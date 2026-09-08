@@ -1,12 +1,17 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use custom_debug_derive::Debug;
+use linera_base::hex_debug;
 use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{
     batch::DeletePrefixExpander,
     memory::MemoryStore,
-    store::{KeyValueStoreError, ReadableKeyValueStore, WithError, WritableKeyValueStore},
+    store::{
+        KeyValueDatabase, KeyValueStoreError, ReadableKeyValueStore, WithError,
+        WritableKeyValueStore,
+    },
     views::MIN_VIEW_TAG,
 };
 
@@ -15,6 +20,7 @@ use crate::{
 pub struct BaseKey {
     /// The byte value of the key prefix.
     #[from]
+    #[debug(with = "hex_debug")]
     pub bytes: Vec<u8>,
 }
 
@@ -44,17 +50,6 @@ impl BaseKey {
         key.extend_from_slice(&self.bytes);
         key.extend_from_slice(index);
         key
-    }
-
-    /// Obtains the `Vec<u8>` key from the key by serialization and using the base key.
-    pub fn derive_key<I: Serialize>(&self, index: &I) -> Result<Vec<u8>, bcs::Error> {
-        let mut key = self.bytes.clone();
-        bcs::serialize_into(&mut key, index)?;
-        assert!(
-            key.len() > self.bytes.len(),
-            "Empty indices are not allowed"
-        );
-        Ok(key)
     }
 
     /// Obtains the `Vec<u8>` key from the key by serialization and using the `base_key`.
@@ -99,7 +94,7 @@ where
     type Store: ReadableKeyValueStore + WritableKeyValueStore + WithError<Error = Self::Error>;
 
     /// User-provided data to be carried along.
-    type Extra: Clone + Send + Sync;
+    type Extra: Clone + linera_base::util::traits::AutoTraits;
 
     /// The type of errors that may be returned by operations on the `Store`, a
     /// convenience alias for `<Self::Store as WithError>::Error`.
@@ -177,10 +172,21 @@ impl<E, S> ViewContext<E, S>
 where
     S: ReadableKeyValueStore + WritableKeyValueStore,
 {
-    /// Creates a context suitable for a root view, using the given store. If the
-    /// journal's store is non-empty, it will be cleared first, before the context is
-    /// returned.
-    pub async fn create_root_context(store: S, extra: E) -> Result<Self, S::Error> {
+    /// Creates a context suitable for a root view over the partition at `root_key`,
+    /// which is opened in exclusive mode. If the journal is non-empty, it is cleared
+    /// first, before the context is returned.
+    ///
+    /// Taking the database rather than an already-opened store is what keeps a view
+    /// from being backed by a shared partition: the caller never chooses the mode.
+    pub async fn create_root_context<D>(
+        database: &D,
+        root_key: &[u8],
+        extra: E,
+    ) -> Result<Self, S::Error>
+    where
+        D: KeyValueDatabase<Store = S> + WithError<Error = S::Error>,
+    {
+        let store = database.open_exclusive(root_key)?;
         store.clear_journal().await?;
         Ok(Self::new_unchecked(store, Vec::new(), extra))
     }
@@ -201,7 +207,7 @@ impl<E, S> ViewContext<E, S> {
 
 impl<E, S> Context for ViewContext<E, S>
 where
-    E: Clone + Send + Sync,
+    E: Clone + linera_base::util::traits::AutoTraits,
     S: ReadableKeyValueStore + WritableKeyValueStore + Clone,
     S::Error: From<bcs::Error> + Send + Sync + std::error::Error + 'static,
 {

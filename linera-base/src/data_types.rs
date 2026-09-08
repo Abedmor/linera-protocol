@@ -7,12 +7,11 @@
 #[cfg(with_testing)]
 use std::ops;
 use std::{
+    collections::{BTreeMap, BTreeSet, HashSet},
     fmt::{self, Display},
-    fs,
     hash::Hash,
     io, iter,
     num::ParseIntError,
-    path::Path,
     str::FromStr,
     sync::Arc,
 };
@@ -25,6 +24,7 @@ use linera_witty::{WitLoad, WitStore, WitType};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_with::{serde_as, Bytes};
 use thiserror::Error;
+use tracing::instrument;
 
 #[cfg(with_metrics)]
 use crate::prometheus_util::MeasureLatency as _;
@@ -32,13 +32,265 @@ use crate::{
     crypto::{BcsHashable, CryptoError, CryptoHash},
     doc_scalar, hex_debug, http,
     identifiers::{
-        ApplicationId, BlobId, BlobType, ChainId, EventId, GenericApplicationId, ModuleId, StreamId,
+        AccountOwner, ApplicationId, BlobId, BlobType, ChainId, EventId, GenericApplicationId,
+        ModuleId, StreamId,
     },
     limited_writer::{LimitedWriter, LimitedWriterError},
     ownership::ChainOwnership,
     time::{Duration, SystemTime},
     vm::VmRuntime,
 };
+
+/// A [`BTreeMap`] that serializes like a `Vec<(K, V)>` instead of using BCS's canonical
+/// map encoding.
+///
+/// BCS serializes a [`BTreeMap`] in *canonical* form: on every `serialize` call it re-sorts the
+/// entries by their serialized-key bytes (an `O(n log n)` sort) and verifies that ordering again
+/// on `deserialize`. Since a [`BTreeMap`] already keeps its entries ordered, this is wasted work.
+/// `NonCanonicalBTreeMap` instead (de)serializes the entries as a plain sequence of pairs, exactly
+/// like `Vec<(K, V)>`, trading the canonical wire format for speed.
+///
+/// Use it in *value* position — the value of a `RegisterView<Value>` or `MapView<_, Value>` — so
+/// that `save()` does not pay the canonical sort. Never use it in *key* position
+/// (`MapView<Key, _>`): keys rely on the canonical encoding that this type skips, so use
+/// [`CanonicalBTreeMap`] there instead.
+///
+/// It otherwise behaves like a [`BTreeMap`]: it derefs to one, so all the usual methods are
+/// available.
+#[derive(Debug, Clone, PartialEq, Eq, Allocative)]
+pub struct NonCanonicalBTreeMap<K, V>(BTreeMap<K, V>);
+
+impl<K, V> Default for NonCanonicalBTreeMap<K, V> {
+    fn default() -> Self {
+        Self(BTreeMap::new())
+    }
+}
+
+impl<K, V> std::ops::Deref for NonCanonicalBTreeMap<K, V> {
+    type Target = BTreeMap<K, V>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<K, V> std::ops::DerefMut for NonCanonicalBTreeMap<K, V> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<K, V> From<BTreeMap<K, V>> for NonCanonicalBTreeMap<K, V> {
+    fn from(map: BTreeMap<K, V>) -> Self {
+        Self(map)
+    }
+}
+
+impl<K, V> From<NonCanonicalBTreeMap<K, V>> for BTreeMap<K, V> {
+    fn from(map: NonCanonicalBTreeMap<K, V>) -> Self {
+        map.0
+    }
+}
+
+impl<K: Ord, V> FromIterator<(K, V)> for NonCanonicalBTreeMap<K, V> {
+    fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
+        Self(BTreeMap::from_iter(iter))
+    }
+}
+
+impl<K, V> IntoIterator for NonCanonicalBTreeMap<K, V> {
+    type Item = (K, V);
+    type IntoIter = std::collections::btree_map::IntoIter<K, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+impl<'a, K, V> IntoIterator for &'a NonCanonicalBTreeMap<K, V> {
+    type Item = (&'a K, &'a V);
+    type IntoIter = std::collections::btree_map::Iter<'a, K, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl<K, V> Serialize for NonCanonicalBTreeMap<K, V>
+where
+    K: Serialize,
+    V: Serialize,
+{
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Serialize as a sequence of pairs, exactly like `Vec<(K, V)>`. The entries are already
+        // in key order, so this avoids the canonical re-sorting that BCS does for maps.
+        serializer.collect_seq(self.0.iter())
+    }
+}
+
+impl<'de, K, V> Deserialize<'de> for NonCanonicalBTreeMap<K, V>
+where
+    K: Deserialize<'de> + Ord,
+    V: Deserialize<'de>,
+{
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let entries = Vec::<(K, V)>::deserialize(deserializer)?;
+        Ok(Self(entries.into_iter().collect()))
+    }
+}
+
+impl<K, V> async_graphql::OutputType for NonCanonicalBTreeMap<K, V>
+where
+    BTreeMap<K, V>: async_graphql::OutputType,
+{
+    fn type_name() -> std::borrow::Cow<'static, str> {
+        <BTreeMap<K, V> as async_graphql::OutputType>::type_name()
+    }
+
+    fn create_type_info(registry: &mut async_graphql::registry::Registry) -> String {
+        <BTreeMap<K, V> as async_graphql::OutputType>::create_type_info(registry)
+    }
+
+    async fn resolve(
+        &self,
+        ctx: &async_graphql::ContextSelectionSet<'_>,
+        field: &async_graphql::Positioned<async_graphql::parser::types::Field>,
+    ) -> async_graphql::ServerResult<async_graphql::Value> {
+        self.0.resolve(ctx, field).await
+    }
+}
+
+/// A [`BTreeSet`] used in value position; the counterpart to [`NonCanonicalBTreeMap`].
+///
+/// Unlike maps, serde already serializes a [`BTreeSet`] as a plain sequence (it never goes through
+/// `serialize_map`), so BCS does not re-sort it. A type alias is therefore enough; no wrapper is
+/// needed.
+///
+/// Use it in *value* position (`RegisterView<Value>` or `MapView<_, Value>`). In *key* position
+/// (`MapView<Key, _>`) use [`CanonicalBTreeSet`] instead, which enforces the canonical ordering
+/// that keys require.
+pub type NonCanonicalBTreeSet<T> = BTreeSet<T>;
+
+/// A [`BTreeMap`] suitable for *key* position; an alias for [`BTreeMap`] itself.
+///
+/// In key position the canonical BCS encoding is exactly what is wanted — keys are ordered and
+/// compared by their serialized bytes — so no wrapper is needed. Use it for the key type of a
+/// `MapView<Key, _>`. In *value* position prefer [`NonCanonicalBTreeMap`], which skips the
+/// per-`save()` canonical sort. This alias exists to make that intent explicit and to pair with
+/// [`NonCanonicalBTreeMap`].
+pub type CanonicalBTreeMap<K, V> = BTreeMap<K, V>;
+
+/// A [`BTreeSet`] that serializes canonically, like a `BTreeMap<T, ()>`.
+///
+/// A plain [`BTreeSet`] serializes as a serde *sequence*, so BCS keeps the in-memory (Rust `Ord`)
+/// order without enforcing canonical ordering of the serialized elements. That is fine in value
+/// position, but in *key* position the canonical encoding matters. `CanonicalBTreeSet` therefore
+/// (de)serializes through a map of `T -> ()`, so that BCS sorts the elements by their serialized
+/// bytes, exactly as it does for [`BTreeMap`] keys.
+///
+/// Use it for the key type of a `MapView<Key, _>`. In *value* position use
+/// [`NonCanonicalBTreeSet`] instead. It otherwise behaves like a [`BTreeSet`]: it derefs to one,
+/// so all the usual methods are available.
+#[derive(Debug, Clone, PartialEq, Eq, Allocative)]
+pub struct CanonicalBTreeSet<T>(BTreeSet<T>);
+
+impl<T> Default for CanonicalBTreeSet<T> {
+    fn default() -> Self {
+        Self(BTreeSet::new())
+    }
+}
+
+impl<T> std::ops::Deref for CanonicalBTreeSet<T> {
+    type Target = BTreeSet<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T> std::ops::DerefMut for CanonicalBTreeSet<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl<T> From<BTreeSet<T>> for CanonicalBTreeSet<T> {
+    fn from(set: BTreeSet<T>) -> Self {
+        Self(set)
+    }
+}
+
+impl<T> From<CanonicalBTreeSet<T>> for BTreeSet<T> {
+    fn from(set: CanonicalBTreeSet<T>) -> Self {
+        set.0
+    }
+}
+
+impl<T: Ord> FromIterator<T> for CanonicalBTreeSet<T> {
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        Self(BTreeSet::from_iter(iter))
+    }
+}
+
+impl<T> IntoIterator for CanonicalBTreeSet<T> {
+    type Item = T;
+    type IntoIter = std::collections::btree_set::IntoIter<T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter()
+    }
+}
+
+impl<'a, T> IntoIterator for &'a CanonicalBTreeSet<T> {
+    type Item = &'a T;
+    type IntoIter = std::collections::btree_set::Iter<'a, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter()
+    }
+}
+
+impl<T> Serialize for CanonicalBTreeSet<T>
+where
+    T: Serialize,
+{
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Serialize as a `BTreeMap<T, ()>`: going through `serialize_map` lets BCS sort the
+        // elements canonically by their serialized bytes, as required in key position.
+        serializer.collect_map(self.0.iter().map(|element| (element, ())))
+    }
+}
+
+impl<'de, T> Deserialize<'de> for CanonicalBTreeSet<T>
+where
+    T: Deserialize<'de> + Ord,
+{
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let map = BTreeMap::<T, ()>::deserialize(deserializer)?;
+        Ok(Self(map.into_keys().collect()))
+    }
+}
+
+impl<T> async_graphql::OutputType for CanonicalBTreeSet<T>
+where
+    BTreeSet<T>: async_graphql::OutputType,
+{
+    fn type_name() -> std::borrow::Cow<'static, str> {
+        <BTreeSet<T> as async_graphql::OutputType>::type_name()
+    }
+
+    fn create_type_info(registry: &mut async_graphql::registry::Registry) -> String {
+        <BTreeSet<T> as async_graphql::OutputType>::create_type_info(registry)
+    }
+
+    async fn resolve(
+        &self,
+        ctx: &async_graphql::ContextSelectionSet<'_>,
+        field: &async_graphql::Positioned<async_graphql::parser::types::Field>,
+    ) -> async_graphql::ServerResult<async_graphql::Value> {
+        self.0.resolve(ctx, field).await
+    }
+}
 
 /// A non-negative amount of tokens.
 ///
@@ -94,6 +346,15 @@ impl From<Amount> for U256 {
     }
 }
 
+impl From<Amount> for f64 {
+    /// Returns the amount as a floating-point number of whole tokens. This is
+    /// lossy for large or high-precision amounts; intended for telemetry, not
+    /// for arithmetic.
+    fn from(amount: Amount) -> f64 {
+        amount.0 as f64 / Amount::ONE.0 as f64
+    }
+}
+
 /// Error converting from `U256` to `Amount`.
 /// This can fail since `Amount` is a `u128`.
 #[derive(Error, Debug)]
@@ -105,6 +366,52 @@ impl TryFrom<U256> for Amount {
     fn try_from(value: U256) -> Result<Amount, Self::Error> {
         let value = u128::try_from(&value).map_err(|_| AmountConversionError(value))?;
         Ok(Amount(value))
+    }
+}
+
+/// A `u128` newtype that serializes as a decimal string in human-readable
+/// formats (JSON / GraphQL) and as a bare `u128` in binary (BCS).
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    Eq,
+    Ord,
+    PartialEq,
+    PartialOrd,
+    Hash,
+    derive_more::Display,
+    derive_more::Deref,
+    derive_more::DerefMut,
+    derive_more::FromStr,
+)]
+pub struct U128(pub u128);
+
+impl Serialize for U128 {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        if serializer.is_human_readable() {
+            serializer.serialize_str(&self.0.to_string())
+        } else {
+            self.0.serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for U128 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        if deserializer.is_human_readable() {
+            let s = String::deserialize(deserializer)?;
+            s.parse().map(U128).map_err(serde::de::Error::custom)
+        } else {
+            u128::deserialize(deserializer).map(U128)
+        }
     }
 }
 
@@ -193,10 +500,9 @@ impl TimeDelta {
         TimeDelta(secs.saturating_mul(1_000_000))
     }
 
-    /// Returns the given duration, rounded to the nearest microsecond and capped to the maximum
-    /// [`TimeDelta`] value.
+    /// Returns the given [`Duration`] as a [`TimeDelta`], saturating at the maximum on overflow.
     pub fn from_duration(duration: Duration) -> Self {
-        TimeDelta::from_micros(u64::try_from(duration.as_micros()).unwrap_or(u64::MAX))
+        TimeDelta(u64::try_from(duration.as_micros()).unwrap_or(u64::MAX))
     }
 
     /// Returns this [`TimeDelta`] as a number of microseconds.
@@ -285,13 +591,29 @@ impl From<u64> for Timestamp {
 
 impl Display for Timestamp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(date_time) = chrono::DateTime::from_timestamp(
-            (self.0 / 1_000_000) as i64,
-            ((self.0 % 1_000_000) * 1_000) as u32,
-        ) {
+        let seconds = i64::try_from(self.0 / 1_000_000).unwrap_or(i64::MAX);
+        // `% 1_000_000` keeps the value below 10^9, which fits in `u32`.
+        let nanos = u32::try_from((self.0 % 1_000_000) * 1_000)
+            .expect("microseconds modulo 1_000_000 multiplied by 1_000 fits in u32");
+        if let Some(date_time) = chrono::DateTime::from_timestamp(seconds, nanos) {
             return date_time.naive_utc().fmt(f);
         }
         self.0.fmt(f)
+    }
+}
+
+impl FromStr for Timestamp {
+    type Err = chrono::ParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let naive = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
+            .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))?;
+        let micros = naive
+            .and_utc()
+            .timestamp_micros()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        Ok(Timestamp(micros))
     }
 }
 
@@ -328,8 +650,6 @@ pub struct Resources {
     /// The size of the messages to be sent.
     // TODO(#1531): Account for the type of message to be sent.
     pub message_size: u32,
-    /// An increase in the amount of storage space.
-    pub storage_size_delta: u32,
     /// A number of service-as-oracle requests to be performed.
     pub service_as_oracle_queries: u32,
     /// A number of HTTP requests to be performed.
@@ -353,24 +673,6 @@ pub struct SendMessageRequest<Message> {
     pub grant: Resources,
     /// The message itself.
     pub message: Message,
-}
-
-impl<Message> SendMessageRequest<Message>
-where
-    Message: Serialize,
-{
-    /// Serializes the internal `Message` type into raw bytes.
-    pub fn into_raw(self) -> SendMessageRequest<Vec<u8>> {
-        let message = bcs::to_bytes(&self.message).expect("Failed to serialize message");
-
-        SendMessageRequest {
-            destination: self.destination,
-            authenticated: self.authenticated,
-            is_tracked: self.is_tracked,
-            grant: self.grant,
-            message,
-        }
-    }
 }
 
 /// An error type for arithmetic errors.
@@ -437,6 +739,11 @@ macro_rules! impl_wrapped_number {
             /// Returns the absolute difference between `self` and `other`.
             pub fn abs_diff(self, other: Self) -> Self {
                 Self(self.0.abs_diff(other.0))
+            }
+
+            /// Returns the midpoint of `self` and `other`, rounded down.
+            pub const fn midpoint(self, other: Self) -> Self {
+                Self(self.0.midpoint(other.0))
             }
 
             /// Checked in-place addition.
@@ -543,6 +850,7 @@ impl TryFrom<BlockHeight> for usize {
 }
 
 impl_wrapped_number!(Amount, u128);
+impl_wrapped_number!(U128, u128);
 impl_wrapped_number!(BlockHeight, u64);
 impl_wrapped_number!(TimeDelta, u64);
 
@@ -639,13 +947,50 @@ impl FromStr for BlockHeight {
     }
 }
 
+/// A logical position in a chain's stream of outgoing messages: the height of the block
+/// that produced the message and the index of the message-producing transaction within
+/// that block.
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    Hash,
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Serialize,
+    Deserialize,
+    SimpleObject,
+    Allocative,
+)]
+pub struct Cursor {
+    /// The height of the producing block.
+    pub height: BlockHeight,
+    /// The transaction index within the block.
+    pub index: u32,
+}
+
+impl Cursor {
+    /// Returns the cursor pointing to the next position within the same block, or
+    /// [`ArithmeticError::Overflow`] if `index` is already at the maximum.
+    pub fn try_add_one(self) -> Result<Self, ArithmeticError> {
+        let value = Self {
+            height: self.height,
+            index: self.index.checked_add(1).ok_or(ArithmeticError::Overflow)?,
+        };
+        Ok(value)
+    }
+}
+
 impl Display for Round {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Round::Fast => write!(f, "fast round"),
-            Round::MultiLeader(r) => write!(f, "multi-leader round {}", r),
-            Round::SingleLeader(r) => write!(f, "single-leader round {}", r),
-            Round::Validator(r) => write!(f, "validator round {}", r),
+            Round::MultiLeader(r) => write!(f, "multi-leader round {r}"),
+            Round::SingleLeader(r) => write!(f, "single-leader round {r}"),
+            Round::Validator(r) => write!(f, "validator round {r}"),
         }
     }
 }
@@ -742,6 +1087,10 @@ impl Amount {
     }
 
     /// Helper function to obtain the 64 least significant bits of the balance.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "intentional: returns the low 64 bits"
+    )]
     pub const fn lower_half(self) -> u64 {
         self.0 as u64
     }
@@ -777,11 +1126,6 @@ pub enum ChainOrigin {
 }
 
 impl ChainOrigin {
-    /// Whether the chain was created by another chain.
-    pub fn is_child(&self) -> bool {
-        matches!(self, ChainOrigin::Child { .. })
-    }
-
     /// Returns the root chain number, if this is a root chain.
     pub fn root(&self) -> Option<u32> {
         match self {
@@ -883,11 +1227,10 @@ pub struct InitialChainConfig {
     pub ownership: ChainOwnership,
     /// The epoch in which the chain is created.
     pub epoch: Epoch,
-    /// The lowest number of an active epoch at the time of creation of the chain.
-    pub min_active_epoch: Epoch,
-    /// The highest number of an active epoch at the time of creation of the chain.
-    pub max_active_epoch: Epoch,
-    /// The initial chain balance.
+    /// The account on the new chain credited with `balance`. Use [`AccountOwner::CHAIN`] to
+    /// fund the chain account itself.
+    pub account: AccountOwner,
+    /// The initial balance of `account`.
     pub balance: Amount,
     /// The initial application permissions.
     pub application_permissions: ApplicationPermissions,
@@ -929,11 +1272,6 @@ impl ChainDescription {
     /// Returns the timestamp of when the chain was created.
     pub fn timestamp(&self) -> Timestamp {
         self.timestamp
-    }
-
-    /// Whether the chain was created by another chain.
-    pub fn is_child(&self) -> bool {
-        self.origin.is_child()
     }
 }
 
@@ -983,14 +1321,11 @@ pub struct ApplicationPermissions {
     #[graphql(default)]
     #[debug(skip_if = Vec::is_empty)]
     pub mandatory_applications: Vec<ApplicationId>,
-    /// These applications are allowed to close the current chain.
+    /// These applications are allowed to close the current chain, change the application
+    /// permissions, and change the ownership.
     #[graphql(default)]
     #[debug(skip_if = Vec::is_empty)]
-    pub close_chain: Vec<ApplicationId>,
-    /// These applications are allowed to change the application permissions.
-    #[graphql(default)]
-    #[debug(skip_if = Vec::is_empty)]
-    pub change_application_permissions: Vec<ApplicationId>,
+    pub manage_chain: Vec<ApplicationId>,
     /// These applications are allowed to perform calls to services as oracles.
     #[graphql(default)]
     #[debug(skip_if = Option::is_none)]
@@ -1003,26 +1338,25 @@ pub struct ApplicationPermissions {
 
 impl ApplicationPermissions {
     /// Creates new `ApplicationPermissions` where the given application is the only one
-    /// whose operations are allowed and mandatory, and it can also close the chain.
+    /// whose operations are allowed and mandatory, and it can also manage the chain.
     pub fn new_single(app_id: ApplicationId) -> Self {
         Self {
             execute_operations: Some(vec![app_id]),
             mandatory_applications: vec![app_id],
-            close_chain: vec![app_id],
-            change_application_permissions: vec![app_id],
+            manage_chain: vec![app_id],
             call_service_as_oracle: Some(vec![app_id]),
             make_http_requests: Some(vec![app_id]),
         }
     }
 
     /// Creates new `ApplicationPermissions` where the given applications are the only ones
-    /// whose operations are allowed and mandatory, and they can also close the chain.
+    /// whose operations are allowed and mandatory, and they can also manage the chain.
+    #[cfg(with_testing)]
     pub fn new_multiple(app_ids: Vec<ApplicationId>) -> Self {
         Self {
             execute_operations: Some(app_ids.clone()),
             mandatory_applications: app_ids.clone(),
-            close_chain: app_ids.clone(),
-            change_application_permissions: app_ids.clone(),
+            manage_chain: app_ids.clone(),
             call_service_as_oracle: Some(app_ids.clone()),
             make_http_requests: Some(app_ids),
         }
@@ -1037,15 +1371,10 @@ impl ApplicationPermissions {
         }
     }
 
-    /// Returns whether the given application is allowed to close this chain.
-    pub fn can_close_chain(&self, app_id: &ApplicationId) -> bool {
-        self.close_chain.contains(app_id)
-    }
-
-    /// Returns whether the given application is allowed to change the application
-    /// permissions for this chain.
-    pub fn can_change_application_permissions(&self, app_id: &ApplicationId) -> bool {
-        self.change_application_permissions.contains(app_id)
+    /// Returns whether the given application is allowed to manage this chain, i.e. close
+    /// it, change the application permissions, and change the ownership.
+    pub fn can_manage_chain(&self, app_id: &ApplicationId) -> bool {
+        self.manage_chain.contains(app_id)
     }
 
     /// Returns whether the given application can call services.
@@ -1089,12 +1418,39 @@ pub enum OracleResponse {
     ),
     /// An event exists.
     EventExists(EventId),
+    /// A checkpoint of the chain's execution state was published. The execution-state
+    /// dump is chunked into one or more `BlobType::CheckpointExecutionState` blobs whose
+    /// content hashes are listed here in restore order; a bootstrapping node concatenates
+    /// the bytes and feeds them to `ExecutionStateView::restore_from_content`.
+    Checkpoint {
+        /// Content hashes of the execution-state-dump blobs, in restore order.
+        execution_state_blobs: Vec<CryptoHash>,
+        /// All blobs the chain references in its `used_blobs` set at the time of the
+        /// checkpoint. A bootstrapping node must have each of these in shared blob
+        /// storage before applying the checkpoint, otherwise subsequent operations on
+        /// the chain could try to read blob content the node doesn't actually have.
+        used_blobs: Vec<BlobId>,
+        /// Hashes of every block on this chain that the chain's outboxes still reference
+        /// at the time of the checkpoint — i.e. the heights with cross-chain messages
+        /// that recipients haven't acknowledged yet. The current-epoch certificate over
+        /// the checkpoint block transitively certifies these older blocks: a node that
+        /// later receives one of these block's bytes can verify the bytes hash to a
+        /// hash in this set, without trusting the (possibly revoked) validator
+        /// signatures on the older block's own certificate.
+        outbox_block_hashes: Vec<CryptoHash>,
+        /// For each chain whose messages we've consumed, the `next_cursor_to_remove`
+        /// of the corresponding inbox. A bootstrapping node uses these to seed each
+        /// inbox's `restored_cursor`, so subsequent sender re-pushes below that cursor
+        /// are silently dropped (their effects are already baked into the restored
+        /// execution state).
+        inbox_cursors: Vec<(ChainId, Cursor)>,
+    },
 }
 
 impl BcsHashable<'_> for OracleResponse {}
 
 /// Description of a user application.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Hash, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Hash, Serialize, WitType, WitLoad, WitStore)]
 pub struct ApplicationDescription {
     /// The unique ID of the bytecode to use for the application.
     pub module_id: ModuleId,
@@ -1156,9 +1512,13 @@ impl Bytecode {
         Bytecode { bytes }
     }
 
-    /// Load bytecode from a Wasm module file.
-    pub fn load_from_file(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
-        let bytes = fs::read(path)?;
+    /// Loads bytecode from a Wasm module file.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn load_from_file(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
+        let path = path.as_ref();
+        let bytes = tokio::fs::read(path).await.map_err(|error| {
+            std::io::Error::new(error.kind(), format!("{}: {error}", path.display()))
+        })?;
         Ok(Bytecode { bytes })
     }
 
@@ -1245,6 +1605,11 @@ impl CompressedBytecode {
         let _decompression_latency = metrics::BYTECODE_DECOMPRESSION_LATENCY.measure_latency();
         let bytes = zstd::stream::decode_all(&**self.compressed_bytes)?;
 
+        #[cfg(with_metrics)]
+        metrics::BYTECODE_DECOMPRESSED_SIZE_BYTES
+            .with_label_values(&[])
+            .observe(bytes.len() as f64);
+
         Ok(Bytecode { bytes })
     }
 }
@@ -1288,6 +1653,11 @@ impl CompressedBytecode {
                 .read_to_end(&mut bytes)
                 .expect("Reading from a slice in memory should not result in I/O errors");
         }
+
+        #[cfg(with_metrics)]
+        BYTECODE_DECOMPRESSED_SIZE_BYTES
+            .with_label_values(&[])
+            .observe(bytes.len() as f64);
 
         Ok(Bytecode { bytes })
     }
@@ -1352,6 +1722,12 @@ impl BlobContent {
         BlobContent::new(BlobType::ApplicationDescription, bytes)
     }
 
+    /// Creates a new application formats [`BlobContent`] from the BCS-encoded
+    /// `Formats` description bytes.
+    pub fn new_application_formats(bytes: impl Into<Box<[u8]>>) -> Self {
+        BlobContent::new(BlobType::ApplicationFormats, bytes)
+    }
+
     /// Creates a new committee [`BlobContent`] from the provided serialized committee.
     pub fn new_committee(committee: impl Into<Box<[u8]>>) -> Self {
         BlobContent::new(BlobType::Committee, committee)
@@ -1389,6 +1765,12 @@ impl BlobContent {
 impl From<Blob> for BlobContent {
     fn from(blob: Blob) -> BlobContent {
         blob.content
+    }
+}
+
+impl From<Arc<Blob>> for BlobContent {
+    fn from(blob: Arc<Blob>) -> BlobContent {
+        blob.content().clone()
     }
 }
 
@@ -1462,6 +1844,12 @@ impl Blob {
         ))
     }
 
+    /// Creates a new application formats [`Blob`] from the BCS-encoded
+    /// `Formats` description bytes.
+    pub fn new_application_formats(bytes: impl Into<Box<[u8]>>) -> Self {
+        Blob::new(BlobContent::new_application_formats(bytes))
+    }
+
     /// Creates a new committee [`Blob`] from the provided bytes.
     pub fn new_committee(committee: impl Into<Box<[u8]>>) -> Self {
         Blob::new(BlobContent::new_committee(committee))
@@ -1495,14 +1883,14 @@ impl Blob {
         self.content.bytes()
     }
 
-    /// Loads data blob from a file.
-    pub fn load_data_blob_from_file(path: impl AsRef<Path>) -> io::Result<Self> {
-        Ok(Self::new_data(fs::read(path)?))
-    }
-
     /// Returns whether the blob is of [`BlobType::Committee`] variant.
     pub fn is_committee_blob(&self) -> bool {
         self.content().blob_type().is_committee_blob()
+    }
+
+    /// Returns whether the blob carries a chunk of a checkpoint's execution-state dump.
+    pub fn is_checkpoint_blob(&self) -> bool {
+        self.content().blob_type().is_checkpoint_blob()
     }
 }
 
@@ -1574,6 +1962,10 @@ pub struct StreamUpdate {
     pub stream_id: StreamId,
     /// The lowest index of a new event. See [`StreamUpdate::new_indices`].
     pub previous_index: u32,
+    /// The lowest index whose event is still guaranteed to be readable (if it exists): the
+    /// index of the first event published since the publisher's most recent checkpoint. Reading
+    /// an event below this index may fail, since checkpoints prune earlier events.
+    pub first_index: u32,
     /// The index of the next event, i.e. the lowest for which no event is known yet.
     pub next_index: u32,
 }
@@ -1587,8 +1979,98 @@ impl StreamUpdate {
 
 impl BcsHashable<'_> for Event {}
 
+/// Policies for automatically handling incoming messages.
+#[derive(
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    serde::Serialize,
+    serde::Deserialize,
+    async_graphql::SimpleObject,
+)]
+pub struct MessagePolicy {
+    /// The blanket policy applied to all messages.
+    pub blanket: BlanketMessagePolicy,
+    /// A collection of chains which restrict the origin of messages to be
+    /// accepted. `Option::None` means that messages from all chains are accepted. An empty
+    /// `HashSet` denotes that messages from no chains are accepted.
+    pub restrict_chain_ids_to: Option<HashSet<ChainId>>,
+    /// A collection of chains whose incoming messages should be ignored.
+    pub ignore_chain_ids: HashSet<ChainId>,
+    /// A collection of applications: If `Some`, only bundles with at least one message by any
+    /// of these applications will be accepted.
+    pub reject_message_bundles_without_application_ids: Option<HashSet<GenericApplicationId>>,
+    /// A collection of applications: If `Some`, only bundles all of whose messages are by these
+    /// applications will be accepted.
+    pub reject_message_bundles_with_other_application_ids: Option<HashSet<GenericApplicationId>>,
+    /// A collection of applications: If `Some`, only event streams from those
+    /// applications will be processed.
+    pub process_events_from_application_ids: Option<HashSet<GenericApplicationId>>,
+    /// A collection of applications whose messages must never be rejected. Bundles whose
+    /// messages are all from one of these applications bypass the other rejection rules
+    /// (except `restrict_chain_ids_to`), and on execution failure they are discarded for
+    /// later retry instead of being rejected. A bundle that contains any message from an
+    /// application not on this list can be rejected. An empty set disables this feature.
+    pub never_reject_application_ids: HashSet<GenericApplicationId>,
+}
+
+/// A blanket policy to apply to all messages by default.
+#[derive(
+    Default,
+    Copy,
+    Clone,
+    Debug,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    async_graphql::Enum,
+)]
+#[cfg_attr(web, derive(tsify::Tsify), tsify(from_wasm_abi, into_wasm_abi))]
+#[cfg_attr(any(web, not(target_arch = "wasm32")), derive(clap::ValueEnum))]
+pub enum BlanketMessagePolicy {
+    /// Automatically accept all incoming messages. Reject them only if execution fails.
+    #[default]
+    Accept,
+    /// Automatically reject tracked messages, ignore or skip untracked messages, but accept
+    /// protected ones.
+    Reject,
+    /// Don't include any messages in blocks, and don't make any decision whether to accept or
+    /// reject.
+    Ignore,
+}
+
+impl MessagePolicy {
+    /// Returns `true` if the blanket policy is to ignore messages.
+    #[instrument(level = "trace", skip(self))]
+    pub fn is_ignore(&self) -> bool {
+        matches!(self.blanket, BlanketMessagePolicy::Ignore)
+    }
+
+    /// Returns `true` if the blanket policy is to reject messages.
+    #[instrument(level = "trace", skip(self))]
+    pub fn is_reject(&self) -> bool {
+        matches!(self.blanket, BlanketMessagePolicy::Reject)
+    }
+
+    /// Returns `true` if every message from `origin` would be unconditionally dropped:
+    /// blanket policy is `Ignore`, the origin is in `ignore_chain_ids`, or
+    /// `restrict_chain_ids_to` is `Some` and does not contain the origin.
+    #[instrument(level = "trace", skip(self))]
+    pub fn ignores_origin(&self, origin: &ChainId) -> bool {
+        self.is_ignore()
+            || self.ignore_chain_ids.contains(origin)
+            || self
+                .restrict_chain_ids_to
+                .as_ref()
+                .is_some_and(|set| !set.contains(origin))
+    }
+}
+
 doc_scalar!(Bytecode, "A module bytecode (WebAssembly or EVM)");
 doc_scalar!(Amount, "A non-negative amount of tokens.");
+doc_scalar!(U128, "A 128-bit unsigned integer.");
 doc_scalar!(
     Epoch,
     "A number identifying the configuration of the chain (aka the committee)"
@@ -1616,32 +2098,40 @@ doc_scalar!(
 doc_scalar!(ApplicationDescription, "Description of a user application");
 
 #[cfg(with_metrics)]
-mod metrics {
-    use std::sync::LazyLock;
-
+pub(crate) mod metrics {
     use prometheus::HistogramVec;
 
-    use crate::prometheus_util::{exponential_bucket_latencies, register_histogram_vec};
+    use crate::prometheus_util::{
+        exponential_bucket_interval, exponential_bucket_latencies, register_histogram_vec,
+    };
 
-    /// The time it takes to compress a bytecode.
-    pub static BYTECODE_COMPRESSION_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
-        register_histogram_vec(
-            "bytecode_compression_latency",
-            "Bytecode compression latency",
-            &[],
-            exponential_bucket_latencies(10.0),
-        )
-    });
+    crate::declare_metrics! {
+        /// The time it takes to compress a bytecode.
+        pub static BYTECODE_COMPRESSION_LATENCY: HistogramVec =
+            register_histogram_vec(
+                "bytecode_compression_latency",
+                "Bytecode compression latency",
+                &[],
+                exponential_bucket_latencies(10.0),
+            );
 
-    /// The time it takes to decompress a bytecode.
-    pub static BYTECODE_DECOMPRESSION_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
-        register_histogram_vec(
-            "bytecode_decompression_latency",
-            "Bytecode decompression latency",
-            &[],
-            exponential_bucket_latencies(10.0),
-        )
-    });
+        /// The time it takes to decompress a bytecode.
+        pub static BYTECODE_DECOMPRESSION_LATENCY: HistogramVec =
+            register_histogram_vec(
+                "bytecode_decompression_latency",
+                "Bytecode decompression latency",
+                &[],
+                exponential_bucket_latencies(10.0),
+            );
+
+        pub static BYTECODE_DECOMPRESSED_SIZE_BYTES: HistogramVec =
+            register_histogram_vec(
+                "wasm_bytecode_decompressed_size_bytes",
+                "Decompressed size in bytes of WASM bytecodes stored on-chain",
+                &[],
+                exponential_bucket_interval(10_000.0, 100_000_000.0),
+            );
+    }
 }
 
 #[cfg(test)]
@@ -1650,8 +2140,78 @@ mod tests {
 
     use alloy_primitives::U256;
 
-    use super::{Amount, BlobContent};
-    use crate::identifiers::BlobType;
+    use super::{Amount, ApplicationDescription, BlobContent};
+    use crate::{
+        crypto::CryptoHash,
+        data_types::BlockHeight,
+        identifiers::{BlobType, ChainId, ModuleId},
+        vm::VmRuntime,
+    };
+
+    #[test]
+    fn non_canonical_btree_map_serializes_like_vec() {
+        use std::collections::BTreeMap;
+
+        use super::NonCanonicalBTreeMap;
+
+        // `256u32` is chosen so that its little-endian BCS bytes sort *before* `1u32`'s,
+        // i.e. the canonical (serialized-byte) order differs from the numeric `Ord` order.
+        let map = NonCanonicalBTreeMap::from(BTreeMap::from([
+            (1u32, 10u8),
+            (256u32, 20u8),
+            (2u32, 30u8),
+        ]));
+
+        // It serializes as a plain `Vec<(K, V)>` in the map's `Ord` key order, with no canonical
+        // re-sorting.
+        let entries = map
+            .iter()
+            .map(|(k, v)| (*k, *v))
+            .collect::<Vec<(u32, u8)>>();
+        assert_eq!(
+            bcs::to_bytes(&map).unwrap(),
+            bcs::to_bytes(&entries).unwrap()
+        );
+
+        // ... which differs from the canonical `BTreeMap` encoding that re-sorts by serialized key.
+        let canonical = map
+            .iter()
+            .map(|(k, v)| (*k, *v))
+            .collect::<BTreeMap<u32, u8>>();
+        assert_ne!(
+            bcs::to_bytes(&map).unwrap(),
+            bcs::to_bytes(&canonical).unwrap()
+        );
+
+        // It round-trips.
+        let deserialized: NonCanonicalBTreeMap<u32, u8> =
+            bcs::from_bytes(&bcs::to_bytes(&map).unwrap()).unwrap();
+        assert_eq!(map, deserialized);
+    }
+
+    #[test]
+    fn canonical_btree_set_serializes_like_map() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        use super::CanonicalBTreeSet;
+
+        let set = CanonicalBTreeSet::from(BTreeSet::from([1u32, 256u32, 2u32]));
+
+        // It serializes exactly like a `BTreeMap<T, ()>`, i.e. canonically sorted by serialized
+        // bytes.
+        let map = set.iter().map(|t| (*t, ())).collect::<BTreeMap<u32, ()>>();
+        assert_eq!(bcs::to_bytes(&set).unwrap(), bcs::to_bytes(&map).unwrap());
+
+        // That canonical order differs from a plain `BTreeSet`'s sequence encoding, which keeps
+        // the numeric `Ord` order.
+        let plain = set.iter().copied().collect::<BTreeSet<u32>>();
+        assert_ne!(bcs::to_bytes(&set).unwrap(), bcs::to_bytes(&plain).unwrap());
+
+        // It round-trips.
+        let deserialized: CanonicalBTreeSet<u32> =
+            bcs::from_bytes(&bcs::to_bytes(&set).unwrap()).unwrap();
+        assert_eq!(set, deserialized);
+    }
 
     #[test]
     fn display_amount() {
@@ -1716,5 +2276,41 @@ mod tests {
         let value_u256: U256 = value_amount.into();
         let value_amount_rev = Amount::try_from(value_u256).expect("Failed conversion");
         assert_eq!(value_amount, value_amount_rev);
+    }
+
+    /// `linera-explorer` running on `wasm32` does not have access to the
+    /// strongly-typed `ApplicationDescription`: the GraphQL client substitutes
+    /// it for `serde_json::Value`. The explorer therefore fetches the module ID
+    /// for an application by indexing into the JSON object as
+    /// `description["module_id"]`. This test pins that field name and the
+    /// hex-string shape of the serialized `ModuleId` so a future rename or
+    /// representation change immediately breaks here instead of silently in the
+    /// browser.
+    #[test]
+    fn application_description_serializes_module_id_as_hex_string() {
+        let module_id = ModuleId::new(
+            CryptoHash::test_hash("contract-bytecode"),
+            CryptoHash::test_hash("service-bytecode"),
+            VmRuntime::Wasm,
+        );
+        let description = ApplicationDescription {
+            module_id,
+            creator_chain_id: ChainId(CryptoHash::test_hash("chain")),
+            block_height: BlockHeight(0),
+            application_index: 0,
+            parameters: Vec::new(),
+            required_application_ids: Vec::new(),
+        };
+
+        let value = serde_json::to_value(&description).unwrap();
+        let module_id_value = value
+            .get("module_id")
+            .expect("`module_id` is the field name the explorer indexes into");
+        let hex = module_id_value
+            .as_str()
+            .expect("`module_id` must serialize as a hex string in human-readable form");
+        let roundtrip: ModuleId =
+            serde_json::from_value(serde_json::Value::String(hex.to_owned())).unwrap();
+        assert_eq!(roundtrip, module_id);
     }
 }

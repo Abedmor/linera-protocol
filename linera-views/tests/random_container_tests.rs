@@ -1,6 +1,8 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::Result;
@@ -8,7 +10,7 @@ use linera_views::{
     bucket_queue_view::HashedBucketQueueView,
     collection_view::{CollectionView, HashedCollectionView},
     context::{Context, MemoryContext},
-    key_value_store_view::{KeyValueStoreView, SizeData},
+    key_value_store_view::KeyValueStoreView,
     map_view::{HashedByteMapView, MapView},
     queue_view::HashedQueueView,
     random::make_deterministic_rng,
@@ -136,21 +138,8 @@ pub struct KeyValueStateView<C> {
     pub store: KeyValueStoreView<C>,
 }
 
-fn remove_by_prefix<V>(map: &mut BTreeMap<Vec<u8>, V>, key_prefix: Vec<u8>) {
-    map.retain(|key, _| !key.starts_with(&key_prefix));
-}
-
-fn total_size(vec: &Vec<(Vec<u8>, Vec<u8>)>) -> SizeData {
-    let mut total_key_size = 0;
-    let mut total_value_size = 0;
-    for (key, value) in vec {
-        total_key_size += key.len();
-        total_value_size += value.len();
-    }
-    SizeData {
-        key: total_key_size as u32,
-        value: total_value_size as u32,
-    }
+fn remove_by_prefix<V>(map: &mut BTreeMap<Vec<u8>, V>, key_prefix: &[u8]) {
+    map.retain(|key, _| !key.starts_with(key_prefix));
 }
 
 #[tokio::test]
@@ -166,14 +155,13 @@ async fn key_value_store_view_mutability() -> Result<()> {
         let read_state = view.store.index_values().await?;
         let state_vec = state_map.clone().into_iter().collect::<Vec<_>>();
         assert!(read_state.iter().map(|kv| (&kv.0, &kv.1)).eq(&state_map));
-        assert_eq!(total_size(&state_vec), view.store.total_size());
 
         let count_oper = rng.gen_range(0..15);
         let mut new_state_map = state_map.clone();
         let mut new_state_vec = state_vec.clone();
         for _ in 0..count_oper {
             let choice = rng.gen_range(0..5);
-            let entry_count = view.store.count().await?;
+            let entry_count = view.store.iterative_count().await?;
             if choice == 0 {
                 // inserting random stuff
                 let n_ins = rng.gen_range(0..10);
@@ -191,7 +179,6 @@ async fn key_value_store_view_mutability() -> Result<()> {
                     new_state_vec = new_state_map.clone().into_iter().collect();
                     let new_key_values = view.store.index_values().await?;
                     assert_eq!(new_state_vec, new_key_values);
-                    assert_eq!(total_size(&new_state_vec), view.store.total_size());
                 }
             }
             if choice == 1 && entry_count > 0 {
@@ -209,7 +196,7 @@ async fn key_value_store_view_mutability() -> Result<()> {
                 let val = rng.gen_range(0..5) as u8;
                 let key_prefix = vec![val];
                 view.store.remove_by_prefix(key_prefix.clone()).await?;
-                remove_by_prefix(&mut new_state_map, key_prefix);
+                remove_by_prefix(&mut new_state_map, &key_prefix);
             }
             if choice == 3 {
                 // Doing the clearing
@@ -225,7 +212,6 @@ async fn key_value_store_view_mutability() -> Result<()> {
             new_state_vec = new_state_map.clone().into_iter().collect();
             let new_key_values = view.store.index_values().await?;
             assert_eq!(new_state_vec, new_key_values);
-            assert_eq!(total_size(&new_state_vec), view.store.total_size());
             let all_keys_vec = all_keys.clone().into_iter().collect::<Vec<_>>();
             let tests_multi_get = view.store.multi_get(&all_keys_vec).await?;
             for (i, key) in all_keys.clone().into_iter().enumerate() {
@@ -271,7 +257,7 @@ async fn run_map_view_mutability<R: RngCore + Clone>(rng: &mut R) -> Result<()> 
         let mut new_state_vec = state_vec.clone();
         for _ in 0..count_oper {
             let choice = rng.gen_range(0..7);
-            let count = view.map.count().await?;
+            let count = view.map.iterative_count().await?;
             if choice == 0 {
                 // inserting random stuff
                 let n_ins = rng.gen_range(0..10);
@@ -303,7 +289,7 @@ async fn run_map_view_mutability<R: RngCore + Clone>(rng: &mut R) -> Result<()> 
                 let val = rng.gen_range(0..5) as u8;
                 let key_prefix = vec![val];
                 view.map.remove_by_prefix(key_prefix.clone());
-                remove_by_prefix(&mut new_state_map, key_prefix);
+                remove_by_prefix(&mut new_state_map, &key_prefix);
             }
             if choice == 3 {
                 // Doing the clearing
@@ -446,7 +432,7 @@ async fn bucket_queue_view_mutability_check() -> Result<()> {
                 // changing some random entries
                 let pos = rng.gen_range(0..count);
                 let val = rng.gen::<u8>();
-                let mut iter = view.queue.iter_mut().await?;
+                let mut iter = view.queue.try_iter_mut().await?;
                 (for _ in 0..pos {
                     iter.next();
                 });
@@ -595,10 +581,7 @@ async fn nested_collection_map_view_check() -> Result<()> {
                 let submap = new_state_map.get_mut(&key1).unwrap();
                 let count = submap.len();
                 if count > 0 {
-                    let subkeys = submap
-                        .iter()
-                        .map(|(key, _)| key.clone())
-                        .collect::<Vec<_>>();
+                    let subkeys = submap.keys().cloned().collect::<Vec<_>>();
                     let pos = rng.gen_range(0..count);
                     let key2 = subkeys[pos].clone();
                     submap.remove(&key2);
@@ -685,7 +668,7 @@ async fn queue_view_mutability_check() -> Result<()> {
                 // changing some random entries
                 let pos = rng.gen_range(0..count);
                 let val = rng.gen::<u8>();
-                let mut iter = view.queue.iter_mut().await?;
+                let mut iter = view.queue.try_iter_mut().await?;
                 (for _ in 0..pos {
                     iter.next();
                 });

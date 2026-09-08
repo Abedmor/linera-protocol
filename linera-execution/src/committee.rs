@@ -2,50 +2,16 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{borrow::Cow, collections::BTreeMap, str::FromStr};
+use std::{borrow::Cow, collections::BTreeMap, sync::Arc};
 
 use allocative::Allocative;
-use linera_base::crypto::{AccountPublicKey, CryptoError, ValidatorPublicKey};
+use linera_base::{
+    crypto::{AccountPublicKey, CryptoHash, ValidatorPublicKey},
+    data_types::ArithmeticError,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::policy::ResourceControlPolicy;
-
-/// The identity of a validator.
-#[derive(Eq, PartialEq, Ord, PartialOrd, Copy, Clone, Hash, Debug)]
-pub struct ValidatorName(pub ValidatorPublicKey);
-
-impl Serialize for ValidatorName {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::ser::Serializer,
-    {
-        if serializer.is_human_readable() {
-            serializer.serialize_str(&self.to_string())
-        } else {
-            serializer.serialize_newtype_struct("ValidatorName", &self.0)
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for ValidatorName {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::de::Deserializer<'de>,
-    {
-        if deserializer.is_human_readable() {
-            let s = String::deserialize(deserializer)?;
-            let value = Self::from_str(&s).map_err(serde::de::Error::custom)?;
-            Ok(value)
-        } else {
-            #[derive(Deserialize)]
-            #[serde(rename = "ValidatorName")]
-            struct ValidatorNameDerived(ValidatorPublicKey);
-
-            let value = ValidatorNameDerived::deserialize(deserializer)?;
-            Ok(Self(value.0))
-        }
-    }
-}
 
 /// Public state of a validator.
 #[derive(Eq, PartialEq, Hash, Clone, Debug, Serialize, Deserialize, Allocative)]
@@ -98,7 +64,7 @@ impl<'de> Deserialize<'de> for Committee {
             Committee::try_from(committee_full).map_err(serde::de::Error::custom)
         } else {
             let committee_minimal = CommitteeMinimal::deserialize(deserializer)?;
-            Ok(Committee::from(committee_minimal))
+            Committee::try_from(committee_minimal).map_err(serde::de::Error::custom)
         }
     }
 }
@@ -131,7 +97,8 @@ impl TryFrom<CommitteeFull<'static>> for Committee {
             validity_threshold,
             policy,
         } = committee_full;
-        let committee = Committee::new(validators.into_owned(), policy.into_owned());
+        let committee = Committee::new(validators.into_owned(), policy.into_owned())
+            .map_err(|e| e.to_string())?;
         if total_votes != committee.total_votes {
             Err(format!(
                 "invalid committee: total_votes is {}; should be {}",
@@ -172,8 +139,10 @@ impl<'a> From<&'a Committee> for CommitteeFull<'a> {
     }
 }
 
-impl From<CommitteeMinimal<'static>> for Committee {
-    fn from(committee_min: CommitteeMinimal) -> Committee {
+impl TryFrom<CommitteeMinimal<'static>> for Committee {
+    type Error = ArithmeticError;
+
+    fn try_from(committee_min: CommitteeMinimal) -> Result<Committee, ArithmeticError> {
         let CommitteeMinimal { validators, policy } = committee_min;
         Committee::new(validators.into_owned(), policy.into_owned())
     }
@@ -195,48 +164,38 @@ impl<'a> From<&'a Committee> for CommitteeMinimal<'a> {
     }
 }
 
-impl std::fmt::Display for ValidatorName {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
-        self.0.fmt(f)
-    }
-}
-
-impl std::str::FromStr for ValidatorName {
-    type Err = CryptoError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(ValidatorName(ValidatorPublicKey::from_str(s)?))
-    }
-}
-
-impl From<ValidatorPublicKey> for ValidatorName {
-    fn from(value: ValidatorPublicKey) -> Self {
-        Self(value)
-    }
-}
-
 impl Committee {
+    /// Creates a new committee from the given validators and resource control policy.
     pub fn new(
         validators: BTreeMap<ValidatorPublicKey, ValidatorState>,
         policy: ResourceControlPolicy,
-    ) -> Self {
-        let total_votes = validators.values().fold(0, |sum, state| sum + state.votes);
+    ) -> Result<Self, ArithmeticError> {
+        let mut total_votes: u64 = 0;
+        for state in validators.values() {
+            total_votes = total_votes
+                .checked_add(state.votes)
+                .ok_or(ArithmeticError::Overflow)?;
+        }
         // The validity threshold is f + 1, where f is maximal so that it is less than a third.
         // So the threshold is N / 3, rounded up.
         let validity_threshold = total_votes.div_ceil(3);
         // The quorum threshold is minimal such that any two quorums intersect in at least one
         // validity threshold.
-        let quorum_threshold = (total_votes + validity_threshold).div_ceil(2);
+        let quorum_threshold = total_votes
+            .checked_add(validity_threshold)
+            .ok_or(ArithmeticError::Overflow)?
+            .div_ceil(2);
 
-        Committee {
+        Ok(Committee {
             validators,
             total_votes,
             quorum_threshold,
             validity_threshold,
             policy,
-        }
+        })
     }
 
+    /// Creates a simple committee for testing, giving each validator equal voting weight.
     #[cfg(with_testing)]
     pub fn make_simple(keys: Vec<(ValidatorPublicKey, AccountPublicKey)>) -> Self {
         let map = keys
@@ -253,8 +212,10 @@ impl Committee {
             })
             .collect();
         Committee::new(map, ResourceControlPolicy::default())
+            .expect("test committee votes should not overflow")
     }
 
+    /// Returns the number of votes held by the given validator, or zero if it is not a member.
     pub fn weight(&self, author: &ValidatorPublicKey) -> u64 {
         match self.validators.get(author) {
             Some(state) => state.votes,
@@ -262,46 +223,41 @@ impl Committee {
         }
     }
 
-    pub fn keys_and_weights(&self) -> impl Iterator<Item = (ValidatorPublicKey, u64)> + '_ {
-        self.validators
-            .iter()
-            .map(|(name, validator)| (*name, validator.votes))
-    }
-
+    /// Returns an iterator over each validator's account public key and its number of votes.
     pub fn account_keys_and_weights(&self) -> impl Iterator<Item = (AccountPublicKey, u64)> + '_ {
         self.validators
             .values()
             .map(|validator| (validator.account_public_key, validator.votes))
     }
 
-    pub fn network_address(&self, author: &ValidatorPublicKey) -> Option<&str> {
-        self.validators
-            .get(author)
-            .map(|state| state.network_address.as_ref())
-    }
-
+    /// Returns the number of votes required to reach a quorum.
     pub fn quorum_threshold(&self) -> u64 {
         self.quorum_threshold
     }
 
+    /// Returns the number of votes required to reach the validity threshold.
     pub fn validity_threshold(&self) -> u64 {
         self.validity_threshold
     }
 
+    /// Returns the validators in this committee, keyed by their public key.
     pub fn validators(&self) -> &BTreeMap<ValidatorPublicKey, ValidatorState> {
         &self.validators
     }
 
+    /// Returns an iterator over each validator's public key and network address.
     pub fn validator_addresses(&self) -> impl Iterator<Item = (ValidatorPublicKey, &str)> {
         self.validators
             .iter()
             .map(|(name, validator)| (*name, &*validator.network_address))
     }
 
+    /// Returns the total number of votes across all validators.
     pub fn total_votes(&self) -> u64 {
         self.total_votes
     }
 
+    /// Returns the resource control policy of this committee.
     pub fn policy(&self) -> &ResourceControlPolicy {
         &self.policy
     }
@@ -309,5 +265,80 @@ impl Committee {
     /// Returns a mutable reference to this committee's [`ResourceControlPolicy`].
     pub fn policy_mut(&mut self) -> &mut ResourceControlPolicy {
         &mut self.policy
+    }
+}
+
+/// Process-global, append-only cache of committees keyed by their blob hash.
+///
+/// Committees are network-global state (created by the admin chain, agreed
+/// on by every validator), so caching them once per process avoids holding a
+/// separate copy in every chain's execution state. The map is populated
+/// lazily by `get_or_load_committee_by_hash` in the storage layer.
+#[derive(Clone, Debug, Default)]
+pub struct SharedCommittees {
+    map: Arc<papaya::HashMap<CryptoHash, Arc<Committee>>>,
+}
+
+impl SharedCommittees {
+    /// Creates a new, empty committee cache.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns the cached committee for `hash`, if any.
+    pub fn get(&self, hash: CryptoHash) -> Option<Arc<Committee>> {
+        self.map.pin().get(&hash).cloned()
+    }
+
+    /// Inserts `committee` under `hash`. If an entry was already present, the
+    /// existing value wins and is returned (avoiding spurious clones when two
+    /// callers race to populate the same hash).
+    pub fn insert(&self, hash: CryptoHash, committee: Arc<Committee>) -> Arc<Committee> {
+        let pinned = self.map.pin();
+        match pinned.try_insert(hash, committee) {
+            Ok(inserted) => inserted.clone(),
+            Err(e) => e.current.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_committees_insert_and_get() {
+        let shared = SharedCommittees::new();
+        let hash = CryptoHash::test_hash("c0");
+        assert!(shared.get(hash).is_none());
+        let committee = Arc::new(Committee::default());
+        let inserted = shared.insert(hash, committee.clone());
+        assert!(Arc::ptr_eq(&inserted, &committee));
+        let fetched = shared.get(hash).unwrap();
+        assert!(Arc::ptr_eq(&fetched, &committee));
+    }
+
+    #[test]
+    fn shared_committees_insert_is_first_writer_wins() {
+        let shared = SharedCommittees::new();
+        let hash = CryptoHash::test_hash("c1");
+        let first = Arc::new(Committee::default());
+        let second = Arc::new(Committee::default());
+        let winner = shared.insert(hash, first.clone());
+        assert!(Arc::ptr_eq(&winner, &first));
+        let loser = shared.insert(hash, second.clone());
+        assert!(Arc::ptr_eq(&loser, &first));
+        assert!(!Arc::ptr_eq(&loser, &second));
+    }
+
+    #[test]
+    fn shared_committees_clones_share_storage() {
+        let a = SharedCommittees::new();
+        let b = a.clone();
+        let hash = CryptoHash::test_hash("c2");
+        let committee = Arc::new(Committee::default());
+        a.insert(hash, committee.clone());
+        let fetched = b.get(hash).unwrap();
+        assert!(Arc::ptr_eq(&fetched, &committee));
     }
 }

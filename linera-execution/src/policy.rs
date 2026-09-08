@@ -15,12 +15,38 @@ use allocative::Allocative;
 use linera_base::{
     data_types::{Amount, ArithmeticError, BlobContent, CompressedBytecode, Resources},
     ensure,
-    identifiers::BlobType,
+    identifiers::{ApplicationId, BlobType},
     vm::VmRuntime,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::ExecutionError;
+
+/// A flag that enables an optional protocol feature.
+///
+/// Flags are stored in [`ResourceControlPolicy::flags`] so that new features can be activated
+/// in future testnets or on mainnet by updating the policy, without breaking compatibility
+/// with chains and validators that don't have the feature enabled.
+#[repr(u32)]
+#[derive(
+    Eq,
+    PartialEq,
+    Ord,
+    PartialOrd,
+    Hash,
+    Clone,
+    Copy,
+    Debug,
+    Serialize,
+    Deserialize,
+    Allocative,
+    strum::Display,
+    strum::EnumString,
+)]
+pub enum ProtocolFlag {
+    #[doc(hidden)]
+    _Reserved = 0,
+}
 
 /// A collection of prices and limits associated with block execution.
 #[derive(Eq, PartialEq, Hash, Clone, Debug, Serialize, Deserialize, Allocative)]
@@ -47,9 +73,6 @@ pub struct ResourceControlPolicy {
     pub blob_byte_read: Amount,
     /// The price to publish a blob, per byte.
     pub blob_byte_published: Amount,
-    /// The price of increasing storage by a byte.
-    // TODO(#1536): This is not fully supported.
-    pub byte_stored: Amount,
     /// The base price of adding an operation to a block.
     pub operation: Amount,
     /// The additional price for each byte in the argument of a user operation.
@@ -94,6 +117,10 @@ pub struct ResourceControlPolicy {
     pub http_request_timeout_ms: u64,
     /// The list of hosts that contracts and services can send HTTP requests to.
     pub http_request_allow_list: BTreeSet<String>,
+    /// The list of application IDs for which all message- and event-related fees are waived.
+    pub free_application_ids: BTreeSet<ApplicationId>,
+    /// The set of optional protocol features that are enabled.
+    pub flags: BTreeSet<ProtocolFlag>,
 }
 
 impl fmt::Display for ResourceControlPolicy {
@@ -110,7 +137,6 @@ impl fmt::Display for ResourceControlPolicy {
             blob_published,
             blob_byte_read,
             blob_byte_published,
-            byte_stored,
             operation,
             operation_byte,
             message,
@@ -131,6 +157,8 @@ impl fmt::Display for ResourceControlPolicy {
             maximum_http_response_bytes,
             http_request_allow_list,
             http_request_timeout_ms,
+            free_application_ids,
+            flags,
         } = self;
         write!(
             f,
@@ -146,7 +174,6 @@ impl fmt::Display for ResourceControlPolicy {
             {blob_published:.2} base cost per published blob\n\
             {blob_byte_read:.2} cost of reading blobs, per byte\n\
             {blob_byte_published:.2} cost of publishing blobs, per byte\n\
-            {byte_stored:.2} cost per byte stored\n\
             {operation:.2} per operation\n\
             {operation_byte:.2} per byte in the argument of an operation\n\
             {service_as_oracle_query:.2} per query to a service as an oracle\n\
@@ -167,7 +194,9 @@ impl fmt::Display for ResourceControlPolicy {
             {maximum_oracle_response_bytes} maximum number of bytes of an oracle response\n\
             {maximum_http_response_bytes} maximum number of bytes of an HTTP response\n\
             {http_request_timeout_ms} ms timeout for HTTP requests\n\
-            HTTP hosts allowed for contracts and services: {http_request_allow_list:#?}\n",
+            HTTP hosts allowed for contracts and services: {http_request_allow_list:#?}\n\
+            Free application IDs: {free_application_ids:#?}\n\
+            Enabled protocol flags: {flags:#?}\n",
         )?;
         Ok(())
     }
@@ -196,7 +225,6 @@ impl ResourceControlPolicy {
             blob_published: Amount::ZERO,
             blob_byte_read: Amount::ZERO,
             blob_byte_published: Amount::ZERO,
-            byte_stored: Amount::ZERO,
             operation: Amount::ZERO,
             operation_byte: Amount::ZERO,
             message: Amount::ZERO,
@@ -217,7 +245,14 @@ impl ResourceControlPolicy {
             maximum_http_response_bytes: u64::MAX,
             http_request_timeout_ms: u64::MAX,
             http_request_allow_list: BTreeSet::new(),
+            free_application_ids: BTreeSet::new(),
+            flags: BTreeSet::new(),
         }
+    }
+
+    /// Returns whether the given application has its message- and event-related fees waived.
+    pub fn is_free_app(&self, app_id: &ApplicationId) -> bool {
+        self.free_application_ids.contains(app_id)
     }
 
     /// The maximum fuel per block according to the `VmRuntime`.
@@ -275,7 +310,6 @@ impl ResourceControlPolicy {
             blob_byte_published: Amount::from_nanos(100),
             read_operation: Amount::from_micros(10),
             write_operation: Amount::from_micros(20),
-            byte_stored: Amount::from_nanos(10),
             message_byte: Amount::from_nanos(100),
             operation_byte: Amount::from_nanos(10),
             operation: Amount::from_micros(10),
@@ -296,9 +330,12 @@ impl ResourceControlPolicy {
             maximum_http_response_bytes: 10_000,
             http_request_timeout_ms: 20_000,
             http_request_allow_list: BTreeSet::new(),
+            free_application_ids: BTreeSet::new(),
+            flags: BTreeSet::new(),
         }
     }
 
+    /// Returns the total price to charge for the given resources.
     pub fn total_price(&self, resources: &Resources) -> Result<Amount, ArithmeticError> {
         let mut amount = Amount::ZERO;
         amount.try_add_assign(self.fuel_price(resources.wasm_fuel, VmRuntime::Wasm)?)?;
@@ -323,7 +360,6 @@ impl ResourceControlPolicy {
         )?;
         amount.try_add_assign(self.message.try_mul(resources.messages as u128)?)?;
         amount.try_add_assign(self.message_bytes_price(resources.message_size as u64)?)?;
-        amount.try_add_assign(self.bytes_stored_price(resources.storage_size_delta as u64)?)?;
         amount.try_add_assign(
             self.service_as_oracle_queries_price(resources.service_as_oracle_queries)?,
         )?;
@@ -371,12 +407,6 @@ impl ResourceControlPolicy {
             .try_add(self.blob_published)
     }
 
-    // TODO(#1536): This is not fully implemented.
-    #[allow(dead_code)]
-    pub(crate) fn bytes_stored_price(&self, count: u64) -> Result<Amount, ArithmeticError> {
-        self.byte_stored.try_mul(count as u128)
-    }
-
     /// Returns how much it would cost to perform `count` queries to services running as oracles.
     pub(crate) fn service_as_oracle_queries_price(
         &self,
@@ -410,6 +440,7 @@ impl ResourceControlPolicy {
         u64::try_from(balance.saturating_ratio(fuel_unit)).unwrap_or(u64::MAX)
     }
 
+    /// Checks that the blob's size does not exceed the maximum allowed by this policy.
     pub fn check_blob_size(&self, content: &BlobContent) -> Result<(), ExecutionError> {
         ensure!(
             u64::try_from(content.bytes().len())
@@ -429,8 +460,10 @@ impl ResourceControlPolicy {
             }
             BlobType::Data
             | BlobType::ApplicationDescription
+            | BlobType::ApplicationFormats
             | BlobType::Committee
-            | BlobType::ChainDescription => {}
+            | BlobType::ChainDescription
+            | BlobType::CheckpointExecutionState => {}
         }
         Ok(())
     }

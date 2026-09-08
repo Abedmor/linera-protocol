@@ -1,0 +1,43 @@
+---
+source: crowd-funding/tests/format.rs
+expression: "CrowdFundingApplication::pruned_formats().unwrap()"
+---
+REGISTRY:
+  InstantiationArgument:
+    STRUCT:
+      - owner:
+          TYPENAME: AccountOwner
+      - deadline:
+          TYPENAME: Timestamp
+      - target:
+          TYPENAME: Amount
+  Message:
+    ENUM:
+      0:
+        PledgeWithAccount:
+          STRUCT:
+            - owner:
+                TYPENAME: AccountOwner
+            - amount:
+                TYPENAME: Amount
+  Operation:
+    ENUM:
+      202450794:
+        Cancel: UNIT
+      229616410:
+        Pledge:
+          STRUCT:
+            - owner:
+                TYPENAME: AccountOwner
+            - amount:
+                TYPENAME: Amount
+      255551373:
+        Collect: UNIT
+  Timestamp:
+    NEWTYPESTRUCT: U64
+OPERATION:
+  TYPENAME: Operation
+RESPONSE: UNIT
+MESSAGE:
+  TYPENAME: Message
+EVENT_VALUE: UNIT

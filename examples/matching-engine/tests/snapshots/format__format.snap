@@ -1,0 +1,71 @@
+---
+source: matching-engine/tests/format.rs
+expression: "MatchingEngineApplication::pruned_formats().unwrap()"
+---
+REGISTRY:
+  Message:
+    ENUM:
+      0:
+        ExecuteOrder:
+          STRUCT:
+            - order:
+                TYPENAME: Order
+  Operation:
+    ENUM:
+      180705481:
+        CloseChain: UNIT
+      248831914:
+        ExecuteOrder:
+          STRUCT:
+            - order:
+                TYPENAME: Order
+  Order:
+    ENUM:
+      0:
+        Insert:
+          STRUCT:
+            - owner:
+                TYPENAME: AccountOwner
+            - quantity:
+                TYPENAME: Amount
+            - nature:
+                TYPENAME: OrderNature
+            - price:
+                TYPENAME: Price
+      1:
+        Cancel:
+          STRUCT:
+            - owner:
+                TYPENAME: AccountOwner
+            - order_id: U64
+      2:
+        Modify:
+          STRUCT:
+            - owner:
+                TYPENAME: AccountOwner
+            - order_id: U64
+            - reduce_quantity:
+                TYPENAME: Amount
+  OrderNature:
+    ENUM:
+      0:
+        Bid: UNIT
+      1:
+        Ask: UNIT
+  Parameters:
+    STRUCT:
+      - tokens:
+          TUPLEARRAY:
+            CONTENT:
+              TYPENAME: ApplicationId
+            SIZE: 2
+      - price_decimals: U16
+  Price:
+    STRUCT:
+      - price: U64
+OPERATION:
+  TYPENAME: Operation
+RESPONSE: UNIT
+MESSAGE:
+  TYPENAME: Message
+EVENT_VALUE: UNIT

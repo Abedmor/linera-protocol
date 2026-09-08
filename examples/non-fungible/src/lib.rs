@@ -7,6 +7,7 @@ use std::fmt::{Display, Formatter};
 
 use async_graphql::{InputObject, Request, Response, SimpleObject};
 use linera_sdk::{
+    formats::StableEnum,
     linera_base_types::{
         Account, AccountOwner, ApplicationId, ChainId, ContractAbi, DataBlobHash, ServiceAbi,
     },
@@ -35,7 +36,7 @@ impl ServiceAbi for NonFungibleTokenAbi {
 }
 
 /// An operation.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, StableEnum)]
 pub enum Operation {
     /// Mints a token
     Mint {
@@ -147,5 +148,55 @@ impl Nft {
         Ok(TokenId {
             id: hasher.finalize().to_vec(),
         })
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod formats {
+    use linera_sdk::{
+        formats::{BcsApplication, Formats, TracerExt},
+        linera_base_types::{Account, AccountOwner},
+    };
+    use serde_reflection::{Samples, Tracer, TracerConfig};
+
+    use super::{Message, Nft, NftOutput, NonFungibleTokenAbi, Operation, TokenId};
+
+    /// The NonFungible application.
+    pub struct NonFungibleApplication;
+
+    impl BcsApplication for NonFungibleApplication {
+        type Abi = NonFungibleTokenAbi;
+
+        fn formats() -> serde_reflection::Result<Formats> {
+            let mut tracer = Tracer::new(
+                TracerConfig::default()
+                    .record_samples_for_newtype_structs(true)
+                    .record_samples_for_tuple_structs(true),
+            );
+            let samples = Samples::new();
+
+            // Trace the ABI types
+            let operation = tracer.trace_stable_enum_type::<Operation>(&samples)?;
+            let (response, _) = tracer.trace_type::<()>(&samples)?;
+            let (message, _) = tracer.trace_type::<Message>(&samples)?;
+            let (event_value, _) = tracer.trace_type::<()>(&samples)?;
+
+            // Trace additional supporting types (notably all enums) to populate the registry
+            tracer.trace_type::<TokenId>(&samples)?;
+            tracer.trace_type::<Nft>(&samples)?;
+            tracer.trace_type::<NftOutput>(&samples)?;
+            tracer.trace_type::<Account>(&samples)?;
+            tracer.trace_type::<AccountOwner>(&samples)?;
+
+            let registry = tracer.registry()?;
+
+            Ok(Formats {
+                registry,
+                operation,
+                response,
+                message,
+                event_value,
+            })
+        }
     }
 }

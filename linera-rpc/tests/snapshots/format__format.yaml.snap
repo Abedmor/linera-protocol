@@ -96,10 +96,7 @@ ApplicationPermissions:
     - mandatory_applications:
         SEQ:
           TYPENAME: ApplicationId
-    - close_chain:
-        SEQ:
-          TYPENAME: ApplicationId
-    - change_application_permissions:
+    - manage_chain:
         SEQ:
           TYPENAME: ApplicationId
     - call_service_as_oracle:
@@ -137,6 +134,10 @@ BlobType:
       Committee: UNIT
     6:
       ChainDescription: UNIT
+    7:
+      ApplicationFormats: UNIT
+    8:
+      CheckpointExecutionState: UNIT
 Block:
   STRUCT:
     - header:
@@ -242,12 +243,6 @@ BlockHeader:
           TYPENAME: AccountOwner
 BlockHeight:
   NEWTYPESTRUCT: U64
-BlockHeightRange:
-  STRUCT:
-    - start:
-        TYPENAME: BlockHeight
-    - limit:
-        OPTION: U64
 BlockProposal:
   STRUCT:
     - content:
@@ -322,13 +317,9 @@ ChainInfo:
     - requested_owner_balance:
         OPTION:
           TYPENAME: Amount
-    - requested_committees:
+    - committee_hash:
         OPTION:
-          MAP:
-            KEY:
-              TYPENAME: Epoch
-            VALUE:
-              TYPENAME: Committee
+          TYPENAME: CryptoHash
     - requested_pending_message_bundles:
         SEQ:
           TYPENAME: IncomingBundle
@@ -339,6 +330,17 @@ ChainInfo:
     - requested_received_log:
         SEQ:
           TYPENAME: ChainAndHeight
+    - requested_previous_event_blocks:
+        MAP:
+          KEY:
+            TYPENAME: StreamId
+          VALUE:
+            TUPLE:
+              - TYPENAME: BlockHeight
+              - TYPENAME: CryptoHash
+    - requested_latest_checkpoint_height:
+        OPTION:
+          TYPENAME: BlockHeight
 ChainInfoQuery:
   STRUCT:
     - chain_id:
@@ -348,11 +350,7 @@ ChainInfoQuery:
           TYPENAME: BlockHeight
     - request_owner_balance:
         TYPENAME: AccountOwner
-    - request_committees: BOOL
     - request_pending_message_bundles: BOOL
-    - request_sent_certificate_hashes_in_range:
-        OPTION:
-          TYPENAME: BlockHeightRange
     - request_received_log_excluding_first_n:
         OPTION: U64
     - request_manager_values: BOOL
@@ -365,7 +363,10 @@ ChainInfoQuery:
     - request_sent_certificate_hashes_by_heights:
         SEQ:
           TYPENAME: BlockHeight
-    - create_network_actions: BOOL
+    - request_previous_event_blocks:
+        SEQ:
+          TYPENAME: StreamId
+    - request_latest_checkpoint_height: BOOL
 ChainInfoResponse:
   STRUCT:
     - info:
@@ -443,27 +444,23 @@ ChainOwnership:
     - open_multi_leader_rounds: BOOL
     - timeout_config:
         TYPENAME: TimeoutConfig
-Committee:
-  STRUCT:
-    - validators:
-        MAP:
-          KEY:
-            TYPENAME: Secp256k1PublicKey
-          VALUE:
-            TYPENAME: ValidatorState
-    - policy:
-        TYPENAME: ResourceControlPolicy
 ConfirmedBlockCertificate:
   STRUCT:
     - value:
         TYPENAME: Block
     - round:
         TYPENAME: Round
+    - first_round: BOOL
+    - justification_commitment:
+        OPTION:
+          TYPENAME: CryptoHash
     - signatures:
         SEQ:
           TUPLE:
             - TYPENAME: Secp256k1PublicKey
             - TYPENAME: Secp256k1Signature
+    - justification:
+        TYPENAME: JustificationChain
 CrateVersion:
   STRUCT:
     - major: U32
@@ -483,6 +480,9 @@ CrossChainRequest:
                 TUPLE:
                   - TYPENAME: Epoch
                   - TYPENAME: MessageBundle
+          - previous_height:
+              OPTION:
+                TYPENAME: BlockHeight
     1:
       ConfirmUpdatedRecipient:
         STRUCT:
@@ -492,11 +492,25 @@ CrossChainRequest:
               TYPENAME: ChainId
           - latest_height:
               TYPENAME: BlockHeight
+    2:
+      RevertConfirm:
+        STRUCT:
+          - sender:
+              TYPENAME: ChainId
+          - recipient:
+              TYPENAME: ChainId
+          - retransmit_from:
+              TYPENAME: BlockHeight
 CryptoHash:
   NEWTYPESTRUCT:
     TUPLEARRAY:
       CONTENT: U8
       SIZE: 32
+Cursor:
+  STRUCT:
+    - height:
+        TYPENAME: BlockHeight
+    - index: U32
 Ed25519PublicKey:
   NEWTYPESTRUCT:
     TUPLEARRAY:
@@ -576,20 +590,41 @@ InitialChainConfig:
         TYPENAME: ChainOwnership
     - epoch:
         TYPENAME: Epoch
-    - min_active_epoch:
-        TYPENAME: Epoch
-    - max_active_epoch:
-        TYPENAME: Epoch
+    - account:
+        TYPENAME: AccountOwner
     - balance:
         TYPENAME: Amount
     - application_permissions:
         TYPENAME: ApplicationPermissions
+JustificationChain:
+  STRUCT:
+    - links:
+        SEQ:
+          TYPENAME: JustificationLink
+JustificationLink:
+  STRUCT:
+    - round:
+        TYPENAME: Round
+    - signatures:
+        SEQ:
+          TUPLE:
+            - TYPENAME: Secp256k1PublicKey
+            - TYPENAME: Secp256k1Signature
 LiteCertificate:
   STRUCT:
     - value:
         TYPENAME: LiteValue
     - round:
         TYPENAME: Round
+    - unlocking_round:
+        OPTION:
+          TYPENAME: Round
+    - first_round: BOOL
+    - justification_commitment:
+        OPTION:
+          TYPENAME: CryptoHash
+    - justification:
+        TYPENAME: JustificationChain
     - signatures:
         SEQ:
           TUPLE:
@@ -609,6 +644,13 @@ LiteVote:
         TYPENAME: LiteValue
     - round:
         TYPENAME: Round
+    - unlocking_round:
+        OPTION:
+          TYPENAME: Round
+    - first_round: BOOL
+    - justification_commitment:
+        OPTION:
+          TYPENAME: CryptoHash
     - signature:
         TYPENAME: Secp256k1Signature
 LockingBlock:
@@ -669,6 +711,9 @@ ModuleId:
         TYPENAME: CryptoHash
     - vm_runtime:
         TYPENAME: VmRuntime
+    - formats_blob_hash:
+        OPTION:
+          TYPENAME: CryptoHash
 NetworkDescription:
   STRUCT:
     - name: STR
@@ -718,71 +763,77 @@ NodeError:
           - found_block_height:
               TYPENAME: BlockHeight
     8:
-      MissingCrossChainUpdate:
+      MissingCrossChainUpdates:
         STRUCT:
           - chain_id:
               TYPENAME: ChainId
-          - origin:
-              TYPENAME: ChainId
-          - height:
-              TYPENAME: BlockHeight
+          - bundles:
+              SEQ:
+                TUPLE:
+                  - TYPENAME: ChainId
+                  - TYPENAME: BlockHeight
     9:
       BlobsNotFound:
         NEWTYPE:
           SEQ:
             TYPENAME: BlobId
     10:
+      BlocksNotFound:
+        NEWTYPE:
+          SEQ:
+            TYPENAME: CryptoHash
+    11:
       EventsNotFound:
         NEWTYPE:
           SEQ:
             TYPENAME: EventId
-    11:
-      MissingCertificateValue: UNIT
     12:
+      MissingCertificateValue: UNIT
+    13:
       MissingCertificates:
         NEWTYPE:
           SEQ:
             TYPENAME: CryptoHash
-    13:
+    14:
       MissingVoteInValidatorResponse:
         NEWTYPE: STR
-    14:
-      InvalidChainInfoResponse: UNIT
     15:
-      UnexpectedCertificateValue: UNIT
+      InvalidChainInfoResponse: UNIT
     16:
-      InvalidDecoding: UNIT
+      UnexpectedCertificateValue: UNIT
     17:
-      UnexpectedMessage: UNIT
+      InvalidDecoding: UNIT
     18:
+      UnexpectedMessage: UNIT
+    19:
       GrpcError:
         STRUCT:
           - error: STR
-    19:
+    20:
       ClientIoError:
         STRUCT:
           - error: STR
-    20:
+    21:
       CannotResolveValidatorAddress:
         STRUCT:
           - address: STR
-    21:
+    22:
       SubscriptionError:
         STRUCT:
           - transport: STR
-    22:
+    23:
       SubscriptionFailed:
         STRUCT:
           - status: STR
-    23:
+    24:
       InvalidCertificateForBlob:
         NEWTYPE:
           TYPENAME: BlobId
-    24:
-      DuplicatesInBlobsNotFound: UNIT
     25:
-      UnexpectedEntriesInBlobsNotFound: UNIT
+      DuplicatesInBlobsNotFound: UNIT
     26:
+      UnexpectedEntriesInBlobsNotFound: UNIT
+    27:
       UnexpectedCertificates:
         STRUCT:
           - returned:
@@ -791,13 +842,13 @@ NodeError:
           - requested:
               SEQ:
                 TYPENAME: CryptoHash
-    27:
-      EmptyBlobsNotFound: UNIT
     28:
+      EmptyBlobsNotFound: UNIT
+    29:
       ResponseHandlingError:
         STRUCT:
           - error: STR
-    29:
+    30:
       MissingCertificatesByHeights:
         STRUCT:
           - chain_id:
@@ -805,14 +856,14 @@ NodeError:
           - heights:
               SEQ:
                 TYPENAME: BlockHeight
-    30:
+    31:
       TooManyCertificatesReturned:
         STRUCT:
           - chain_id:
               TYPENAME: ChainId
           - remote_node:
               TYPENAME: Secp256k1PublicKey
-    31:
+    32:
       InvalidTimestamp:
         STRUCT:
           - block_timestamp:
@@ -820,10 +871,20 @@ NodeError:
           - local_time:
               TYPENAME: Timestamp
           - block_time_grace_period_ms: U64
+    33:
+      NoValidators: UNIT
+Notification:
+  STRUCT:
+    - chain_id:
+        TYPENAME: ChainId
+    - reason:
+        TYPENAME: Reason
 OpenChainConfig:
   STRUCT:
     - ownership:
         TYPENAME: ChainOwnership
+    - account:
+        TYPENAME: AccountOwner
     - balance:
         TYPENAME: Amount
     - application_permissions:
@@ -870,6 +931,23 @@ OracleResponse:
       EventExists:
         NEWTYPE:
           TYPENAME: EventId
+    7:
+      Checkpoint:
+        STRUCT:
+          - execution_state_blobs:
+              SEQ:
+                TYPENAME: CryptoHash
+          - used_blobs:
+              SEQ:
+                TYPENAME: BlobId
+          - outbox_block_hashes:
+              SEQ:
+                TYPENAME: CryptoHash
+          - inbox_cursors:
+              SEQ:
+                TUPLE:
+                  - TYPENAME: ChainId
+                  - TYPENAME: Cursor
 OriginalProposal:
   ENUM:
     0:
@@ -909,7 +987,6 @@ PostedMessage:
           TYPENAME: Account
     - kind:
         TYPENAME: MessageKind
-    - index: U32
     - message:
         TYPENAME: Message
 ProposalContent:
@@ -940,59 +1017,46 @@ ProposedBlock:
     - previous_block_hash:
         OPTION:
           TYPENAME: CryptoHash
-ResourceControlPolicy:
-  STRUCT:
-    - wasm_fuel_unit:
-        TYPENAME: Amount
-    - evm_fuel_unit:
-        TYPENAME: Amount
-    - read_operation:
-        TYPENAME: Amount
-    - write_operation:
-        TYPENAME: Amount
-    - byte_runtime:
-        TYPENAME: Amount
-    - byte_read:
-        TYPENAME: Amount
-    - byte_written:
-        TYPENAME: Amount
-    - blob_read:
-        TYPENAME: Amount
-    - blob_published:
-        TYPENAME: Amount
-    - blob_byte_read:
-        TYPENAME: Amount
-    - blob_byte_published:
-        TYPENAME: Amount
-    - byte_stored:
-        TYPENAME: Amount
-    - operation:
-        TYPENAME: Amount
-    - operation_byte:
-        TYPENAME: Amount
-    - message:
-        TYPENAME: Amount
-    - message_byte:
-        TYPENAME: Amount
-    - service_as_oracle_query:
-        TYPENAME: Amount
-    - http_request:
-        TYPENAME: Amount
-    - maximum_wasm_fuel_per_block: U64
-    - maximum_evm_fuel_per_block: U64
-    - maximum_service_oracle_execution_ms: U64
-    - maximum_block_size: U64
-    - maximum_bytecode_size: U64
-    - maximum_blob_size: U64
-    - maximum_published_blobs: U64
-    - maximum_block_proposal_size: U64
-    - maximum_bytes_read_per_block: U64
-    - maximum_bytes_written_per_block: U64
-    - maximum_oracle_response_bytes: U64
-    - maximum_http_response_bytes: U64
-    - http_request_timeout_ms: U64
-    - http_request_allow_list:
-        SEQ: STR
+Reason:
+  ENUM:
+    0:
+      NewBlock:
+        STRUCT:
+          - height:
+              TYPENAME: BlockHeight
+          - hash:
+              TYPENAME: CryptoHash
+    1:
+      NewEvents:
+        STRUCT:
+          - height:
+              TYPENAME: BlockHeight
+          - block_hash:
+              TYPENAME: CryptoHash
+          - event_streams:
+              SEQ:
+                TYPENAME: StreamId
+    2:
+      NewIncomingBundle:
+        STRUCT:
+          - origin:
+              TYPENAME: ChainId
+          - height:
+              TYPENAME: BlockHeight
+    3:
+      NewRound:
+        STRUCT:
+          - height:
+              TYPENAME: BlockHeight
+          - round:
+              TYPENAME: Round
+    4:
+      BlockExecuted:
+        STRUCT:
+          - height:
+              TYPENAME: BlockHeight
+          - hash:
+              TYPENAME: CryptoHash
 Response:
   STRUCT:
     - status: U16
@@ -1048,125 +1112,150 @@ RpcMessage:
         NEWTYPE:
           TYPENAME: BlobId
     8:
+      DownloadBlobs:
+        NEWTYPE:
+          SEQ:
+            TYPENAME: BlobId
+    9:
       DownloadPendingBlob:
         NEWTYPE:
           TUPLE:
             - TYPENAME: ChainId
             - TYPENAME: BlobId
-    9:
+    10:
       HandlePendingBlob:
         NEWTYPE:
           TUPLE:
             - TYPENAME: ChainId
             - TYPENAME: BlobContent
-    10:
+    11:
       DownloadConfirmedBlock:
         NEWTYPE:
           TYPENAME: CryptoHash
-    11:
+    12:
       DownloadCertificates:
         NEWTYPE:
           SEQ:
             TYPENAME: CryptoHash
-    12:
+    13:
       DownloadCertificatesByHeights:
         TUPLE:
           - TYPENAME: ChainId
           - SEQ:
               TYPENAME: BlockHeight
-    13:
+    14:
       BlobLastUsedBy:
         NEWTYPE:
           TYPENAME: BlobId
-    14:
+    15:
       MissingBlobIds:
         NEWTYPE:
           SEQ:
             TYPENAME: BlobId
-    15:
-      VersionInfoQuery: UNIT
     16:
-      NetworkDescriptionQuery: UNIT
+      EventBlockHeights:
+        NEWTYPE:
+          SEQ:
+            TYPENAME: EventId
     17:
+      VersionInfoQuery: UNIT
+    18:
+      NetworkDescriptionQuery: UNIT
+    19:
       Vote:
         NEWTYPE:
           TYPENAME: LiteVote
-    18:
+    20:
       ChainInfoResponse:
         NEWTYPE:
           TYPENAME: ChainInfoResponse
-    19:
+    21:
       Error:
         NEWTYPE:
           TYPENAME: NodeError
-    20:
+    22:
       VersionInfoResponse:
         NEWTYPE:
           TYPENAME: VersionInfo
-    21:
+    23:
       NetworkDescriptionResponse:
         NEWTYPE:
           TYPENAME: NetworkDescription
-    22:
+    24:
       UploadBlobResponse:
         NEWTYPE:
           TYPENAME: BlobId
-    23:
+    25:
       DownloadBlobResponse:
         NEWTYPE:
           TYPENAME: BlobContent
-    24:
+    26:
       DownloadPendingBlobResponse:
         NEWTYPE:
           TYPENAME: BlobContent
-    25:
+    27:
       DownloadConfirmedBlockResponse:
         NEWTYPE:
           TYPENAME: Block
-    26:
+    28:
       DownloadCertificatesResponse:
         NEWTYPE:
           SEQ:
             TYPENAME: ConfirmedBlockCertificate
-    27:
+    29:
       DownloadCertificatesByHeightsResponse:
         NEWTYPE:
           SEQ:
             TYPENAME: ConfirmedBlockCertificate
-    28:
+    30:
       BlobLastUsedByResponse:
         NEWTYPE:
           TYPENAME: CryptoHash
-    29:
+    31:
       MissingBlobIdsResponse:
         NEWTYPE:
           SEQ:
             TYPENAME: BlobId
-    30:
+    32:
+      EventBlockHeightsResponse:
+        NEWTYPE:
+          SEQ:
+            OPTION:
+              TYPENAME: BlockHeight
+    33:
       CrossChainRequest:
         NEWTYPE:
           TYPENAME: CrossChainRequest
-    31:
+    34:
       BlobLastUsedByCertificate:
         NEWTYPE:
           TYPENAME: BlobId
-    32:
+    35:
       BlobLastUsedByCertificateResponse:
         NEWTYPE:
           TYPENAME: ConfirmedBlockCertificate
-    33:
+    36:
       ShardInfoQuery:
         NEWTYPE:
           TYPENAME: ChainId
-    34:
+    37:
       ShardInfoResponse:
         NEWTYPE:
           TYPENAME: ShardInfo
+    38:
+      SubscribeNotifications:
+        NEWTYPE:
+          SEQ:
+            TYPENAME: ChainId
+    39:
+      Notification:
+        NEWTYPE:
+          TYPENAME: Notification
 Secp256k1PublicKey:
   NEWTYPESTRUCT:
     TUPLEARRAY:
       CONTENT: U8
-      SIZE: 33
+      SIZE: 65
 Secp256k1Signature:
   NEWTYPESTRUCT:
     TUPLEARRAY:
@@ -1204,6 +1293,11 @@ SystemMessage:
               TYPENAME: Amount
           - recipient:
               TYPENAME: Account
+    2:
+      CheckpointAck:
+        STRUCT:
+          - latest_received_cursor:
+              TYPENAME: Cursor
 SystemOperation:
   ENUM:
     0:
@@ -1288,17 +1382,18 @@ SystemOperation:
         NEWTYPE:
           TYPENAME: Epoch
     12:
-      ProcessRemovedEpoch:
-        NEWTYPE:
-          TYPENAME: Epoch
+      UpdateStream:
+        STRUCT:
+          - application_id:
+              TYPENAME: ApplicationId
+          - chain_id:
+              TYPENAME: ChainId
+          - stream_id:
+              TYPENAME: StreamId
+          - first_index: U32
+          - next_index: U32
     13:
-      UpdateStreams:
-        NEWTYPE:
-          SEQ:
-            TUPLE:
-              - TYPENAME: ChainId
-              - TYPENAME: StreamId
-              - U32
+      Checkpoint: UNIT
 TimeDelta:
   NEWTYPESTRUCT: U64
 Timeout:
@@ -1349,17 +1444,19 @@ ValidatedBlockCertificate:
         TYPENAME: Block
     - round:
         TYPENAME: Round
+    - unlocking_round:
+        OPTION:
+          TYPENAME: Round
+    - justification_commitment:
+        OPTION:
+          TYPENAME: CryptoHash
     - signatures:
         SEQ:
           TUPLE:
             - TYPENAME: Secp256k1PublicKey
             - TYPENAME: Secp256k1Signature
-ValidatorState:
-  STRUCT:
-    - network_address: STR
-    - votes: U64
-    - account_public_key:
-        TYPENAME: AccountPublicKey
+    - justification:
+        TYPENAME: JustificationChain
 VersionInfo:
   STRUCT:
     - crate_version:

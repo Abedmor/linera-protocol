@@ -1,0 +1,85 @@
+---
+source: gen-nft/tests/format.rs
+expression: "GenNftApplication::pruned_formats().unwrap()"
+---
+REGISTRY:
+  Account:
+    STRUCT:
+      - chain_id:
+          TYPENAME: ChainId
+      - owner:
+          TYPENAME: AccountOwner
+  ChainId:
+    NEWTYPESTRUCT:
+      TYPENAME: CryptoHash
+  Message:
+    ENUM:
+      0:
+        Transfer:
+          STRUCT:
+            - nft:
+                TYPENAME: Nft
+            - target_account:
+                TYPENAME: Account
+      1:
+        Claim:
+          STRUCT:
+            - source_account:
+                TYPENAME: Account
+            - token_id:
+                TYPENAME: TokenId
+            - target_account:
+                TYPENAME: Account
+  Nft:
+    STRUCT:
+      - tokenId:
+          TYPENAME: TokenId
+      - owner:
+          TYPENAME: AccountOwner
+      - prompt: STR
+      - minter:
+          TYPENAME: AccountOwner
+  NftOutput:
+    STRUCT:
+      - tokenId: STR
+      - owner:
+          TYPENAME: AccountOwner
+      - prompt: STR
+      - minter:
+          TYPENAME: AccountOwner
+  Operation:
+    ENUM:
+      144297355:
+        Transfer:
+          STRUCT:
+            - source_owner:
+                TYPENAME: AccountOwner
+            - token_id:
+                TYPENAME: TokenId
+            - target_account:
+                TYPENAME: Account
+      189683137:
+        Mint:
+          STRUCT:
+            - minter:
+                TYPENAME: AccountOwner
+            - prompt: STR
+      204322437:
+        Claim:
+          STRUCT:
+            - source_account:
+                TYPENAME: Account
+            - token_id:
+                TYPENAME: TokenId
+            - target_account:
+                TYPENAME: Account
+  TokenId:
+    STRUCT:
+      - id:
+          SEQ: U8
+OPERATION:
+  TYPENAME: Operation
+RESPONSE: UNIT
+MESSAGE:
+  TYPENAME: Message
+EVENT_VALUE: UNIT

@@ -1,10 +1,10 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::cast_possible_truncation)]
+
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use linera_base::time::{Duration, Instant};
-#[cfg(with_dynamodb)]
-use linera_views::dynamo_db::DynamoDbDatabase;
 #[cfg(with_rocksdb)]
 use linera_views::rocks_db::RocksDbDatabase;
 #[cfg(with_scylladb)]
@@ -61,8 +61,7 @@ where
     D::Store: ReadableKeyValueStore + WritableKeyValueStore + Clone + 'static,
 {
     let database = D::connect_test_namespace().await.unwrap();
-    let store = database.open_shared(&[]).unwrap();
-    let context = ViewContext::<(), D::Store>::create_root_context(store, ())
+    let context = ViewContext::<(), D::Store>::create_root_context(&database, &[], ())
         .await
         .unwrap();
     let mut total_time = Duration::ZERO;
@@ -111,15 +110,6 @@ fn bench_queue_view(criterion: &mut Criterion) {
             })
     });
 
-    #[cfg(with_dynamodb)]
-    criterion.bench_function("dynamodb_queue_view", |bencher| {
-        bencher
-            .to_async(Runtime::new().expect("Failed to create Tokio runtime"))
-            .iter_custom(|iterations| async move {
-                performance_queue_view::<DynamoDbDatabase>(iterations).await
-            })
-    });
-
     #[cfg(with_scylladb)]
     criterion.bench_function("scylladb_queue_view", |bencher| {
         bencher
@@ -142,8 +132,7 @@ where
     D::Store: ReadableKeyValueStore + WritableKeyValueStore + Clone + 'static,
 {
     let database = D::connect_test_namespace().await.unwrap();
-    let store = database.open_shared(&[]).unwrap();
-    let context = ViewContext::<(), D::Store>::create_root_context(store, ())
+    let context = ViewContext::<(), D::Store>::create_root_context(&database, &[], ())
         .await
         .unwrap();
     let mut total_time = Duration::ZERO;
@@ -193,15 +182,6 @@ fn bench_bucket_queue_view(criterion: &mut Criterion) {
             })
     });
 
-    #[cfg(with_dynamodb)]
-    criterion.bench_function("dynamodb_bucket_queue_view", |bencher| {
-        bencher
-            .to_async(Runtime::new().expect("Failed to create Tokio runtime"))
-            .iter_custom(|iterations| async move {
-                performance_bucket_queue_view::<DynamoDbDatabase>(iterations).await
-            })
-    });
-
     #[cfg(with_scylladb)]
     criterion.bench_function("scylladb_bucket_queue_view", |bencher| {
         bencher
@@ -228,8 +208,7 @@ where
 
     for _ in 0..iterations {
         let database = D::connect_test_namespace().await.unwrap();
-        let store = database.open_shared(&[]).unwrap();
-        let context = ViewContext::<(), D::Store>::create_root_context(store, ())
+        let context = ViewContext::<(), D::Store>::create_root_context(&database, &[], ())
             .await
             .unwrap();
 
@@ -265,8 +244,7 @@ where
 
     for _ in 0..iterations {
         let database = D::connect_test_namespace().await.unwrap();
-        let store = database.open_shared(&[]).unwrap();
-        let context = ViewContext::<(), D::Store>::create_root_context(store, ())
+        let context = ViewContext::<(), D::Store>::create_root_context(&database, &[], ())
             .await
             .unwrap();
 

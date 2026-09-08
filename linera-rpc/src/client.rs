@@ -4,7 +4,7 @@
 use linera_base::{
     crypto::CryptoHash,
     data_types::{BlobContent, BlockHeight, NetworkDescription},
-    identifiers::{BlobId, ChainId},
+    identifiers::{BlobId, ChainId, EventId},
 };
 use linera_chain::{
     data_types::BlockProposal,
@@ -14,23 +14,27 @@ use linera_chain::{
 };
 use linera_core::{
     data_types::{ChainInfoQuery, ChainInfoResponse},
-    node::{CrossChainMessageDelivery, NodeError, NotificationStream, ValidatorNode},
+    node::{BlobStream, CrossChainMessageDelivery, NodeError, NotificationStream, ValidatorNode},
 };
+use linera_storage::Arc as CacheArc;
 
 use crate::grpc::GrpcClient;
 #[cfg(with_simple_network)]
 use crate::simple::SimpleClient;
 
+/// A client for communicating with a validator over one of the supported networks.
 #[derive(Clone)]
 pub enum Client {
-    Grpc(GrpcClient),
+    /// A client using the gRPC network.
+    Grpc(Box<GrpcClient>),
+    /// A client using the simple (UDP or TCP) network.
     #[cfg(with_simple_network)]
     Simple(SimpleClient),
 }
 
 impl From<GrpcClient> for Client {
     fn from(client: GrpcClient) -> Self {
-        Self::Grpc(client)
+        Self::Grpc(Box::new(client))
     }
 }
 
@@ -101,7 +105,7 @@ impl ValidatorNode for Client {
 
     async fn handle_confirmed_certificate(
         &self,
-        certificate: ConfirmedBlockCertificate,
+        certificate: CacheArc<ConfirmedBlockCertificate>,
         delivery: CrossChainMessageDelivery,
     ) -> Result<ChainInfoResponse, NodeError> {
         match self {
@@ -195,6 +199,15 @@ impl ValidatorNode for Client {
         })
     }
 
+    async fn download_blobs(&self, blob_ids: Vec<BlobId>) -> Result<BlobStream, NodeError> {
+        Ok(match self {
+            Client::Grpc(grpc_client) => grpc_client.download_blobs(blob_ids).await?,
+
+            #[cfg(with_simple_network)]
+            Client::Simple(simple_client) => simple_client.download_blobs(blob_ids).await?,
+        })
+    }
+
     async fn download_pending_blob(
         &self,
         chain_id: ChainId,
@@ -272,6 +285,18 @@ impl ValidatorNode for Client {
                     .download_certificates_by_heights(chain_id, heights)
                     .await?
             }
+        })
+    }
+
+    async fn event_block_heights(
+        &self,
+        event_ids: Vec<EventId>,
+    ) -> Result<Vec<Option<BlockHeight>>, NodeError> {
+        Ok(match self {
+            Client::Grpc(grpc_client) => grpc_client.event_block_heights(event_ids).await?,
+
+            #[cfg(with_simple_network)]
+            Client::Simple(simple_client) => simple_client.event_block_heights(event_ids).await?,
         })
     }
 

@@ -3,10 +3,14 @@
 
 //! GraphQL-compatible structured metadata representations for operations and messages.
 
+// The GraphQL spec only has signed integer scalars, so this module casts
+// `u32` to `i32` at the API boundary. The casts are by design.
+#![allow(clippy::cast_possible_wrap)]
+
 use async_graphql::SimpleObject;
 use linera_base::{
     crypto::CryptoHash,
-    data_types::{Amount, ApplicationPermissions},
+    data_types::{Amount, ApplicationPermissions, Cursor},
     hex,
     identifiers::{Account, AccountOwner, ApplicationId, ChainId},
     ownership::{ChainOwnership, TimeoutConfig},
@@ -54,7 +58,7 @@ impl From<&ChainOwnership> for ChainOwnershipMetadata {
             // Fallback to Debug format should never be needed, as ChainOwnership implements Serialize.
             // But we include it as a safety measure for GraphQL responses to always succeed.
             ownership_json: serde_json::to_string(ownership)
-                .unwrap_or_else(|_| format!("{:?}", ownership)),
+                .unwrap_or_else(|_| format!("{ownership:?}")),
         }
     }
 }
@@ -72,7 +76,7 @@ impl From<&ApplicationPermissions> for ApplicationPermissionsMetadata {
             // Fallback to Debug format should never be needed, as ApplicationPermissions implements Serialize.
             // But we include it as a safety measure for GraphQL responses to always succeed.
             permissions_json: serde_json::to_string(permissions)
-                .unwrap_or_else(|_| format!("{:?}", permissions)),
+                .unwrap_or_else(|_| format!("{permissions:?}")),
         }
     }
 }
@@ -102,14 +106,14 @@ pub struct SystemOperationMetadata {
     pub verify_blob: Option<VerifyBlobMetadata>,
     /// Publish module operation details
     pub publish_module: Option<PublishModuleMetadata>,
-    /// Epoch operation details (`ProcessNewEpoch`, `ProcessRemovedEpoch`)
+    /// Epoch operation details (`ProcessNewEpoch`)
     pub epoch: Option<i32>,
-    /// `UpdateStreams` operation details
-    pub update_streams: Option<Vec<UpdateStreamMetadata>>,
+    /// `UpdateStream` operation details
+    pub update_stream: Option<UpdateStreamMetadata>,
 }
 
 impl SystemOperationMetadata {
-    /// Creates a new metadata with the given operation type and all fields set to None.
+    /// Creates a new metadata with the given operation type and all fields set to `None`.
     fn new(system_operation_type: &str) -> Self {
         SystemOperationMetadata {
             system_operation_type: system_operation_type.to_string(),
@@ -124,7 +128,7 @@ impl SystemOperationMetadata {
             verify_blob: None,
             publish_module: None,
             epoch: None,
-            update_streams: None,
+            update_stream: None,
         }
     }
 }
@@ -132,92 +136,130 @@ impl SystemOperationMetadata {
 /// Transfer operation metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, SimpleObject)]
 pub struct TransferOperationMetadata {
+    /// The account owner whose balance is debited.
     pub owner: AccountOwner,
+    /// The account that receives the transferred tokens.
     pub recipient: Account,
+    /// The amount of tokens to transfer.
     pub amount: Amount,
 }
 
 /// Claim operation metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, SimpleObject)]
 pub struct ClaimOperationMetadata {
+    /// The account owner whose balance is being claimed.
     pub owner: AccountOwner,
+    /// The chain on which the claimed balance is held.
     pub target_id: ChainId,
+    /// The account that receives the claimed tokens.
     pub recipient: Account,
+    /// The amount of tokens to claim.
     pub amount: Amount,
 }
 
 /// Open chain operation metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, SimpleObject)]
 pub struct OpenChainOperationMetadata {
+    /// The account on the new chain credited with the initial balance.
+    pub account: AccountOwner,
+    /// The initial balance credited to `account`.
     pub balance: Amount,
+    /// The ownership configuration of the new chain.
     pub ownership: ChainOwnershipMetadata,
+    /// The application permissions of the new chain.
     pub application_permissions: ApplicationPermissionsMetadata,
 }
 
 /// Change ownership operation metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, SimpleObject)]
 pub struct ChangeOwnershipOperationMetadata {
+    /// The super owners, who can propose fast blocks in the first round and regular blocks in any round.
     pub super_owners: Vec<AccountOwner>,
+    /// The regular owners, each with the weight that determines how often they are round leader.
     pub owners: Vec<OwnerWithWeight>,
+    /// The leader of the first single-leader round; if unset, that leader is random like other rounds.
     pub first_leader: Option<AccountOwner>,
+    /// The number of rounds in which all owners are allowed to propose blocks.
     pub multi_leader_rounds: i32,
+    /// Whether the multi-leader rounds are unrestricted, i.e. not limited to chain owners.
     pub open_multi_leader_rounds: bool,
+    /// The timeout configuration governing round durations.
     pub timeout_config: TimeoutConfigMetadata,
 }
 
 /// Owner with weight metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, SimpleObject)]
 pub struct OwnerWithWeight {
+    /// The account owner.
     pub owner: AccountOwner,
+    /// The owner's weight, determining how often they are round leader (a `u64` as a string).
     pub weight: String, // Using String to represent u64 safely in GraphQL
 }
 
 /// Change application permissions operation metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, SimpleObject)]
 pub struct ChangeApplicationPermissionsMetadata {
+    /// The new application permissions to set on the chain.
     pub permissions: ApplicationPermissionsMetadata,
 }
 
 /// Admin operation metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, SimpleObject)]
 pub struct AdminOperationMetadata {
+    /// The kind of admin operation: "PublishCommitteeBlob", "CreateCommittee" or "RemoveCommittee".
     pub admin_operation_type: String,
+    /// The committee epoch this operation refers to, if applicable.
     pub epoch: Option<i32>,
+    /// The hash of the committee blob, if applicable.
     pub blob_hash: Option<CryptoHash>,
 }
 
 /// Create application operation metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, SimpleObject)]
 pub struct CreateApplicationOperationMetadata {
+    /// The ID of the module the application is instantiated from.
     pub module_id: String,
+    /// The application's static parameters, encoded as a hex string.
     pub parameters_hex: String,
+    /// The argument passed to the application's instantiation, encoded as a hex string.
     pub instantiation_argument_hex: String,
+    /// The applications this application depends on and requires to be present.
     pub required_application_ids: Vec<ApplicationId>,
 }
 
 /// Publish data blob operation metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, SimpleObject)]
 pub struct PublishDataBlobMetadata {
+    /// The hash of the data blob being published.
     pub blob_hash: CryptoHash,
 }
 
 /// Verify blob operation metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, SimpleObject)]
 pub struct VerifyBlobMetadata {
+    /// The ID of the blob whose existence is being verified.
     pub blob_id: String,
 }
 
 /// Publish module operation metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, SimpleObject)]
 pub struct PublishModuleMetadata {
+    /// The ID of the module being published.
     pub module_id: String,
 }
 
 /// Update stream metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, SimpleObject)]
 pub struct UpdateStreamMetadata {
+    /// The application that owns the event stream.
+    pub application_id: String,
+    /// The chain on which the events are published.
     pub chain_id: ChainId,
+    /// The identifier of the event stream being updated.
     pub stream_id: String,
+    /// The lowest event index still guaranteed to be readable (if it exists).
+    pub first_index: i32,
+    /// The index of the next event to read from the stream.
     pub next_index: i32,
 }
 
@@ -230,22 +272,37 @@ pub struct SystemMessageMetadata {
     pub credit: Option<CreditMessageMetadata>,
     /// Withdraw message details
     pub withdraw: Option<WithdrawMessageMetadata>,
+    /// CheckpointAck message details
+    pub checkpoint_ack: Option<CheckpointAckMessageMetadata>,
 }
 
 /// Credit message metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, SimpleObject)]
 pub struct CreditMessageMetadata {
+    /// The account owner whose balance is credited on the receiving chain.
     pub target: AccountOwner,
+    /// The amount of tokens being credited.
     pub amount: Amount,
+    /// The account owner the transfer originated from.
     pub source: AccountOwner,
 }
 
 /// Withdraw message metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, SimpleObject)]
 pub struct WithdrawMessageMetadata {
+    /// The account owner whose balance is debited on the source chain.
     pub owner: AccountOwner,
+    /// The amount of tokens being withdrawn.
     pub amount: Amount,
+    /// The account that receives the withdrawn tokens.
     pub recipient: Account,
+}
+
+/// CheckpointAck message metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, SimpleObject)]
+pub struct CheckpointAckMessageMetadata {
+    /// The cursor past the last bundle from the recipient that the sender has consumed.
+    pub latest_received_cursor: Cursor,
 }
 
 /// Structured representation of a message for GraphQL.
@@ -292,6 +349,7 @@ impl From<&SystemOperation> for SystemOperationMetadata {
             },
             SystemOperation::OpenChain(config) => SystemOperationMetadata {
                 open_chain: Some(OpenChainOperationMetadata {
+                    account: config.account,
                     balance: config.balance,
                     ownership: ChainOwnershipMetadata::from(&config.ownership),
                     application_permissions: ApplicationPermissionsMetadata::from(
@@ -342,8 +400,7 @@ impl From<&SystemOperation> for SystemOperationMetadata {
                 required_application_ids,
             } => SystemOperationMetadata {
                 create_application: Some(CreateApplicationOperationMetadata {
-                    module_id: serde_json::to_string(module_id)
-                        .unwrap_or_else(|_| format!("{:?}", module_id)),
+                    module_id: module_id.to_string(),
                     parameters_hex: hex::encode(parameters),
                     instantiation_argument_hex: hex::encode(instantiation_argument),
                     required_application_ids: required_application_ids.clone(),
@@ -364,8 +421,7 @@ impl From<&SystemOperation> for SystemOperationMetadata {
             },
             SystemOperation::PublishModule { module_id } => SystemOperationMetadata {
                 publish_module: Some(PublishModuleMetadata {
-                    module_id: serde_json::to_string(module_id)
-                        .unwrap_or_else(|_| format!("{:?}", module_id)),
+                    module_id: module_id.to_string(),
                 }),
                 ..SystemOperationMetadata::new("PublishModule")
             },
@@ -373,23 +429,23 @@ impl From<&SystemOperation> for SystemOperationMetadata {
                 epoch: Some(epoch.0 as i32),
                 ..SystemOperationMetadata::new("ProcessNewEpoch")
             },
-            SystemOperation::ProcessRemovedEpoch(epoch) => SystemOperationMetadata {
-                epoch: Some(epoch.0 as i32),
-                ..SystemOperationMetadata::new("ProcessRemovedEpoch")
+            SystemOperation::UpdateStream {
+                application_id,
+                chain_id,
+                stream_id,
+                first_index,
+                next_index,
+            } => SystemOperationMetadata {
+                update_stream: Some(UpdateStreamMetadata {
+                    application_id: application_id.to_string(),
+                    chain_id: *chain_id,
+                    stream_id: stream_id.to_string(),
+                    first_index: *first_index as i32,
+                    next_index: *next_index as i32,
+                }),
+                ..SystemOperationMetadata::new("UpdateStream")
             },
-            SystemOperation::UpdateStreams(streams) => SystemOperationMetadata {
-                update_streams: Some(
-                    streams
-                        .iter()
-                        .map(|(chain_id, stream_id, next_index)| UpdateStreamMetadata {
-                            chain_id: *chain_id,
-                            stream_id: stream_id.to_string(),
-                            next_index: *next_index as i32,
-                        })
-                        .collect(),
-                ),
-                ..SystemOperationMetadata::new("UpdateStreams")
-            },
+            SystemOperation::Checkpoint => SystemOperationMetadata::new("Checkpoint"),
         }
     }
 }
@@ -453,6 +509,7 @@ impl From<&SystemMessage> for SystemMessageMetadata {
                     source: *source,
                 }),
                 withdraw: None,
+                checkpoint_ack: None,
             },
             SystemMessage::Withdraw {
                 owner,
@@ -465,6 +522,17 @@ impl From<&SystemMessage> for SystemMessageMetadata {
                     owner: *owner,
                     amount: *amount,
                     recipient: *recipient,
+                }),
+                checkpoint_ack: None,
+            },
+            SystemMessage::CheckpointAck {
+                latest_received_cursor,
+            } => SystemMessageMetadata {
+                system_message_type: "CheckpointAck".to_string(),
+                credit: None,
+                withdraw: None,
+                checkpoint_ack: Some(CheckpointAckMessageMetadata {
+                    latest_received_cursor: *latest_received_cursor,
                 }),
             },
         }

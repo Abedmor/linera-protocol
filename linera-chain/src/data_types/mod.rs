@@ -2,7 +2,16 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+//! Data types exchanged while proposing, voting on, and confirming blocks.
+//!
+//! The correctness specification's vocabulary — what a validator signs, what a proposal and a
+//! certificate are — and the quorum properties that everything else rests on are stated and
+//! proved in [`proof`]. The `linera-spec` crate gives the intended reading order.
+
+use std::{
+    collections::{BTreeMap, BTreeSet, HashSet},
+    sync::Arc,
+};
 
 use allocative::Allocative;
 use async_graphql::SimpleObject;
@@ -13,12 +22,19 @@ use linera_base::{
         AccountSignature, BcsHashable, BcsSignable, CryptoError, CryptoHash, Signer,
         ValidatorPublicKey, ValidatorSecretKey, ValidatorSignature,
     },
-    data_types::{Amount, Blob, BlockHeight, Epoch, Event, OracleResponse, Round, Timestamp},
+    data_types::{
+        Amount, Blob, BlockHeight, Cursor, Epoch, Event, MessagePolicy, OracleResponse, Round,
+        Timestamp,
+    },
     doc_scalar, ensure, hex, hex_debug,
-    identifiers::{Account, AccountOwner, ApplicationId, BlobId, ChainId, StreamId},
+    identifiers::{
+        Account, AccountOwner, ApplicationId, BlobId, ChainId, GenericApplicationId, StreamId,
+    },
+    time::Duration,
 };
 use linera_execution::{committee::Committee, Message, MessageKind, Operation, OutgoingMessage};
 use serde::{Deserialize, Serialize};
+use tracing::{info, instrument};
 
 use crate::{
     block::{Block, ValidatedBlock},
@@ -30,6 +46,7 @@ use crate::{
 };
 
 pub mod metadata;
+pub mod proof;
 
 pub use metadata::*;
 
@@ -80,6 +97,16 @@ impl ProposedBlock {
             .collect()
     }
 
+    /// Returns whether the first transaction in this block is a
+    /// `SystemOperation::Checkpoint`. Under the chain-level checkpoint preconditions
+    /// this is equivalent to "the block is a checkpoint block", since Checkpoint must
+    /// be the only transaction.
+    pub fn starts_with_checkpoint(&self) -> bool {
+        self.transactions
+            .first()
+            .is_some_and(Transaction::is_checkpoint)
+    }
+
     /// Returns whether the block contains only rejected incoming messages, which
     /// makes it admissible even on closed chains.
     pub fn has_only_rejected_messages(&self) -> bool {
@@ -92,24 +119,6 @@ impl ProposedBlock {
                 })
             )
         })
-    }
-
-    /// Returns an iterator over all incoming [`PostedMessage`]s in this block.
-    pub fn incoming_messages(&self) -> impl Iterator<Item = &PostedMessage> {
-        self.incoming_bundles()
-            .flat_map(|incoming_bundle| &incoming_bundle.bundle.messages)
-    }
-
-    /// Returns the number of incoming messages.
-    pub fn message_count(&self) -> usize {
-        self.incoming_bundles()
-            .map(|im| im.bundle.messages.len())
-            .sum()
-    }
-
-    /// Returns an iterator over all transactions as references.
-    pub fn transaction_refs(&self) -> impl Iterator<Item = &Transaction> {
-        self.transactions.iter()
     }
 
     /// Returns all operations in this block.
@@ -128,6 +137,7 @@ impl ProposedBlock {
         })
     }
 
+    /// Checks that the serialized size of this block does not exceed the given maximum.
     pub fn check_proposal_size(&self, maximum_block_proposal_size: u64) -> Result<(), ChainError> {
         let size = bcs::serialized_size(self)?;
         ensure!(
@@ -150,7 +160,9 @@ impl ProposedBlock {
 }
 
 /// A transaction in a block: incoming messages or an operation.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Allocative)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, Allocative, strum::AsRefStr,
+)]
 pub enum Transaction {
     /// Receive a bundle of incoming messages.
     ReceiveMessages(IncomingBundle),
@@ -161,14 +173,32 @@ pub enum Transaction {
 impl BcsHashable<'_> for Transaction {}
 
 impl Transaction {
+    /// Returns the incoming bundle, if this transaction receives messages.
     pub fn incoming_bundle(&self) -> Option<&IncomingBundle> {
         match self {
             Transaction::ReceiveMessages(bundle) => Some(bundle),
             _ => None,
         }
     }
+
+    /// Returns whether this transaction executes a `SystemOperation::UpdateStream`.
+    pub fn is_update_stream(&self) -> bool {
+        matches!(
+            self,
+            Transaction::ExecuteOperation(op) if op.is_update_stream()
+        )
+    }
+
+    /// Returns whether this transaction executes a `SystemOperation::Checkpoint`.
+    pub fn is_checkpoint(&self) -> bool {
+        matches!(
+            self,
+            Transaction::ExecuteOperation(op) if op.is_checkpoint()
+        )
+    }
 }
 
+/// GraphQL-compatible structured representation of an operation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, SimpleObject)]
 #[graphql(name = "Operation")]
 pub struct OperationMetadata {
@@ -216,6 +246,7 @@ pub struct TransactionMetadata {
 }
 
 impl TransactionMetadata {
+    /// Builds GraphQL-compatible metadata from a transaction.
     pub fn from_transaction(transaction: &Transaction) -> Self {
         match transaction {
             Transaction::ReceiveMessages(bundle) => TransactionMetadata {
@@ -247,7 +278,9 @@ impl TransactionMetadata {
     Allocative,
 )]
 pub struct ChainAndHeight {
+    /// The chain that the block belongs to.
     pub chain_id: ChainId,
+    /// The height of the block within that chain.
     pub height: BlockHeight,
 }
 
@@ -267,6 +300,61 @@ impl IncomingBundle {
     pub fn messages(&self) -> impl Iterator<Item = &PostedMessage> {
         self.bundle.messages.iter()
     }
+
+    fn matches_policy(&self, policy: &MessagePolicy) -> bool {
+        if let Some(chain_ids) = &policy.restrict_chain_ids_to {
+            if !chain_ids.contains(&self.origin) {
+                return false;
+            }
+        }
+        if policy.ignore_chain_ids.contains(&self.origin) {
+            return false;
+        }
+        if !policy.never_reject_application_ids.is_empty()
+            && self.messages().all(|posted_msg| {
+                policy
+                    .never_reject_application_ids
+                    .contains(&posted_msg.message.application_id())
+            })
+        {
+            return true;
+        }
+        if let Some(app_ids) = &policy.reject_message_bundles_without_application_ids {
+            if !self
+                .messages()
+                .any(|posted_msg| app_ids.contains(&posted_msg.message.application_id()))
+            {
+                return false;
+            }
+        }
+        if let Some(app_ids) = &policy.reject_message_bundles_with_other_application_ids {
+            if !self
+                .messages()
+                .all(|posted_msg| app_ids.contains(&posted_msg.message.application_id()))
+            {
+                return false;
+            }
+        }
+        !policy.is_reject()
+    }
+
+    /// Applies the message policy to this bundle, returning `None` if it is dropped,
+    /// or the bundle with a possibly updated action otherwise.
+    #[instrument(level = "trace", skip(self))]
+    pub fn apply_policy(mut self, policy: &MessagePolicy) -> Option<IncomingBundle> {
+        if !self.matches_policy(policy) {
+            if self.bundle.is_skippable() {
+                return None;
+            } else if !self.bundle.is_protected() {
+                info!(
+                    origin = %self.origin,
+                    "Rejecting incoming message bundle due to the message policy"
+                );
+                self.action = MessageAction::Reject;
+            }
+        }
+        Some(self)
+    }
 }
 
 impl BcsHashable<'_> for IncomingBundle {}
@@ -278,6 +366,54 @@ pub enum MessageAction {
     Accept,
     /// Do not execute the incoming message.
     Reject,
+}
+
+/// Policy for handling message bundle execution failures during block execution.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum BundleFailurePolicy {
+    /// Abort block execution on any bundle failure. The proposal is never modified.
+    #[default]
+    Abort,
+    /// Automatically handle failing bundles with checkpointing and retry.
+    ///
+    /// This policy is intended for use by clients when preparing proposals. It modifies
+    /// the proposal by discarding or rejecting bundles that fail to execute:
+    ///
+    /// - For limit errors (block too large, fuel exceeded, etc.): discard the bundle
+    ///   so it can be retried in a later block, unless it's the first transaction
+    ///   (in which case it's inherently too large and gets rejected).
+    /// - For bundles whose messages are all from applications in
+    ///   `never_reject_application_ids`: discard the bundle (and subsequent bundles from
+    ///   the same sender) so they can be retried in a later block, and log a warning.
+    /// - For all other non-limit errors: reject the bundle (triggering bounced messages).
+    /// - After `max_failures` discarded bundles, discard all remaining message bundles.
+    AutoRetry {
+        /// Maximum number of discarded bundles before discarding all remaining message bundles.
+        max_failures: u32,
+        /// Applications whose messages must never be rejected. A failed bundle whose messages
+        /// are all from such applications is discarded instead of rejected. A bundle that
+        /// contains any message from an application not on this list can be rejected.
+        never_reject_application_ids: Arc<HashSet<GenericApplicationId>>,
+    },
+}
+
+/// Policy for executing message bundles during block execution.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BundleExecutionPolicy {
+    /// What to do when a bundle fails.
+    pub on_failure: BundleFailurePolicy,
+    /// Optional time budget for bundle execution.
+    pub time_budget: Option<Duration>,
+}
+
+impl BundleExecutionPolicy {
+    /// Returns a policy suitable for committed blocks: abort on failure, no time budget.
+    pub fn committed() -> Self {
+        BundleExecutionPolicy {
+            on_failure: BundleFailurePolicy::Abort,
+            time_budget: None,
+        }
+    }
 }
 
 /// A set of messages from a single block, for a single destination.
@@ -303,6 +439,7 @@ pub enum OriginalProposal {
     Fast(AccountSignature),
     /// A validated block certificate from an earlier round.
     Regular {
+        /// The validated block certificate.
         certificate: LiteCertificate<'static>,
     },
 }
@@ -313,8 +450,12 @@ pub enum OriginalProposal {
 #[derive(Clone, Debug, Serialize, Deserialize, Allocative)]
 #[cfg_attr(with_testing, derive(Eq, PartialEq))]
 pub struct BlockProposal {
+    /// The signed content of the proposal: the proposed block, the round, and any
+    /// execution outcome from a previous round.
     pub content: ProposalContent,
+    /// The proposer's signature over `content`.
     pub signature: AccountSignature,
+    /// The earlier proposal being retried, if this proposal is a retry in a later round.
     #[debug(skip_if = Option::is_none)]
     pub original_proposal: Option<OriginalProposal>,
 }
@@ -334,20 +475,19 @@ pub struct PostedMessage {
     pub refund_grant_to: Option<Account>,
     /// The kind of message being sent.
     pub kind: MessageKind,
-    /// The index of the message in the sending block.
-    pub index: u32,
     /// The message itself.
     pub message: Message,
 }
 
+/// Extension trait for converting an `OutgoingMessage` into a `PostedMessage`.
 pub trait OutgoingMessageExt {
     /// Returns the posted message, i.e. the outgoing message without the destination.
-    fn into_posted(self, index: u32) -> PostedMessage;
+    fn into_posted(self) -> PostedMessage;
 }
 
 impl OutgoingMessageExt for OutgoingMessage {
     /// Returns the posted message, i.e. the outgoing message without the destination.
-    fn into_posted(self, index: u32) -> PostedMessage {
+    fn into_posted(self) -> PostedMessage {
         let OutgoingMessage {
             destination: _,
             authenticated_owner,
@@ -361,7 +501,6 @@ impl OutgoingMessageExt for OutgoingMessage {
             grant,
             refund_grant_to,
             kind,
-            index,
             message,
         }
     }
@@ -415,12 +554,16 @@ pub struct BlockExecutionOutcome {
 /// The hash and chain ID of a `CertificateValue`.
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, Allocative)]
 pub struct LiteValue {
+    /// The hash of the `CertificateValue`.
     pub value_hash: CryptoHash,
+    /// The chain that the value belongs to.
     pub chain_id: ChainId,
+    /// The kind of certificate this value is for.
     pub kind: CertificateKind,
 }
 
 impl LiteValue {
+    /// Creates a `LiteValue` from a certificate value.
     pub fn new<T: CertificateValue>(value: &T) -> Self {
         LiteValue {
             value_hash: value.hash(),
@@ -430,15 +573,60 @@ impl LiteValue {
     }
 }
 
+//(deuszx): pub is temp.
+/// The value a validator signs when voting: the value hash, round, certificate kind, the
+/// unlocking round (for `ValidatedBlock` votes), the first-round attestation (for
+/// `ConfirmedBlock` votes), and the justification commitment.
+///
+/// The unlocking round is the consensus device behind fault attributability: by signing it, a
+/// validator asserts "I have not voted to confirm a block other than this one in any round at or
+/// above the unlocking round". `None` means an unlocking round of `0`, i.e. the strongest claim
+/// ("...in any round"), and is used for freshly proposed blocks and for `ConfirmedBlock`/`Timeout`
+/// votes, which carry no unlocking round.
+///
+/// The `bool` is the first-round attestation: it is `true` only when a `ConfirmedBlock`
+/// vote confirms a block in the chain's first round, and is always `false` for `ValidatedBlock`
+/// and `Timeout` votes.
+///
+/// The final hash is the justification commitment: the hash of the quorum this vote cites (see
+/// [`CommittedQuorum`]), which transitively commits to the whole justification chain below it.
+/// By signing it, the voter attests that they verified the cited quorum, so certificates are
+/// verified by checking only their top quorum's signatures. A `ValidatedBlock` vote cites the
+/// quorum that justifies its unlocking round (`None` for a fresh proposal); a `ConfirmedBlock`
+/// vote cites the quorum that validated the block in the same round (`None` when confirming in
+/// the chain's first round); `Timeout` votes cite nothing.
+///
+/// [`CommittedQuorum`]: crate::justification::CommittedQuorum
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
-struct VoteValue(CryptoHash, Round, CertificateKind);
+pub struct VoteValue(
+    pub(crate) CryptoHash,
+    pub(crate) Round,
+    pub(crate) CertificateKind,
+    pub(crate) Option<Round>,
+    pub(crate) bool,
+    pub(crate) Option<CryptoHash>,
+);
 
 /// A vote on a statement from a validator.
 #[derive(Allocative, Clone, Debug, Serialize, Deserialize)]
 #[serde(bound(deserialize = "T: Deserialize<'de>"))]
 pub struct Vote<T> {
+    /// The value being voted for.
     pub value: T,
+    /// The consensus round in which the vote was cast.
     pub round: Round,
+    /// The unlocking round this vote signed (see [`VoteValue`]). Only `ValidatedBlock` votes carry
+    /// an unlocking round; it is `None` for fresh proposals and for `ConfirmedBlock`/`Timeout` votes.
+    pub unlocking_round: Option<Round>,
+    /// The first-round attestation this vote signed (see [`VoteValue`]). It is `true` only for a
+    /// `ConfirmedBlock` vote that confirms a block in the chain's first round; it is always
+    /// `false` for `ValidatedBlock` and `Timeout` votes.
+    pub first_round: bool,
+    /// The justification commitment this vote signed (see [`VoteValue`]): the hash of the cited
+    /// quorum, or `None` if the vote cites none.
+    pub justification_commitment: Option<CryptoHash>,
+    /// The validator's signature over the value hash, round, certificate kind, unlocking round,
+    /// first-round attestation and justification commitment.
     pub signature: ValidatorSignature,
 }
 
@@ -448,11 +636,68 @@ impl<T> Vote<T> {
     where
         T: CertificateValue,
     {
-        let hash_and_round = VoteValue(value.hash(), round, T::KIND);
+        Self::new_with_unlocking_round(value, round, None, None, key_pair)
+    }
+
+    /// Use signing key to create a signed object with the given unlocking round and the
+    /// justification commitment of the quorum that grounds it (see [`VoteValue`]).
+    pub fn new_with_unlocking_round(
+        value: T,
+        round: Round,
+        unlocking_round: Option<Round>,
+        justification_commitment: Option<CryptoHash>,
+        key_pair: &ValidatorSecretKey,
+    ) -> Self
+    where
+        T: CertificateValue,
+    {
+        let hash_and_round = VoteValue(
+            value.hash(),
+            round,
+            T::KIND,
+            unlocking_round,
+            false,
+            justification_commitment,
+        );
         let signature = ValidatorSignature::new(&hash_and_round, key_pair);
         Self {
             value,
             round,
+            unlocking_round,
+            first_round: false,
+            justification_commitment,
+            signature,
+        }
+    }
+
+    /// Use signing key to create a signed `ConfirmedBlock` object that carries the first-round
+    /// attestation `first_round` and the justification commitment of the quorum that validated
+    /// the block (see [`VoteValue`]). The unlocking round is always `None`.
+    pub fn new_with_first_round(
+        value: T,
+        round: Round,
+        first_round: bool,
+        justification_commitment: Option<CryptoHash>,
+        key_pair: &ValidatorSecretKey,
+    ) -> Self
+    where
+        T: CertificateValue,
+    {
+        let hash_and_round = VoteValue(
+            value.hash(),
+            round,
+            T::KIND,
+            None,
+            first_round,
+            justification_commitment,
+        );
+        let signature = ValidatorSignature::new(&hash_and_round, key_pair);
+        Self {
+            value,
+            round,
+            unlocking_round: None,
+            first_round,
+            justification_commitment,
             signature,
         }
     }
@@ -465,6 +710,9 @@ impl<T> Vote<T> {
         LiteVote {
             value: LiteValue::new(&self.value),
             round: self.round,
+            unlocking_round: self.unlocking_round,
+            first_round: self.first_round,
+            justification_commitment: self.justification_commitment,
             signature: self.signature,
         }
     }
@@ -479,8 +727,22 @@ impl<T> Vote<T> {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[cfg_attr(with_testing, derive(Eq, PartialEq))]
 pub struct LiteVote {
+    /// The value being voted for, as a `LiteValue`.
     pub value: LiteValue,
+    /// The consensus round in which the vote was cast.
     pub round: Round,
+    /// The unlocking round this vote signed (see [`VoteValue`]). Only `ValidatedBlock` votes carry
+    /// an unlocking round; it is `None` for fresh proposals and for `ConfirmedBlock`/`Timeout` votes.
+    pub unlocking_round: Option<Round>,
+    /// The first-round attestation this vote signed (see [`VoteValue`]). It is `true` only for a
+    /// `ConfirmedBlock` vote that confirms a block in the chain's first round; it is always
+    /// `false` for `ValidatedBlock` and `Timeout` votes.
+    pub first_round: bool,
+    /// The justification commitment this vote signed (see [`VoteValue`]): the hash of the cited
+    /// quorum, or `None` if the vote cites none.
+    pub justification_commitment: Option<CryptoHash>,
+    /// The validator's signature over the value hash, round, certificate kind, unlocking round,
+    /// first-round attestation and justification commitment.
     pub signature: ValidatorSignature,
 }
 
@@ -494,26 +756,65 @@ impl LiteVote {
         Some(Vote {
             value,
             round: self.round,
+            unlocking_round: self.unlocking_round,
+            first_round: self.first_round,
+            justification_commitment: self.justification_commitment,
             signature: self.signature,
         })
     }
 
+    /// Returns the kind of certificate this vote is for.
     pub fn kind(&self) -> CertificateKind {
         self.value.kind
     }
 }
 
 impl MessageBundle {
+    /// Returns the logical position of this bundle in its sender chain's outgoing
+    /// stream.
+    pub fn cursor(&self) -> Cursor {
+        Cursor {
+            height: self.height,
+            index: self.transaction_index,
+        }
+    }
+
+    /// Returns a rough estimate of the serialized size in bytes, for chunking.
+    pub fn estimated_size(&self) -> usize {
+        // Fixed overhead: height (8) + timestamp (8) + hash (32) + tx_index (4) + vec len (8)
+        let overhead = 60;
+        let messages_size: usize = self
+            .messages
+            .iter()
+            .map(PostedMessage::estimated_size)
+            .sum();
+        overhead + messages_size
+    }
+
+    /// Returns whether all messages in this bundle can be skipped.
     pub fn is_skippable(&self) -> bool {
         self.messages.iter().all(PostedMessage::is_skippable)
     }
 
+    /// Returns whether any message in this bundle is protected.
     pub fn is_protected(&self) -> bool {
         self.messages.iter().any(PostedMessage::is_protected)
     }
 }
 
 impl PostedMessage {
+    /// Returns a rough estimate of the serialized size in bytes.
+    pub fn estimated_size(&self) -> usize {
+        // Fixed: signer option (33) + grant (16) + refund option (34) + kind (1) + enum tag (8)
+        let overhead = 92;
+        let message_size = match &self.message {
+            Message::System(_) => 256, // conservative estimate for system messages
+            Message::User { bytes, .. } => 64 + bytes.len(),
+        };
+        overhead + message_size
+    }
+
+    /// Returns whether this message can be skipped.
     pub fn is_skippable(&self) -> bool {
         match self.kind {
             MessageKind::Protected | MessageKind::Tracked => false,
@@ -521,30 +822,41 @@ impl PostedMessage {
         }
     }
 
+    /// Returns whether this message is protected.
     pub fn is_protected(&self) -> bool {
         matches!(self.kind, MessageKind::Protected)
     }
 
+    /// Returns whether this message is tracked.
     pub fn is_tracked(&self) -> bool {
         matches!(self.kind, MessageKind::Tracked)
     }
 
+    /// Returns whether this message is bouncing.
     pub fn is_bouncing(&self) -> bool {
         matches!(self.kind, MessageKind::Bouncing)
     }
 }
 
 impl BlockExecutionOutcome {
+    /// Combines this outcome with a proposed block into a full block.
     pub fn with(self, block: ProposedBlock) -> Block {
         Block::new(block, self)
     }
 
+    /// Returns the IDs of all blobs referenced by oracle responses in this outcome.
     pub fn oracle_blob_ids(&self) -> HashSet<BlobId> {
         let mut required_blob_ids = HashSet::new();
         for responses in &self.oracle_responses {
             for response in responses {
-                if let OracleResponse::Blob(blob_id) = response {
-                    required_blob_ids.insert(*blob_id);
+                match response {
+                    OracleResponse::Blob(blob_id) => {
+                        required_blob_ids.insert(*blob_id);
+                    }
+                    OracleResponse::Checkpoint { used_blobs, .. } => {
+                        required_blob_ids.extend(used_blobs.iter().copied());
+                    }
+                    _ => {}
                 }
             }
         }
@@ -552,18 +864,16 @@ impl BlockExecutionOutcome {
         required_blob_ids
     }
 
+    /// Returns whether any transaction in this outcome recorded oracle responses.
     pub fn has_oracle_responses(&self) -> bool {
         self.oracle_responses
             .iter()
             .any(|responses| !responses.is_empty())
     }
 
+    /// Returns an iterator over the IDs of all blobs created in this outcome.
     pub fn iter_created_blobs_ids(&self) -> impl Iterator<Item = BlobId> + '_ {
         self.blobs.iter().flatten().map(|blob| blob.id())
-    }
-
-    pub fn created_blobs_ids(&self) -> HashSet<BlobId> {
-        self.iter_created_blobs_ids().collect()
     }
 }
 
@@ -580,6 +890,7 @@ pub struct ProposalContent {
 }
 
 impl BlockProposal {
+    /// Creates a new block proposal, signed by the given owner.
     pub async fn new_initial<S: Signer + ?Sized>(
         owner: AccountOwner,
         round: Round,
@@ -600,6 +911,7 @@ impl BlockProposal {
         })
     }
 
+    /// Creates a proposal that retries a fast-round proposal in a later round.
     pub async fn new_retry_fast<S: Signer + ?Sized>(
         owner: AccountOwner,
         round: Round,
@@ -620,6 +932,7 @@ impl BlockProposal {
         })
     }
 
+    /// Creates a proposal that retries a validated block from an earlier round.
     pub async fn new_retry_regular<S: Signer>(
         owner: AccountOwner,
         round: Round,
@@ -652,10 +965,12 @@ impl BlockProposal {
         }
     }
 
+    /// Verifies the signature on this proposal.
     pub fn check_signature(&self) -> Result<(), CryptoError> {
         self.signature.verify(&self.content)
     }
 
+    /// Returns the IDs of the blobs that must be available to validate this proposal.
     pub fn required_blob_ids(&self) -> impl Iterator<Item = BlobId> + '_ {
         self.content.block.published_blob_ids().into_iter().chain(
             self.content
@@ -665,6 +980,7 @@ impl BlockProposal {
         )
     }
 
+    /// Returns the IDs of the blobs that are required or created by this proposal.
     pub fn expected_blob_ids(&self) -> impl Iterator<Item = BlobId> + '_ {
         self.content.block.published_blob_ids().into_iter().chain(
             self.content.outcome.iter().flat_map(|outcome| {
@@ -710,22 +1026,33 @@ impl BlockProposal {
 impl LiteVote {
     /// Uses the signing key to create a signed object.
     pub fn new(value: LiteValue, round: Round, secret_key: &ValidatorSecretKey) -> Self {
-        let hash_and_round = VoteValue(value.value_hash, round, value.kind);
+        let hash_and_round = VoteValue(value.value_hash, round, value.kind, None, false, None);
         let signature = ValidatorSignature::new(&hash_and_round, secret_key);
         Self {
             value,
             round,
+            unlocking_round: None,
+            first_round: false,
+            justification_commitment: None,
             signature,
         }
     }
 
     /// Verifies the signature in the vote.
     pub fn check(&self, public_key: ValidatorPublicKey) -> Result<(), ChainError> {
-        let hash_and_round = VoteValue(self.value.value_hash, self.round, self.value.kind);
+        let hash_and_round = VoteValue(
+            self.value.value_hash,
+            self.round,
+            self.value.kind,
+            self.unlocking_round,
+            self.first_round,
+            self.justification_commitment,
+        );
         Ok(self.signature.check(&hash_and_round, public_key)?)
     }
 }
 
+/// Helper for aggregating validator signatures on a value into a certificate.
 pub struct SignatureAggregator<'a, T: CertificateValue> {
     committee: &'a Committee,
     weight: u64,
@@ -734,13 +1061,29 @@ pub struct SignatureAggregator<'a, T: CertificateValue> {
 }
 
 impl<'a, T: CertificateValue> SignatureAggregator<'a, T> {
-    /// Starts aggregating signatures for the given value into a certificate.
-    pub fn new(value: T, round: Round, committee: &'a Committee) -> Self {
+    /// Starts aggregating signatures for the given value into a certificate whose voters signed
+    /// the given unlocking round, first-round attestation and justification commitment (see
+    /// [`VoteValue`]).
+    pub fn new(
+        value: T,
+        round: Round,
+        unlocking_round: Option<Round>,
+        first_round: bool,
+        justification_commitment: Option<CryptoHash>,
+        committee: &'a Committee,
+    ) -> Self {
         Self {
             committee,
             weight: 0,
             used_validators: HashSet::new(),
-            partial: GenericCertificate::new(value, round, Vec::new()),
+            partial: GenericCertificate::new_with_payload(
+                value,
+                round,
+                unlocking_round,
+                first_round,
+                justification_commitment,
+                Vec::new(),
+            ),
         }
     }
 
@@ -755,7 +1098,14 @@ impl<'a, T: CertificateValue> SignatureAggregator<'a, T> {
     where
         T: CertificateValue,
     {
-        let hash_and_round = VoteValue(self.partial.hash(), self.partial.round, T::KIND);
+        let hash_and_round = VoteValue(
+            self.partial.hash(),
+            self.partial.round,
+            T::KIND,
+            self.partial.unlocking_round(),
+            self.partial.first_round(),
+            self.partial.justification_commitment(),
+        );
         signature.check(&hash_and_round, public_key)?;
         // Check that each validator only appears once.
         ensure!(
@@ -785,11 +1135,10 @@ pub(crate) fn is_strictly_ordered(values: &[(ValidatorPublicKey, ValidatorSignat
     values.windows(2).all(|pair| pair[0].0 < pair[1].0)
 }
 
-/// Verifies certificate signatures.
+/// Verifies certificate signatures: that the signers form a quorum of the committee without
+/// duplicates, and that every signature verifies over the given signed payload.
 pub(crate) fn check_signatures(
-    value_hash: CryptoHash,
-    certificate_kind: CertificateKind,
-    round: Round,
+    value: &VoteValue,
     signatures: &[(ValidatorPublicKey, ValidatorSignature)],
     committee: &Committee,
 ) -> Result<(), ChainError> {
@@ -813,8 +1162,7 @@ pub(crate) fn check_signatures(
         ChainError::CertificateRequiresQuorum
     );
     // All that is left is checking signatures!
-    let hash_and_round = VoteValue(value_hash, round, certificate_kind);
-    ValidatorSignature::verify_batch(&hash_and_round, signatures.iter())?;
+    ValidatorSignature::verify_batch(value, signatures.iter())?;
     Ok(())
 }
 

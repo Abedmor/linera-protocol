@@ -1,6 +1,8 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+//! A plugin that indexes the operations executed on each chain.
+
 use std::{
     cmp::{Ordering, PartialOrd},
     sync::Arc,
@@ -28,10 +30,15 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 use tracing::info;
 
+/// The key identifying an operation: the chain it ran on, the height of the block
+/// that contains it, and its index within that block.
 #[derive(Deserialize, Serialize, Clone, Debug, PartialEq)]
 pub struct OperationKey {
+    /// The chain on which the operation was executed.
     pub chain_id: ChainId,
+    /// The height of the block containing the operation.
     pub height: BlockHeight,
+    /// The index of the operation within the block.
     pub index: usize,
 }
 
@@ -47,6 +54,7 @@ impl PartialOrd for OperationKey {
     }
 }
 
+/// An indexed operation together with the location of the previous one on the same chain.
 #[derive(Deserialize, Serialize, Clone, SimpleObject, Debug)]
 pub struct ChainOperation {
     key: OperationKey,
@@ -56,6 +64,7 @@ pub struct ChainOperation {
     content: Operation,
 }
 
+/// The persistent state of the operations plugin: per-chain operation indices.
 #[derive(RootView)]
 pub struct Operations<C> {
     last: MapView<C, ChainId, OperationKey>,
@@ -64,9 +73,12 @@ pub struct Operations<C> {
     operations: MapView<C, OperationKey, ChainOperation>,
 }
 
+/// A way to refer to an operation: either by its exact key, or as the last operation on a chain.
 #[derive(OneofObject)]
 pub enum OperationKeyKind {
+    /// Refers to the operation with this exact key.
     Key(OperationKey),
+    /// Refers to the last operation registered for this chain.
     Last(ChainId),
 }
 
@@ -98,14 +110,16 @@ where
                     "register operation for {:?}:\n{:?}",
                     key.chain_id, operation
                 );
-                self.operations.insert(&key, operation.clone())?;
+                self.operations.insert(&key, operation)?;
                 self.count.insert(&key.chain_id, index + 1)?;
-                Ok(self.last.insert(&key.chain_id, key.clone())?)
+                let chain_id = key.chain_id;
+                Ok(self.last.insert(&chain_id, key)?)
             }
         }
     }
 }
 
+/// The operations plugin: indexes executed operations and serves them over GraphQL.
 #[derive(Clone)]
 pub struct OperationsPlugin<C>(Arc<Mutex<Operations<C>>>);
 
@@ -141,13 +155,9 @@ where
                     height: value.height(),
                     index: transaction_index,
                 };
-                match plugin
+                plugin
                     .register_operation(key, value.hash(), operation.clone())
-                    .await
-                {
-                    Err(e) => return Err(e),
-                    Ok(()) => continue,
-                }
+                    .await?;
             }
         }
         Ok(plugin.save().await?)
@@ -217,11 +227,7 @@ where
     /// Gets the number of operations registered for a chain
     pub async fn count(&self, chain_id: ChainId) -> Result<u64, IndexerError> {
         let plugin = self.0.lock().await;
-        Ok(plugin
-            .count
-            .get(&chain_id)
-            .await
-            .map(|opt| opt.unwrap_or(0))?)
+        Ok(plugin.count.get(&chain_id).await?.unwrap_or(0))
     }
 
     /// Gets the hash of the last operation registered for a chain

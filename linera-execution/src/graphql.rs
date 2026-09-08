@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use linera_base::{
-    crypto::ValidatorPublicKey,
+    crypto::{CryptoHash, ValidatorPublicKey},
     data_types::{Amount, ChainDescription, Epoch, Timestamp},
     doc_scalar,
     identifiers::{AccountOwner, ChainId},
@@ -66,8 +66,8 @@ impl<C: Send + Sync + Context> ExecutionStateView<C> {
 #[async_graphql::Object(cache_control(no_cache))]
 impl<C: Send + Sync + Context> SystemExecutionStateView<C> {
     #[graphql(derived(name = "description"))]
-    async fn _description(&self) -> &Option<ChainDescription> {
-        self.description.get()
+    async fn _description(&self) -> Result<&Option<ChainDescription>, async_graphql::Error> {
+        Ok(self.description.get().await?)
     }
 
     #[graphql(derived(name = "epoch"))]
@@ -75,19 +75,19 @@ impl<C: Send + Sync + Context> SystemExecutionStateView<C> {
         self.epoch.get()
     }
 
-    #[graphql(derived(name = "admin_id"))]
-    async fn _admin_id(&self) -> &Option<ChainId> {
-        self.admin_id.get()
+    #[graphql(derived(name = "admin_chain_id"))]
+    async fn _admin_chain_id(&self) -> &Option<ChainId> {
+        self.admin_chain_id.get()
     }
 
-    #[graphql(derived(name = "committees"))]
-    async fn _committees(&self) -> &BTreeMap<Epoch, Committee> {
-        self.committees.get()
+    #[graphql(derived(name = "committee_hash"))]
+    async fn _committee_hash(&self) -> &Option<CryptoHash> {
+        self.committee_hash.get()
     }
 
     #[graphql(derived(name = "ownership"))]
-    async fn _ownership(&self) -> &ChainOwnership {
-        self.ownership.get()
+    async fn _ownership(&self) -> Result<&ChainOwnership, async_graphql::Error> {
+        Ok(self.ownership.get().await?)
     }
 
     #[graphql(derived(name = "balance"))]
@@ -102,6 +102,6 @@ impl<C: Send + Sync + Context> SystemExecutionStateView<C> {
 
     #[graphql(derived(name = "timestamp"))]
     async fn _timestamp(&self) -> &Timestamp {
-        self.timestamp.get()
+        &self.progress.get().timestamp
     }
 }

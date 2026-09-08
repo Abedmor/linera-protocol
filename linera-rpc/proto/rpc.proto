@@ -6,8 +6,56 @@ import "google/protobuf/empty.proto";
 // A service run by the Proxy which listens for incoming connections
 // from workers and then notifies clients.
 service NotifierService {
-  // Notify a client that there has been an update for a `ChainId`.
-  rpc Notify(Notification) returns (google.protobuf.Empty);
+  // Notify a client that there have been updates for chains.
+  rpc NotifyBatch(NotificationBatch) returns (google.protobuf.Empty);
+}
+
+// A service run by the proxy which forwards a shard's requests to another validator.
+//
+// Shards hold the validator's secret key, so the proxy is the only component that opens outbound
+// connections. A shard names the validator its request is meant for and the proxy performs it.
+// Limited to the operations block export needs, so reaching this service does not confer the
+// ability to make the proxy issue arbitrary requests.
+service ValidatorRelay {
+  // Forward a lite certificate to another validator.
+  rpc RelayLiteCertificate(RelayLiteCertificateRequest) returns (ChainInfoResult);
+
+  // Forward a confirmed certificate to another validator.
+  rpc RelayConfirmedCertificate(RelayConfirmedCertificateRequest) returns (ChainInfoResult);
+
+  // Ask another validator for the state of a chain.
+  rpc RelayChainInfoQuery(RelayChainInfoQueryRequest) returns (ChainInfoResult);
+
+  // Upload a blob to another validator.
+  rpc RelayUploadBlob(RelayUploadBlobRequest) returns (BlobId);
+}
+
+// A lite certificate, and the validator it is for.
+message RelayLiteCertificateRequest {
+  // The public network address of the destination validator.
+  string destination = 1;
+  LiteCertificate inner = 2;
+}
+
+// A confirmed certificate, and the validator it is for.
+message RelayConfirmedCertificateRequest {
+  // The public network address of the destination validator.
+  string destination = 1;
+  HandleConfirmedCertificateRequest inner = 2;
+}
+
+// A chain info query, and the validator it is for.
+message RelayChainInfoQueryRequest {
+  // The public network address of the destination validator.
+  string destination = 1;
+  ChainInfoQuery inner = 2;
+}
+
+// A blob, and the validator it is for.
+message RelayUploadBlobRequest {
+  // The public network address of the destination validator.
+  string destination = 1;
+  BlobContent inner = 2;
 }
 
 // Interface provided by each physical shard (aka "worker") of a validator or a local node.
@@ -72,6 +120,9 @@ service ValidatorNode {
   // Download a blob.
   rpc DownloadBlob(BlobId) returns (BlobContent);
 
+  // Download a batch of blobs as a stream.
+  rpc DownloadBlobs(BlobIds) returns (stream BlobContent);
+
   // Download a blob that belongs to a pending block on the given chain.
   rpc DownloadPendingBlob(PendingBlobRequest) returns (PendingBlobResult);
 
@@ -103,6 +154,9 @@ service ValidatorNode {
 
   // Return the `BlobId`s that are not contained as `Blob`.
   rpc MissingBlobIds(BlobIds) returns (BlobIds);
+
+  // Look up the block heights where the given events were published.
+  rpc EventBlockHeights(EventBlockHeightsRequest) returns (EventBlockHeightsResponse);
 }
 
 // Batch of raw certificates.
@@ -176,6 +230,11 @@ message Notification {
   bytes reason = 2;
 }
 
+// A batch of notifications to be sent together.
+message NotificationBatch {
+  repeated Notification notifications = 1;
+}
+
 // A wrapper around ChainInfoResponse which contains a serialized error variant
 message ChainInfoResult {
   oneof inner {
@@ -190,6 +249,7 @@ message CrossChainRequest {
   oneof inner {
     UpdateRecipient update_recipient = 1;
     ConfirmUpdatedRecipient confirm_updated_recipient = 2;
+    RevertConfirm revert_confirm = 3;
   }
 }
 
@@ -199,6 +259,9 @@ message UpdateRecipient {
   ChainId sender = 1;
   ChainId recipient = 2;
   bytes bundles = 3;
+  // The height of the sender's previous block that sent messages to this recipient
+  // (before the first bundle). Absent if this is the first message ever.
+  optional BlockHeight previous_height = 4;
 }
 
 // Acknowledge the height of the highest confirmed blocks communicated with `UpdateRecipient`.
@@ -208,42 +271,48 @@ message ConfirmUpdatedRecipient {
   BlockHeight latest_height = 3;
 }
 
+// Request the sender to revert a previous confirmation and resend bundles.
+message RevertConfirm {
+  ChainId sender = 1;
+  ChainId recipient = 2;
+  BlockHeight retransmit_from = 3;
+}
+
 // Request information on a chain.
 message ChainInfoQuery {
-  // Removed `request_sent_certificate_hashes_in_range`
-  reserved 5;
   // The chain ID
   ChainId chain_id = 1;
 
   // Optionally test that the block height is as expected
   optional BlockHeight test_next_block_height = 2;
 
-  // Query the current committees
-  bool request_committees = 3;
-
   // Query the received messages that are waiting to be picked in the next block.
-  bool request_pending_message_bundles = 4;
+  bool request_pending_message_bundles = 3;
 
   // Query new certificate removed from the chain.
-  optional uint64 request_received_log_excluding_first_n = 6;
+  optional uint64 request_received_log_excluding_first_n = 4;
 
   // Query values from the chain manager, not just votes.
-  bool request_manager_values = 7;
+  bool request_manager_values = 5;
 
   // Request a signed vote for a leader timeout for the given height and round.
-  optional bytes request_leader_timeout = 8;
+  optional bytes request_leader_timeout = 6;
 
   // Query the balance of a given owner.
-  AccountOwner request_owner_balance = 9;
+  AccountOwner request_owner_balance = 7;
 
   // Request a signed vote for fallback mode.
-  bool request_fallback = 10;
+  bool request_fallback = 8;
 
   // Query for certificate hashes at block heights sent from the chain.
-  optional bytes request_sent_certificate_hashes_by_heights = 11;
+  optional bytes request_sent_certificate_hashes_by_heights = 9;
 
-  // Whether to create network actions as part of the query.
-  optional bool create_network_actions = 12;
+  // Query the previous event blocks for specific streams.
+  optional bytes request_previous_event_blocks = 10;
+
+  // Query the height of the most recent block whose certificate records an
+  // OracleResponse::Checkpoint, if any.
+  bool request_latest_checkpoint_height = 11;
 }
 
 // An authenticated proposal for a new block.
@@ -284,6 +353,16 @@ message LiteCertificate {
   bool wait_for_outgoing_messages = 5;
 
   CertificateKind kind = 6;
+
+  // The unlocking round (a bincode-encoded `Option<Round>`) the `ValidatedBlock` voters signed.
+  bytes unlocking_round = 7;
+
+  // The justification chain (a bincode-encoded `JustificationChain`) carried by the certificate.
+  bytes justification = 8;
+
+  // The first-round attestation the `ConfirmedBlock` voters signed. Only `true` for a confirmed
+  // block certificate confirming a block in the chain's first round; always `false` otherwise.
+  bool first_round = 9;
 }
 
 // A certified statement from the committee, together with other certificates
@@ -354,6 +433,14 @@ message Certificate {
 
   // The kind of certificate serialized in `value` field.
   CertificateKind kind = 4;
+
+  // The justification chain (a `JustificationChain`) carried by validated and confirmed block
+  // certificates. Empty for timeout certificates and for blocks needing no justification.
+  bytes justification = 5;
+
+  // The first-round attestation the `ConfirmedBlock` voters signed. Only `true` for a confirmed
+  // block certificate confirming a block in the chain's first round; always `false` otherwise.
+  bool first_round = 6;
 }
 
 enum CertificateKind {
@@ -424,4 +511,16 @@ message ChainInfoResponse {
 
 message BlockHeight {
   uint64 height = 1;
+}
+
+// A request for looking up block heights where events were published.
+message EventBlockHeightsRequest {
+  // BCS-serialized `Vec<EventId>`.
+  bytes event_ids = 1;
+}
+
+// Response with block heights for each requested event.
+message EventBlockHeightsResponse {
+  // BCS-serialized `Vec<Option<BlockHeight>>`.
+  bytes heights = 1;
 }

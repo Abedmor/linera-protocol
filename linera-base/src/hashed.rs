@@ -21,24 +21,19 @@ pub struct Hashed<T> {
 }
 
 impl<T> Hashed<T> {
-    /// Creates an instance of [`Hashed`] with the given `hash` value.
-    ///
-    /// Note on usage: This method is unsafe because it allows the caller to create a Hashed
-    /// with a hash that doesn't match the value. This is necessary for the rewrite state when
-    /// signers sign over old `Certificate` type.
-    pub fn unchecked_new(value: T, hash: CryptoHash) -> Self {
-        Self { value, hash }
-    }
-
     /// Creates an instance of [`Hashed`] with the given `value`.
-    ///
-    /// Note: Contrary to its `unchecked_new` counterpart, this method is safe because it
-    /// calculates the hash from the value.
     pub fn new<'de>(value: T) -> Self
     where
         T: BcsHashable<'de>,
     {
         let hash = CryptoHash::new(&value);
+        Self { value, hash }
+    }
+
+    /// Creates a [`Hashed`] from a value and a precomputed hash, without recomputing it.
+    ///
+    /// The caller is responsible for the hash being the canonical hash of `value`.
+    pub fn with_hash(value: T, hash: CryptoHash) -> Self {
         Self { value, hash }
     }
 
@@ -111,3 +106,23 @@ impl<T> PartialEq for Hashed<T> {
 }
 
 impl<T> Eq for Hashed<T> {}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        crypto::{BcsHashable, CryptoHash},
+        hashed::Hashed,
+    };
+
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Dummy(u8);
+    impl BcsHashable<'_> for Dummy {}
+
+    #[test]
+    fn with_hash_stores_provided_hash() {
+        let forced = CryptoHash::from([9u8; 32]);
+        let hashed = Hashed::with_hash(Dummy(7), forced);
+        assert_eq!(hashed.hash(), forced);
+        assert_ne!(hashed.hash(), CryptoHash::new(&Dummy(7)));
+    }
+}

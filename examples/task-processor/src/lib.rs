@@ -8,18 +8,31 @@
 //! the results in its state.
 
 use async_graphql::{Request, Response};
-use linera_sdk::linera_base_types::{ContractAbi, ServiceAbi};
+use linera_sdk::{
+    formats::StableEnum,
+    linera_base_types::{ChainId, ContractAbi, ServiceAbi},
+};
 use serde::{Deserialize, Serialize};
 
 pub struct TaskProcessorAbi;
 
 /// Operations that can be executed on the contract.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, StableEnum)]
 pub enum TaskProcessorOperation {
     /// Request a task to be processed by the given operator with the given input.
     RequestTask { operator: String, input: String },
-    /// Store the result of a completed task.
-    StoreResult { result: String },
+    RequestTaskOn {
+        chain_id: ChainId,
+        operator: String,
+        input: String,
+    },
+    /// Store the result of the completed task with the given identifier.
+    StoreResult { id: u64, result: String },
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub enum Message {
+    RequestTask { operator: String, input: String },
 }
 
 impl ContractAbi for TaskProcessorAbi {
@@ -30,4 +43,44 @@ impl ContractAbi for TaskProcessorAbi {
 impl ServiceAbi for TaskProcessorAbi {
     type Query = Request;
     type QueryResponse = Response;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod formats {
+    use linera_sdk::formats::{BcsApplication, Formats, TracerExt};
+    use serde_reflection::{Samples, Tracer, TracerConfig};
+
+    use super::{Message, TaskProcessorAbi, TaskProcessorOperation};
+
+    /// The TaskProcessor application.
+    pub struct TaskProcessorApplication;
+
+    impl BcsApplication for TaskProcessorApplication {
+        type Abi = TaskProcessorAbi;
+
+        fn formats() -> serde_reflection::Result<Formats> {
+            let mut tracer = Tracer::new(
+                TracerConfig::default()
+                    .record_samples_for_newtype_structs(true)
+                    .record_samples_for_tuple_structs(true),
+            );
+            let samples = Samples::new();
+
+            // Trace the ABI types
+            let operation = tracer.trace_stable_enum_type::<TaskProcessorOperation>(&samples)?;
+            let (response, _) = tracer.trace_type::<()>(&samples)?;
+            let (message, _) = tracer.trace_type::<Message>(&samples)?;
+            let (event_value, _) = tracer.trace_type::<()>(&samples)?;
+
+            let registry = tracer.registry()?;
+
+            Ok(Formats {
+                registry,
+                operation,
+                response,
+                message,
+                event_value,
+            })
+        }
+    }
 }

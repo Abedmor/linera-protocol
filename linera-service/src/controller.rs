@@ -2,19 +2,24 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
 };
 
 use futures::{lock::Mutex, stream::StreamExt, FutureExt};
-use linera_base::identifiers::{ApplicationId, ChainId};
+use linera_base::{
+    data_types::MessagePolicy,
+    identifiers::{ApplicationId, ChainId, GenericApplicationId},
+};
 use linera_client::chain_listener::{ClientContext, ListenerCommand};
 use linera_core::{
-    client::{ChainClient, ListeningMode},
+    client::ChainClient,
     node::NotificationStream,
-    worker::Reason,
+    worker::{Notification, Reason},
 };
-use linera_sdk::abis::controller::{LocalWorkerState, Operation, WorkerCommand};
+use linera_sdk::abis::controller::{
+    LocalWorkerState, ManagedServiceId, Operation, PendingService, WorkerCommand,
+};
 use serde_json::json;
 use tokio::{
     select,
@@ -23,11 +28,12 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info};
 
-use crate::task_processor::{OperatorMap, TaskProcessor};
+use crate::task_processor::{OperatorMap, TaskProcessor, TaskProcessorConfig};
 
 /// An update message sent to a TaskProcessor to change its set of applications.
 #[derive(Debug)]
 pub struct Update {
+    /// The new set of applications the processor should handle.
     pub application_ids: Vec<ApplicationId>,
 }
 
@@ -35,6 +41,7 @@ struct ProcessorHandle {
     update_sender: mpsc::UnboundedSender<Update>,
 }
 
+/// Watches a controller chain and spawns task processors for its managed services.
 pub struct Controller<Ctx: ClientContext> {
     chain_id: ChainId,
     controller_id: ApplicationId,
@@ -43,8 +50,18 @@ pub struct Controller<Ctx: ClientContext> {
     cancellation_token: CancellationToken,
     notifications: NotificationStream,
     operators: OperatorMap,
+    config: TaskProcessorConfig,
     processors: BTreeMap<ChainId, ProcessorHandle>,
+    listened_local_chains: BTreeSet<ChainId>,
+    current_message_policies: BTreeMap<ChainId, MessagePolicy>,
     command_sender: UnboundedSender<ListenerCommand>,
+    pending_services_notifications: BTreeMap<
+        ChainId,
+        (
+            HashMap<ManagedServiceId, PendingService>,
+            NotificationStream,
+        ),
+    >,
 }
 
 impl<Ctx> Controller<Ctx>
@@ -53,6 +70,8 @@ where
     Ctx::Environment: 'static,
     <Ctx::Environment as linera_core::Environment>::Storage: Clone,
 {
+    /// Creates a new controller for the given controller chain.
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         chain_id: ChainId,
         controller_id: ApplicationId,
@@ -60,6 +79,7 @@ where
         chain_client: ChainClient<Ctx::Environment>,
         cancellation_token: CancellationToken,
         operators: OperatorMap,
+        config: TaskProcessorConfig,
         command_sender: UnboundedSender<ListenerCommand>,
     ) -> Self {
         let notifications = chain_client.subscribe().expect("client subscription");
@@ -71,11 +91,16 @@ where
             cancellation_token,
             notifications,
             operators,
+            config,
             processors: BTreeMap::new(),
+            listened_local_chains: BTreeSet::new(),
+            current_message_policies: BTreeMap::new(),
             command_sender,
+            pending_services_notifications: BTreeMap::new(),
         }
     }
 
+    /// Runs the controller, watching for notifications until cancelled.
     pub async fn run(mut self) {
         info!(
             "Watching for notifications for controller chain {}",
@@ -83,6 +108,22 @@ where
         );
         self.process_controller_state().await;
         loop {
+            let pending_services_notifications: std::pin::Pin<
+                Box<dyn futures::Future<Output = (ChainId, Option<Notification>)> + Send>,
+            > = if !self.pending_services_notifications.is_empty() {
+                Box::pin(
+                    futures::future::select_all(
+                        self.pending_services_notifications.iter_mut().map(
+                            |(chain_id, (_, notifications))| {
+                                notifications.next().map(|result| (*chain_id, result))
+                            },
+                        ),
+                    )
+                    .map(|((chain_id, maybe_notification), _, _)| (chain_id, maybe_notification)),
+                )
+            } else {
+                Box::pin(futures::future::pending())
+            };
             select! {
                 Some(notification) = self.notifications.next() => {
                     if let Reason::NewBlock { .. } = notification.reason {
@@ -90,12 +131,58 @@ where
                         self.process_controller_state().await;
                     }
                 }
+                (chain_id, Some(notification)) = pending_services_notifications => {
+                    self.process_pending_service_notification(chain_id, notification).await;
+                }
                 _ = self.cancellation_token.cancelled().fuse() => {
                     break;
                 }
             }
         }
         debug!("Notification stream ended.");
+    }
+
+    async fn process_pending_service_notification(
+        &mut self,
+        chain_id: ChainId,
+        notification: Notification,
+    ) {
+        debug!(
+            "Processing notification on pending service chain {}",
+            chain_id
+        );
+        if let Reason::NewBlock { height, .. } = notification.reason {
+            let pending_services = &mut self
+                .pending_services_notifications
+                .get_mut(&chain_id)
+                .expect("the entry should exist")
+                .0;
+            for (service_id, pending_service) in &*pending_services {
+                if pending_service.start_block_height <= height {
+                    let bytes = bcs::to_bytes(&Operation::StartLocalService {
+                        service_id: *service_id,
+                    })
+                    .expect("bcs bytes");
+                    let operation = linera_execution::Operation::User {
+                        application_id: self.controller_id,
+                        bytes,
+                    };
+                    if let Err(e) = self
+                        .chain_client
+                        .execute_operations(vec![operation], vec![])
+                        .await
+                    {
+                        // TODO: handle leader timeouts
+                        error!("Failed to execute worker on-chain registration: {e}");
+                    }
+                }
+            }
+            pending_services
+                .retain(|_, pending_service| pending_service.start_block_height > height);
+            if pending_services.is_empty() {
+                self.pending_services_notifications.remove(&chain_id);
+            }
+        }
     }
 
     async fn process_controller_state(&mut self) {
@@ -119,6 +206,24 @@ where
             "We should be registered with the current account owner."
         );
 
+        // Subscribe to notifications on pending services chains - we need to know when
+        // they sync their blocks.
+        for (managed_service_id, (chain_id, pending_service)) in &state.local_pending_services {
+            // No need to subscribe twice.
+            if self.pending_services_notifications.contains_key(chain_id) {
+                continue;
+            }
+            let service_notifications = self
+                .chain_client
+                .subscribe_to(*chain_id)
+                .expect("client subscription");
+            self.pending_services_notifications
+                .entry(*chain_id)
+                .or_insert_with(|| (HashMap::new(), service_notifications))
+                .0
+                .insert(*managed_service_id, pending_service.clone());
+        }
+
         // Build a map of ChainId -> Vec<ApplicationId> from local_services
         let mut chain_apps: BTreeMap<ChainId, Vec<ApplicationId>> = BTreeMap::new();
         for service in &state.local_services {
@@ -127,6 +232,36 @@ where
                 .or_default()
                 .push(service.application_id);
         }
+
+        // The service chains should reject bundles that contain no messages sent by relevant apps
+        // and no system messages.
+        let mut message_policies: BTreeMap<_, _> = chain_apps
+            .iter()
+            .map(|(chain_id, apps)| {
+                let message_policy = MessagePolicy {
+                    reject_message_bundles_without_application_ids: Some(
+                        apps.iter()
+                            .map(|app_id| GenericApplicationId::User(*app_id))
+                            .chain(std::iter::once(GenericApplicationId::User(
+                                self.controller_id,
+                            )))
+                            .chain(std::iter::once(GenericApplicationId::System))
+                            .collect(),
+                    ),
+                    ..Default::default()
+                };
+                (*chain_id, message_policy)
+            })
+            .collect();
+        message_policies.extend(state.local_message_policy);
+
+        let message_policies_to_update: BTreeMap<_, _> = message_policies
+            .iter()
+            .filter(|(chain_id, message_policy)| {
+                self.current_message_policies.get(chain_id) != Some(*message_policy)
+            })
+            .map(|(chain_id, message_policy)| (*chain_id, message_policy.clone()))
+            .collect();
 
         let old_chains: BTreeSet<_> = self.processors.keys().cloned().collect();
 
@@ -163,25 +298,71 @@ where
             }
         }
 
-        let new_chains: BTreeMap<_, _> = active_chains
-            .difference(&old_chains)
-            .map(|chain_id| (*chain_id, ListeningMode::FullChain))
+        // Collect local_chains from state
+        let local_chains: BTreeSet<_> = state.local_chains.iter().cloned().collect();
+
+        // Compute all chains we were listening to (processors + local_chains)
+        let old_listened: BTreeSet<_> = old_chains
+            .union(&self.listened_local_chains)
+            .cloned()
             .collect();
 
-        if let Err(err) = self
+        // Compute all chains we want to listen to (active services + local_chains)
+        let desired_listened: BTreeSet<_> = active_chains.union(&local_chains).cloned().collect();
+
+        // New chains to listen (neither had processor nor were in listened_local_chains)
+        let owner = worker.owner;
+        let mut new_chains: BTreeMap<_, _> = desired_listened
+            .difference(&old_listened)
+            .map(|chain_id| (*chain_id, Some(owner)))
+            .collect();
+
+        // Follow the chains for pending services, so that they are synced.
+        new_chains.extend(
+            state
+                .local_pending_services
+                .iter()
+                .map(|(_, (chain_id, _))| *chain_id)
+                .collect::<BTreeSet<_>>()
+                .difference(&old_listened)
+                .map(|chain_id| (*chain_id, None)),
+        );
+
+        // Chains to stop listening (were listened but no longer needed)
+        let chains_to_stop: BTreeSet<_> = old_listened
+            .difference(&desired_listened)
+            .cloned()
+            .collect();
+
+        // Update listened_local_chains for next iteration
+        // These are local_chains that don't have services (not in active_chains)
+        self.listened_local_chains = local_chains.difference(&active_chains).cloned().collect();
+
+        if let Err(error) = self
             .command_sender
             .send(ListenerCommand::Listen(new_chains))
         {
-            error!(%err, "error sending a command to chain listener");
+            error!(%error, "error sending a command to chain listener");
         }
-        if let Err(err) = self
+        if let Err(error) = self
             .command_sender
-            .send(ListenerCommand::StopListening(stale_chains))
+            .send(ListenerCommand::StopListening(chains_to_stop))
         {
-            error!(%err, "error sending a command to chain listener");
+            error!(%error, "error sending a command to chain listener");
         }
+        // This may affect chains we are just starting to listen to, so this command has to be sent
+        // last.
+        if let Err(error) = self.command_sender.send(ListenerCommand::SetMessagePolicy(
+            message_policies_to_update,
+        )) {
+            error!(%error, "error sending a command to chain listener");
+        }
+        self.current_message_policies = message_policies;
     }
 
+    // Keeping `&mut self` avoids borrowing `Controller` through `&self` across `.await`,
+    // which would make `controller.run()` fail the `Send` bound required by `tokio::spawn`.
+    #[expect(clippy::needless_pass_by_ref_mut)]
     async fn register_worker(&mut self) {
         let capabilities = self.operators.keys().cloned().collect();
         let command = WorkerCommand::RegisterWorker { capabilities };
@@ -241,18 +422,24 @@ where
 
         let (update_sender, update_receiver) = mpsc::unbounded_channel();
 
-        let chain_client = self
+        let mut chain_client = self
             .context
             .lock()
             .await
             .make_chain_client(service_chain_id)
             .await?;
+        // The processor may need to propose blocks with task results - for that, it will
+        // need the chain client to be configured with a preferred owner.
+        if let Some(owner) = self.chain_client.preferred_owner() {
+            chain_client.set_preferred_owner(owner);
+        }
         let processor = TaskProcessor::new(
             service_chain_id,
             application_ids,
             chain_client,
             self.cancellation_token.child_token(),
             self.operators.clone(),
+            self.config,
             Some(update_receiver),
         );
 
@@ -264,6 +451,8 @@ where
         Ok(())
     }
 
+    // Keeping `&mut self` avoids borrowing `Controller` through `&self` across `.await`,
+    // which would make `controller.run()` fail the `Send` bound required by `tokio::spawn`.
     async fn query_controller_state(&mut self) -> Result<LocalWorkerState, anyhow::Error> {
         let query = "query { localWorkerState }";
         let bytes = serde_json::to_vec(&json!({"query": query}))?;
@@ -271,10 +460,13 @@ where
             application_id: self.controller_id,
             bytes,
         };
-        let linera_execution::QueryOutcome {
-            response,
-            operations: _,
-        } = self.chain_client.query_application(query, None).await?;
+        let (
+            linera_execution::QueryOutcome {
+                response,
+                operations: _,
+            },
+            _,
+        ) = self.chain_client.query_application(query, None).await?;
         let linera_execution::QueryResponse::User(response) = response else {
             anyhow::bail!("cannot get a system response for a user query");
         };

@@ -1,13 +1,17 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! OpenTelemetry integration for tracing with OTLP export and Chrome trace export.
+//! OpenTelemetry integration for tracing with OTLP export.
 
-use opentelemetry::{global, trace::TracerProvider};
+use opentelemetry::{global, propagation::TextMapCompositePropagator, trace::TracerProvider};
 use opentelemetry_otlp::{SpanExporter, WithExportConfig};
 #[cfg(with_testing)]
 use opentelemetry_sdk::trace::InMemorySpanExporter;
-use opentelemetry_sdk::{trace::SdkTracerProvider, Resource};
+use opentelemetry_sdk::{
+    propagation::{BaggagePropagator, TraceContextPropagator},
+    trace::{BatchSpanProcessor, SdkTracerProvider},
+    Resource,
+};
 use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::{
     filter::{filter_fn, FilterFn},
@@ -47,7 +51,7 @@ fn opentelemetry_skip_filter() -> FilterFn<impl Fn(&tracing::Metadata<'_>) -> bo
 /// Initializes tracing with a custom OpenTelemetry tracer provider.
 ///
 /// This is an internal function used by both production and test code.
-fn init_with_tracer_provider(log_name: &str, tracer_provider: SdkTracerProvider) {
+fn init_with_tracer_provider(log_name: &str, tracer_provider: &SdkTracerProvider) {
     global::set_tracer_provider(tracer_provider.clone());
     let tracer = tracer_provider.tracer("linera");
 
@@ -64,6 +68,8 @@ fn init_with_tracer_provider(log_name: &str, tracer_provider: SdkTracerProvider)
         .with(maybe_log_file_layer)
         .with(stderr_layer)
         .init();
+
+    linera_base::panic_hook::init();
 }
 
 /// Builds an OpenTelemetry layer with the opentelemetry.skip filter.
@@ -99,6 +105,19 @@ pub fn build_opentelemetry_layer_with_test_exporter(
     (opentelemetry_layer, exporter_clone, tracer_provider)
 }
 
+/// Sets up the global text map propagator with TraceContext and Baggage support.
+///
+/// This enables:
+/// - W3C TraceContext propagation (traceparent, tracestate headers)
+/// - W3C Baggage propagation (baggage header for traffic_type, etc.)
+fn setup_propagator() {
+    let propagator = TextMapCompositePropagator::new(vec![
+        Box::new(TraceContextPropagator::new()),
+        Box::new(BaggagePropagator::new()),
+    ]);
+    global::set_text_map_propagator(propagator);
+}
+
 /// Initializes tracing with OpenTelemetry OTLP exporter.
 ///
 /// Exports traces using the OTLP protocol to any OpenTelemetry-compatible backend.
@@ -106,16 +125,15 @@ pub fn build_opentelemetry_layer_with_test_exporter(
 /// Only enables OpenTelemetry if LINERA_OTLP_EXPORTER_ENDPOINT env var is set.
 /// This prevents DNS errors in environments where OpenTelemetry is not deployed.
 pub fn init(log_name: &str, otlp_endpoint: Option<&str>) {
+    // Set up composite propagator for TraceContext and Baggage
+    setup_propagator();
+
     // Check if OpenTelemetry endpoint is configured via parameter or env var
     let endpoint = match otlp_endpoint {
         Some(ep) if !ep.is_empty() => ep.to_string(),
         _ => match std::env::var("LINERA_OTLP_EXPORTER_ENDPOINT") {
             Ok(ep) if !ep.is_empty() => ep,
             _ => {
-                eprintln!(
-                    "LINERA_OTLP_EXPORTER_ENDPOINT not set and no endpoint provided. \
-                     Falling back to standard tracing without OpenTelemetry support."
-                );
                 crate::tracing::init(log_name);
                 return;
             }
@@ -132,11 +150,22 @@ pub fn init(log_name: &str, otlp_endpoint: Option<&str>) {
         .build()
         .expect("Failed to create OTLP exporter");
 
+    // Configure batch processor for high-throughput scenarios
+    // Larger queue (16k instead of 2k default) to handle benchmark load
+    // Faster export (100ms instead of 5s default) to prevent queue buildup
+    let batch_config = opentelemetry_sdk::trace::BatchConfigBuilder::default()
+        .with_max_queue_size(16384) // 8x default, enough for 8 shards under load
+        .with_max_export_batch_size(2048) // Larger batches for efficiency
+        .with_scheduled_delay(std::time::Duration::from_millis(100)) // Fast export to prevent queue buildup
+        .build();
+
+    let batch_processor = BatchSpanProcessor::new(exporter, batch_config);
+
     let tracer_provider = SdkTracerProvider::builder()
         .with_resource(resource)
-        .with_batch_exporter(exporter)
+        .with_span_processor(batch_processor)
         .with_sampler(opentelemetry_sdk::trace::Sampler::AlwaysOn)
         .build();
 
-    init_with_tracer_provider(log_name, tracer_provider);
+    init_with_tracer_provider(log_name, &tracer_provider);
 }

@@ -11,12 +11,13 @@ use std::{
 };
 
 use linera_base::{
-    data_types::Amount,
+    data_types::{Amount, Timestamp},
     identifiers::{Account, AccountOwner, ApplicationId, ChainId},
     time::Instant,
 };
 use linera_core::{
     client::chain_client::{self, ChainClient},
+    data_types::ClientOutcome,
     Environment,
 };
 use linera_execution::{system::SystemOperation, Operation};
@@ -34,15 +35,241 @@ use tracing::{debug, error, info, warn, Instrument as _};
 
 use crate::chain_listener::{ChainListener, ClientContext};
 
+/// Trait for generating benchmark operations.
+///
+/// Implement this trait to create custom operation generators for different
+/// application benchmarks (e.g., prediction markets, custom tokens, etc.).
+///
+/// Each benchmark chain gets its own generator instance. The generator is responsible
+/// for producing operations to include in blocks, including any destination chain
+/// selection logic.
+pub trait OperationGenerator: Send + 'static {
+    /// Generate a batch of operations for a single block.
+    fn generate_operations(&mut self, owner: AccountOwner, count: usize) -> Vec<Operation>;
+}
+
+/// A client the benchmark can drive, so the same harness runs against either the full
+/// [`ChainClient`] or a storage-free proposer.
+///
+/// The benchmark loop only ever asks a client to commit one block of operations, which is
+/// what makes the two interchangeable: everything else -- rate control, block sizing,
+/// destination selection, reporting -- is the harness's job and is shared.
+#[cfg_attr(not(web), async_trait::async_trait)]
+#[cfg_attr(web, async_trait::async_trait(?Send))]
+pub trait BenchmarkClient: Send + Sync + 'static {
+    /// The chain this client proposes on.
+    fn chain_id(&self) -> ChainId;
+
+    /// The owner the generated operations are attributed to.
+    async fn owner(&self) -> Result<AccountOwner, BenchmarkError>;
+
+    /// Proposes a block carrying `operations` and returns once it is committed.
+    async fn commit_operations(&self, operations: Vec<Operation>) -> Result<(), BenchmarkError>;
+}
+
+#[cfg_attr(not(web), async_trait::async_trait)]
+#[cfg_attr(web, async_trait::async_trait(?Send))]
+impl<Env: Environment> BenchmarkClient for ChainClient<Env> {
+    fn chain_id(&self) -> ChainId {
+        ChainClient::chain_id(self)
+    }
+
+    async fn owner(&self) -> Result<AccountOwner, BenchmarkError> {
+        self.identity().await.map_err(BenchmarkError::ChainClient)
+    }
+
+    async fn commit_operations(&self, operations: Vec<Operation>) -> Result<(), BenchmarkError> {
+        self.execute_operations(operations, vec![])
+            .await
+            .map_err(BenchmarkError::ChainClient)?
+            .expect("should execute block with operations");
+        Ok(())
+    }
+}
+
+/// Generates native fungible token transfer operations between chains.
+pub struct NativeFungibleTransferGenerator {
+    source_chain_id: ChainId,
+    destination_chains: Vec<ChainId>,
+    destination_index: usize,
+    rng: SmallRng,
+    single_destination_per_block: bool,
+    avoid_self: bool,
+}
+
+impl NativeFungibleTransferGenerator {
+    /// Creates a generator that sends native token transfers from the source chain.
+    ///
+    /// If `avoid_self` is true, `self.source_chain_id` is skipped whenever the destination
+    /// list has more than one entry (the historical behavior: a caller that wants a mix of
+    /// self- and cross-chain traffic should build a destination list that already includes
+    /// `source_chain_id` explicitly and pass `avoid_self = false`, otherwise it would never
+    /// actually be selected).
+    pub fn new(
+        source_chain_id: ChainId,
+        mut destination_chains: Vec<ChainId>,
+        single_destination_per_block: bool,
+        avoid_self: bool,
+    ) -> Result<Self, BenchmarkError> {
+        // With a single chain, send to self.
+        if destination_chains.is_empty() {
+            destination_chains.push(source_chain_id);
+        }
+        let mut rng = SmallRng::from_rng(thread_rng())?;
+        destination_chains.shuffle(&mut rng);
+        Ok(Self {
+            source_chain_id,
+            destination_chains,
+            destination_index: 0,
+            rng,
+            single_destination_per_block,
+            avoid_self,
+        })
+    }
+
+    fn next_destination(&mut self) -> ChainId {
+        if self.destination_index >= self.destination_chains.len() {
+            self.destination_chains.shuffle(&mut self.rng);
+            self.destination_index = 0;
+        }
+        let destination_chain_id = self.destination_chains[self.destination_index];
+        self.destination_index += 1;
+        // Skip self when there are other destinations available.
+        if destination_chain_id == self.source_chain_id
+            && self.destination_chains.len() > 1
+            && self.avoid_self
+        {
+            self.next_destination()
+        } else {
+            destination_chain_id
+        }
+    }
+}
+
+impl OperationGenerator for NativeFungibleTransferGenerator {
+    fn generate_operations(&mut self, _owner: AccountOwner, count: usize) -> Vec<Operation> {
+        let amount = Amount::from_attos(1);
+        if self.single_destination_per_block {
+            let recipient = self.next_destination();
+            (0..count)
+                .map(|_| {
+                    Operation::system(SystemOperation::Transfer {
+                        owner: AccountOwner::CHAIN,
+                        recipient: Account::chain(recipient),
+                        amount,
+                    })
+                })
+                .collect()
+        } else {
+            (0..count)
+                .map(|_| {
+                    let recipient = self.next_destination();
+                    Operation::system(SystemOperation::Transfer {
+                        owner: AccountOwner::CHAIN,
+                        recipient: Account::chain(recipient),
+                        amount,
+                    })
+                })
+                .collect()
+        }
+    }
+}
+
+/// Generates fungible token transfer operations between chains.
+pub struct FungibleTransferGenerator {
+    application_id: ApplicationId,
+    source_chain_id: ChainId,
+    destination_chains: Vec<ChainId>,
+    destination_index: usize,
+    rng: SmallRng,
+    single_destination_per_block: bool,
+    avoid_self: bool,
+}
+
+impl FungibleTransferGenerator {
+    /// Creates a generator that sends fungible token transfers from the source chain.
+    ///
+    /// `avoid_self` has the same meaning as on [`NativeFungibleTransferGenerator::new`]: with
+    /// it set, `source_chain_id` is skipped whenever the destination list has more than one
+    /// entry, so a caller wanting a mix of self- and cross-chain traffic passes `false` and a
+    /// list that already contains `source_chain_id`.
+    pub fn new(
+        application_id: ApplicationId,
+        source_chain_id: ChainId,
+        mut destination_chains: Vec<ChainId>,
+        single_destination_per_block: bool,
+        avoid_self: bool,
+    ) -> Result<Self, BenchmarkError> {
+        // With a single chain, send to self (matching old behavior).
+        if destination_chains.is_empty() {
+            destination_chains.push(source_chain_id);
+        }
+        let mut rng = SmallRng::from_rng(thread_rng())?;
+        destination_chains.shuffle(&mut rng);
+        Ok(Self {
+            application_id,
+            source_chain_id,
+            destination_chains,
+            destination_index: 0,
+            rng,
+            single_destination_per_block,
+            avoid_self,
+        })
+    }
+
+    fn next_destination(&mut self) -> ChainId {
+        if self.destination_index >= self.destination_chains.len() {
+            self.destination_chains.shuffle(&mut self.rng);
+            self.destination_index = 0;
+        }
+        let destination_chain_id = self.destination_chains[self.destination_index];
+        self.destination_index += 1;
+        // Skip self when there are other destinations available.
+        if destination_chain_id == self.source_chain_id
+            && self.destination_chains.len() > 1
+            && self.avoid_self
+        {
+            self.next_destination()
+        } else {
+            destination_chain_id
+        }
+    }
+}
+
+impl OperationGenerator for FungibleTransferGenerator {
+    fn generate_operations(&mut self, owner: AccountOwner, count: usize) -> Vec<Operation> {
+        let amount = Amount::from_attos(1);
+        if self.single_destination_per_block {
+            let recipient = self.next_destination();
+            (0..count)
+                .map(|_| fungible_transfer(self.application_id, recipient, owner, owner, amount))
+                .collect()
+        } else {
+            (0..count)
+                .map(|_| {
+                    let recipient = self.next_destination();
+                    fungible_transfer(self.application_id, recipient, owner, owner, amount)
+                })
+                .collect()
+        }
+    }
+}
+
 const PROXY_LATENCY_P99_THRESHOLD: f64 = 400.0;
 const LATENCY_METRIC_PREFIX: &str = "linera_proxy_request_latency";
 
+/// An error that can occur while running a benchmark.
 #[derive(Debug, thiserror::Error)]
+#[allow(missing_docs)]
 pub enum BenchmarkError {
     #[error("Failed to join task: {0}")]
     JoinError(#[from] task::JoinError),
     #[error("Chain client error: {0}")]
     ChainClient(#[from] chain_client::Error),
+    /// The storage-free client has no `chain_client::Error` to wrap, so its failures arrive
+    /// as a message.
+    #[error("Lite client error: {0}")]
+    LiteClient(String),
     #[error("Current histogram count is less than previous histogram count")]
     HistogramCountMismatch,
     #[error("Expected histogram value, got {0:?}")]
@@ -88,17 +315,21 @@ struct HistogramSnapshot {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+/// Configuration listing the chains to use for a benchmark.
 pub struct BenchmarkConfig {
+    /// The chains to use for the benchmark.
     pub chain_ids: Vec<ChainId>,
 }
 
 impl BenchmarkConfig {
+    /// Loads the benchmark configuration from a YAML file.
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
         let config = serde_yaml::from_str(&content)?;
         Ok(config)
     }
 
+    /// Saves the benchmark configuration to a YAML file.
     pub fn save_to_file<P: AsRef<Path>>(&self, path: P) -> anyhow::Result<()> {
         let content = serde_yaml::to_string(self)?;
         std::fs::write(path, content)?;
@@ -106,25 +337,33 @@ impl BenchmarkConfig {
     }
 }
 
+/// Driver for running benchmarks against a network.
 pub struct Benchmark<Env: Environment> {
     _phantom: std::marker::PhantomData<Env>,
 }
 
 impl<Env: Environment> Benchmark<Env> {
+    /// Runs a benchmark with the given chain clients and operation generators.
+    ///
+    /// Each chain client is paired with an operation generator (one per chain).
+    /// The generators produce the operations to include in each block.
     #[expect(clippy::too_many_arguments)]
     pub async fn run_benchmark<C: ClientContext<Environment = Env> + 'static>(
         bps: usize,
-        chain_clients: Vec<ChainClient<Env>>,
-        all_chains: Vec<ChainId>,
+        chain_clients: Vec<Arc<dyn BenchmarkClient>>,
+        generators: Vec<Box<dyn OperationGenerator>>,
         transactions_per_block: usize,
-        fungible_application_id: Option<ApplicationId>,
         health_check_endpoints: Option<String>,
         runtime_in_seconds: Option<u64>,
         delay_between_chains_ms: Option<u64>,
-        chain_listener: ChainListener<C>,
+        chain_listener: Option<ChainListener<C>>,
         shutdown_notifier: &CancellationToken,
-        single_destination_per_block: bool,
     ) -> Result<(), BenchmarkError> {
+        assert_eq!(
+            chain_clients.len(),
+            generators.len(),
+            "Must have one generator per chain client"
+        );
         let num_chains = chain_clients.len();
         let bps_counts = (0..num_chains)
             .map(|_| Arc::new(AtomicUsize::new(0)))
@@ -132,11 +371,19 @@ impl<Env: Environment> Benchmark<Env> {
         let notifier = Arc::new(Notify::new());
         let barrier = Arc::new(Barrier::new(num_chains + 1));
 
-        let chain_listener_future = chain_listener
-            .run(true) // Enabling background sync for benchmarks
-            .await
-            .map_err(|_| BenchmarkError::ChainListenerStartupError)?;
-        let chain_listener_handle = tokio::spawn(chain_listener_future.in_current_span());
+        // Only the full client needs it: it keeps local chain state in sync in the
+        // background. The storage-free client has no local state to sync, and running one
+        // anyway would put exactly the work it avoids back onto the load generator.
+        let chain_listener_handle = match chain_listener {
+            Some(chain_listener) => {
+                let future = chain_listener
+                    .run()
+                    .await
+                    .map_err(|_| BenchmarkError::ChainListenerStartupError)?;
+                Some(tokio::spawn(future.in_current_span()))
+            }
+            None => None,
+        };
 
         let bps_control_task = Self::bps_control_task(
             &barrier,
@@ -153,14 +400,15 @@ impl<Env: Environment> Benchmark<Env> {
         let bps_initial_share = bps / num_chains;
         let mut bps_remainder = bps % num_chains;
         let mut join_set = task::JoinSet::<Result<(), BenchmarkError>>::new();
-        for (chain_idx, chain_client) in chain_clients.into_iter().enumerate() {
+        for (chain_idx, (chain_client, generator)) in
+            chain_clients.into_iter().zip(generators).enumerate()
+        {
             let chain_id = chain_client.chain_id();
             let shutdown_notifier_clone = shutdown_notifier.clone();
             let barrier_clone = barrier.clone();
             let bps_count_clone = bps_counts[chain_idx].clone();
             let notifier_clone = notifier.clone();
             let runtime_control_sender_clone = runtime_control_sender.clone();
-            let all_chains_clone = all_chains.clone();
             let bps_share = if bps_remainder > 0 {
                 bps_remainder -= 1;
                 bps_initial_share + 1
@@ -174,16 +422,14 @@ impl<Env: Environment> Benchmark<Env> {
                         chain_id,
                         bps_share,
                         chain_client,
-                        all_chains_clone,
+                        generator,
                         transactions_per_block,
-                        fungible_application_id,
                         shutdown_notifier_clone,
                         bps_count_clone,
                         barrier_clone,
                         notifier_clone,
                         runtime_control_sender_clone,
                         delay_between_chains_ms,
-                        single_destination_per_block,
                     ))
                     .await?;
 
@@ -216,8 +462,10 @@ impl<Env: Environment> Benchmark<Env> {
             runtime_control_task.await?;
         }
 
-        if let Err(e) = chain_listener_handle.await? {
-            tracing::error!("chain listener error: {e}");
+        if let Some(chain_listener_handle) = chain_listener_handle {
+            if let Err(e) = chain_listener_handle.await? {
+                tracing::error!("chain listener error: {e}");
+            }
         }
 
         Ok(())
@@ -494,13 +742,13 @@ impl<Env: Environment> Benchmark<Env> {
                 } else {
                     return Err(BenchmarkError::ExpectedHistogramValue(sample.value.clone()));
                 }
-            } else if sample.metric == format!("{}_count", metric_prefix) {
+            } else if sample.metric == format!("{metric_prefix}_count") {
                 if let Value::Untyped(count) = sample.value {
                     total_count = Some(count);
                 } else {
                     return Err(BenchmarkError::ExpectedUntypedValue(sample.value.clone()));
                 }
-            } else if sample.metric == format!("{}_sum", metric_prefix) {
+            } else if sample.metric == format!("{metric_prefix}_sum") {
                 if let Value::Untyped(sum) = sample.value {
                     total_sum = Some(sum);
                 } else {
@@ -560,17 +808,15 @@ impl<Env: Environment> Benchmark<Env> {
         chain_idx: usize,
         chain_id: ChainId,
         bps: usize,
-        chain_client: ChainClient<Env>,
-        all_chains: Vec<ChainId>,
+        chain_client: Arc<dyn BenchmarkClient>,
+        mut generator: Box<dyn OperationGenerator>,
         transactions_per_block: usize,
-        fungible_application_id: Option<ApplicationId>,
         shutdown_notifier: CancellationToken,
         bps_count: Arc<AtomicUsize>,
         barrier: Arc<Barrier>,
         notifier: Arc<Notify>,
         runtime_control_sender: Option<mpsc::Sender<()>>,
         delay_between_chains_ms: Option<u64>,
-        single_destination_per_block: bool,
     ) -> Result<(), BenchmarkError> {
         barrier.wait().await;
         if let Some(delay_between_chains_ms) = delay_between_chains_ms {
@@ -585,38 +831,36 @@ impl<Env: Environment> Benchmark<Env> {
             runtime_control_sender.send(()).await?;
         }
 
-        let owner = chain_client
-            .identity()
-            .await
-            .map_err(BenchmarkError::ChainClient)?;
-        let mut destination_manager = ChainDestinationManager::new(chain_id, all_chains)?;
+        let owner = chain_client.owner().await?;
 
         loop {
-            tokio::select! {
-                biased;
+            // Deliberately NOT raced against the shutdown signal. `select!` drops the losing
+            // future, and dropping a commit mid-flight abandons a block the validators have
+            // already voted on: the storage-free client keeps no local record of it, so the
+            // chain is left with an uncertified proposal at that height and every later
+            // proposal there is rejected with "Already voted to confirm a different block".
+            // Finishing the block first costs at most one block of shutdown latency.
+            if shutdown_notifier.is_cancelled() {
+                info!("Shutdown signal received, stopping benchmark");
+                break;
+            }
 
-                _ = shutdown_notifier.cancelled() => {
-                    info!("Shutdown signal received, stopping benchmark");
-                    break;
-                }
-                result = chain_client.execute_operations(
-                    Self::generate_operations(
-                        owner,
-                        transactions_per_block,
-                        fungible_application_id,
-                        &mut destination_manager,
-                        single_destination_per_block,
-                    ),
-                    vec![]
-                ) => {
-                    result
-                        .map_err(BenchmarkError::ChainClient)?
-                        .expect("should execute block with operations");
+            chain_client
+                .commit_operations(generator.generate_operations(owner, transactions_per_block))
+                .await?;
 
-                    let current_bps_count = bps_count.fetch_add(1, Ordering::Relaxed) + 1;
-                    if current_bps_count >= bps {
-                        notifier.notified().await;
+            let current_bps_count = bps_count.fetch_add(1, Ordering::Relaxed) + 1;
+            if current_bps_count >= bps {
+                // Safe to race: waiting on the notifier holds no chain state, and it would
+                // otherwise block until the next tick even after shutdown.
+                tokio::select! {
+                    biased;
+
+                    _ = shutdown_notifier.cancelled() => {
+                        info!("Shutdown signal received, stopping benchmark");
+                        break;
                     }
+                    _ = notifier.notified() => {}
                 }
             }
         }
@@ -625,72 +869,37 @@ impl<Env: Environment> Benchmark<Env> {
         Ok(())
     }
 
-    fn create_operation(
-        fungible_application_id: Option<ApplicationId>,
-        recipient_chain_id: ChainId,
-        owner: AccountOwner,
-        amount: Amount,
-    ) -> Operation {
-        match fungible_application_id {
-            Some(application_id) => {
-                Self::fungible_transfer(application_id, recipient_chain_id, owner, owner, amount)
-            }
-            None => Operation::system(SystemOperation::Transfer {
-                owner: AccountOwner::CHAIN,
-                recipient: Account::chain(recipient_chain_id),
-                amount,
-            }),
-        }
-    }
-
-    /// Generate operations for a single block, randomizing destinations after each full cycle
-    fn generate_operations(
-        owner: AccountOwner,
-        transactions_per_block: usize,
-        fungible_application_id: Option<ApplicationId>,
-        destination_manager: &mut ChainDestinationManager,
-        single_destination_per_block: bool,
-    ) -> Vec<Operation> {
-        let amount = Amount::from_attos(1);
-
-        if single_destination_per_block {
-            let recipient_chain_id = destination_manager.get_next_destination();
-
-            (0..transactions_per_block)
-                .map(|_| {
-                    Self::create_operation(
-                        fungible_application_id,
-                        recipient_chain_id,
-                        owner,
-                        amount,
-                    )
-                })
-                .collect()
-        } else {
-            let mut operations = Vec::with_capacity(transactions_per_block);
-            for _ in 0..transactions_per_block {
-                let recipient_chain_id = destination_manager.get_next_destination();
-
-                operations.push(Self::create_operation(
-                    fungible_application_id,
-                    recipient_chain_id,
-                    owner,
-                    amount,
-                ));
-            }
-            operations
-        }
-    }
-
     /// Closes the chain that was created for the benchmark.
     pub async fn close_benchmark_chain(
         chain_client: &ChainClient<Env>,
     ) -> Result<(), BenchmarkError> {
         let start = Instant::now();
-        chain_client
-            .execute_operation(Operation::system(SystemOperation::CloseChain))
-            .await?
-            .expect("Close chain operation should not fail!");
+        loop {
+            let result = chain_client
+                .execute_operation(Operation::system(SystemOperation::CloseChain))
+                .await?;
+            match result {
+                ClientOutcome::Committed(_) => break,
+                ClientOutcome::Conflict(certificate) => {
+                    info!(
+                        "Conflict while closing chain {:?}: {}. Retrying...",
+                        chain_client.chain_id(),
+                        certificate.hash()
+                    );
+                }
+                ClientOutcome::WaitForTimeout(timeout) => {
+                    info!(
+                        "Waiting for timeout while closing chain {:?}: {}",
+                        chain_client.chain_id(),
+                        timeout
+                    );
+                    linera_base::time::timer::sleep(
+                        timeout.timestamp.duration_since(Timestamp::now()),
+                    )
+                    .await;
+                }
+            }
+        }
 
         debug!(
             "Closed chain {:?} in {} ms",
@@ -701,6 +910,7 @@ impl<Env: Environment> Benchmark<Env> {
         Ok(())
     }
 
+    /// Returns the chains to benchmark, from the config file if given, otherwise from the wallet.
     pub fn get_all_chains(
         chains_config_path: Option<&Path>,
         benchmark_chains: &[(ChainId, AccountOwner)],
@@ -720,70 +930,103 @@ impl<Env: Environment> Benchmark<Env> {
 
         Ok(all_chains)
     }
+}
 
-    /// Creates a fungible token transfer operation.
-    pub fn fungible_transfer(
-        application_id: ApplicationId,
-        chain_id: ChainId,
-        sender: AccountOwner,
-        receiver: AccountOwner,
-        amount: Amount,
-    ) -> Operation {
-        let target_account = Account {
-            chain_id,
-            owner: receiver,
-        };
-        let bytes = bcs::to_bytes(&FungibleOperation::Transfer {
-            owner: sender,
-            amount,
-            target_account,
-        })
-        .expect("should serialize fungible token operation");
-        Operation::User {
-            application_id,
-            bytes,
-        }
+/// Builds a fungible token transfer operation for the given application.
+pub fn fungible_transfer(
+    application_id: ApplicationId,
+    chain_id: ChainId,
+    sender: AccountOwner,
+    receiver: AccountOwner,
+    amount: Amount,
+) -> Operation {
+    let target_account = Account {
+        chain_id,
+        owner: receiver,
+    };
+    let bytes = bcs::to_bytes(&FungibleOperation::Transfer {
+        owner: sender,
+        amount,
+        target_account,
+    })
+    .expect("should serialize fungible token operation");
+    Operation::User {
+        application_id,
+        bytes,
     }
 }
 
-struct ChainDestinationManager {
-    source_chain_id: ChainId,
-    destination_index: usize,
-    destination_chains: Vec<ChainId>,
-    rng: SmallRng,
-}
+#[cfg(test)]
+mod tests {
+    use linera_base::{crypto::CryptoHash, identifiers::ChainId};
 
-impl ChainDestinationManager {
-    fn new(
-        source_chain_id: ChainId,
-        mut destination_chains: Vec<ChainId>,
-    ) -> Result<Self, BenchmarkError> {
-        let mut rng = SmallRng::from_rng(thread_rng())?;
-        destination_chains.shuffle(&mut rng);
+    use super::*;
 
-        Ok(Self {
-            source_chain_id,
-            destination_index: 0,
-            destination_chains,
-            rng,
-        })
+    fn chain(seed: &str) -> ChainId {
+        ChainId(CryptoHash::test_hash(seed))
     }
 
-    fn get_next_destination(&mut self) -> ChainId {
-        // Check if we've gone through all destinations
-        if self.destination_index >= self.destination_chains.len() {
-            // Reshuffle the destinations for the next cycle
-            self.destination_chains.shuffle(&mut self.rng);
-            self.destination_index = 0;
-        }
+    /// `avoid_self` is what makes a mixed self/cross-chain workload expressible, and both
+    /// generators must honour it: the CLI hands them the same interleaved destination list,
+    /// so one ignoring the flag would silently measure 100% cross-chain traffic.
+    #[test]
+    fn avoid_self_decides_whether_the_source_is_a_destination() {
+        let source = chain("source");
+        let other = chain("other");
+        // As the CLI builds it for --mixed-self-transfers: one self entry per cross entry.
+        let interleaved = vec![other, source];
 
-        let destination_chain_id = self.destination_chains[self.destination_index];
-        self.destination_index += 1;
+        for avoid_self in [true, false] {
+            let mut native = NativeFungibleTransferGenerator::new(
+                source,
+                interleaved.clone(),
+                false,
+                avoid_self,
+            )
+            .unwrap();
+            let mut fungible = FungibleTransferGenerator::new(
+                ApplicationId::new(CryptoHash::test_hash("app")),
+                source,
+                interleaved.clone(),
+                false,
+                avoid_self,
+            )
+            .unwrap();
 
-        if destination_chain_id == self.source_chain_id {
-            self.get_next_destination()
-        } else {
-            destination_chain_id
+            let native_hits = (0..100)
+                .filter(|_| native.next_destination() == source)
+                .count();
+            let fungible_hits = (0..100)
+                .filter(|_| fungible.next_destination() == source)
+                .count();
+
+            if avoid_self {
+                assert_eq!(native_hits, 0, "native sent to itself despite avoid_self");
+                assert_eq!(
+                    fungible_hits, 0,
+                    "fungible sent to itself despite avoid_self"
+                );
+            } else {
+                // The list is shuffled, so this is a ratio and not an alternation.
+                assert!(
+                    (30..=70).contains(&native_hits),
+                    "native self-share {native_hits}/100 is not ~half"
+                );
+                assert!(
+                    (30..=70).contains(&fungible_hits),
+                    "fungible self-share {fungible_hits}/100 is not ~half"
+                );
+            }
         }
+    }
+
+    /// A lone destination is kept even when it is the source, or the generator would recurse
+    /// forever looking for somewhere else to send.
+    #[test]
+    fn a_sole_self_destination_survives_avoid_self() {
+        let source = chain("source");
+        let mut generator =
+            NativeFungibleTransferGenerator::new(source, vec![], false, true).unwrap();
+        assert_eq!(generator.next_destination(), source);
     }
 }

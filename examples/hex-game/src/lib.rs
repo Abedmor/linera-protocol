@@ -7,6 +7,7 @@ use std::iter;
 
 use async_graphql::{Enum, InputObject, Request, Response, SimpleObject};
 use linera_sdk::{
+    formats::StableEnum,
     graphql::GraphQLMutationRoot,
     linera_base_types::{AccountOwner, Amount, ContractAbi, ServiceAbi, TimeDelta, Timestamp},
 };
@@ -14,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 pub struct HexAbi;
 
-#[derive(Debug, Deserialize, Serialize, GraphQLMutationRoot)]
+#[derive(Debug, StableEnum, GraphQLMutationRoot)]
 pub enum Operation {
     /// Make a move, and place a stone onto cell `(x, y)`.
     MakeMove { x: u16, y: u16 },
@@ -107,7 +108,7 @@ impl Clock {
 }
 
 /// The outcome of a valid move.
-#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, StableEnum)]
 pub enum HexOutcome {
     /// A player wins the game.
     Winner(Player),
@@ -273,6 +274,77 @@ impl Board {
             .chain((y + 1 < self.size).then(|| (x, y + 1)))
             .chain((x + 1 < self.size && y > 0).then(|| (x + 1, y - 1)))
             .chain((y + 1 < self.size && x > 0).then(|| (x - 1, y + 1)))
+    }
+}
+
+/// Messages sent between chains for the Hex game.
+#[derive(Debug, Serialize, Deserialize)]
+#[doc(hidden)]
+pub enum Message {
+    /// Initializes a game. Sent from the main chain to a temporary chain.
+    Start {
+        /// The players.
+        players: [linera_sdk::linera_base_types::AccountOwner; 2],
+        /// The side length of the board. A typical size is 11.
+        board_size: u16,
+        /// Settings that determine how much time the players have to think about their turns.
+        timeouts: Timeouts,
+    },
+    /// Reports the outcome of a game. Sent from a closed chain to the main chain.
+    End {
+        winner: linera_sdk::linera_base_types::AccountOwner,
+        loser: linera_sdk::linera_base_types::AccountOwner,
+    },
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod formats {
+    use linera_sdk::{
+        formats::{BcsApplication, Formats, TracerExt},
+        linera_base_types::AccountOwner,
+    };
+    use serde_reflection::{Samples, Tracer, TracerConfig};
+
+    use super::{Board, Cell, Clock, HexAbi, HexOutcome, Message, Operation, Player, Timeouts};
+
+    /// The Hex application.
+    pub struct HexApplication;
+
+    impl BcsApplication for HexApplication {
+        type Abi = HexAbi;
+
+        fn formats() -> serde_reflection::Result<Formats> {
+            let mut tracer = Tracer::new(
+                TracerConfig::default()
+                    .record_samples_for_newtype_structs(true)
+                    .record_samples_for_tuple_structs(true),
+            );
+            let samples = Samples::new();
+
+            // Trace the ABI types
+            let operation = tracer.trace_stable_enum_type::<Operation>(&samples)?;
+            let response = tracer.trace_stable_enum_type::<HexOutcome>(&samples)?;
+            let (message, _) = tracer.trace_type::<Message>(&samples)?;
+            let (event_value, _) = tracer.trace_type::<()>(&samples)?;
+
+            // Trace additional supporting types (notably all enums) to populate the registry
+            tracer.trace_type::<Timeouts>(&samples)?;
+            tracer.trace_type::<Clock>(&samples)?;
+            tracer.trace_type::<Board>(&samples)?;
+            tracer.trace_type::<Cell>(&samples)?;
+            tracer.trace_type::<Player>(&samples)?;
+            tracer.trace_type::<AccountOwner>(&samples)?;
+
+            let registry = tracer.registry()?;
+
+            Ok(Formats {
+                registry,
+                operation,
+                response,
+                message,
+                event_value,
+            })
+        }
     }
 }
 

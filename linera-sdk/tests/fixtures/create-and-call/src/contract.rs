@@ -59,7 +59,7 @@ impl Contract for CreateAndCallContract {
         let service_bytecode = Bytecode::new(service_bytes);
         let module_id =
             self.runtime
-                .publish_module(contract_bytecode, service_bytecode, VmRuntime::Wasm);
+                .publish_module(contract_bytecode, service_bytecode, VmRuntime::Wasm, None);
 
         // Step 2: Create application with initialization value
         let application_id = self
@@ -75,7 +75,7 @@ impl Contract for CreateAndCallContract {
         // Step 3: Call the service. It should return the value before
         // the initialization of this contract and thus zero.
         let counter_request = CounterRequest::Query;
-        let value = self.runtime.query_service(application_id, &counter_request);
+        let value = self.runtime.query_service(application_id, counter_request);
         assert_eq!(value, 0);
 
         // Step 4: Call the contract with counter increment operation
@@ -88,7 +88,10 @@ impl Contract for CreateAndCallContract {
         panic!("Create and call application doesn't support any cross-chain messages");
     }
 
-    async fn store(mut self) {
-        self.state.save().await.expect("Failed to save state");
+    async fn store(self) {
+        self.state
+            .save_and_drop()
+            .await
+            .expect("Failed to save state");
     }
 }

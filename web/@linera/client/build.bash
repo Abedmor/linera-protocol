@@ -32,11 +32,27 @@ cargo build --lib --target wasm32-unknown-unknown $profile_flag
 
 wasm-bindgen \
     "$target_dir"/wasm32-unknown-unknown/$profile_dir/linera_web.wasm \
-    --out-dir dist \
-    --out-name linera \
+    --out-dir src/wasm \
+    --out-name index \
     --typescript \
     --target web \
+    --keep-debug \
     --split-linked-modules
+
+if command -v wasm-split >/dev/null; then
+    wasm-split \
+        src/wasm/index_bg.wasm \
+        --strip \
+        --debug-out src/wasm/index_bg.debug.wasm
+else
+    echo "wasm-split not found, skipping (debug wasm and stripping disabled)" >&2
+fi
+
+# Start from a clean dist so stale artifacts from a previous build can never be
+# published (dist/ is gitignored and rebuilt fresh on `prepare`/publish).
+rm -rf dist
+mkdir -p dist
+cp -r src/wasm dist/
 
 pnpm exec tsc
 pnpm exec tsc-alias

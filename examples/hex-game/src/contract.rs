@@ -6,7 +6,7 @@
 mod state;
 
 use async_graphql::ComplexObject;
-use hex_game::{Board, Clock, HexAbi, HexOutcome, Operation, Timeouts};
+use hex_game::{Board, Clock, HexAbi, HexOutcome, Message, Operation, Timeouts};
 use linera_sdk::{
     linera_base_types::{
         AccountOwner, Amount, ApplicationPermissions, ChainId, ChainOwnership, TimeoutConfig,
@@ -15,7 +15,6 @@ use linera_sdk::{
     views::{RootView, View},
     Contract, ContractRuntime,
 };
-use serde::{Deserialize, Serialize};
 use state::{GameChain, HexState};
 
 pub struct HexContract {
@@ -97,8 +96,11 @@ impl Contract for HexContract {
         }
     }
 
-    async fn store(mut self) {
-        self.state.save().await.expect("Failed to save state");
+    async fn store(self) {
+        self.state
+            .save_and_drop()
+            .await
+            .expect("Failed to save state");
     }
 }
 
@@ -155,7 +157,9 @@ impl HexContract {
         );
         let app_id = self.runtime.application_id();
         let permissions = ApplicationPermissions::new_single(app_id.forget_abi());
-        let chain_id = self.runtime.open_chain(ownership, permissions, fee_budget);
+        let chain_id =
+            self.runtime
+                .open_chain(ownership, permissions, AccountOwner::CHAIN, fee_budget);
         for owner in &players {
             self.state
                 .game_chains
@@ -191,24 +195,6 @@ impl HexContract {
     fn main_chain_id(&mut self) -> ChainId {
         self.runtime.application_creator_chain_id()
     }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub enum Message {
-    /// Initializes a game. Sent from the main chain to a temporary chain.
-    Start {
-        /// The players.
-        players: [AccountOwner; 2],
-        /// The side length of the board. A typical size is 11.
-        board_size: u16,
-        /// Settings that determine how much time the players have to think about their turns.
-        timeouts: Timeouts,
-    },
-    /// Reports the outcome of a game. Sent from a closed chain to the main chain.
-    End {
-        winner: AccountOwner,
-        loser: AccountOwner,
-    },
 }
 
 /// This implementation is only nonempty in the service.

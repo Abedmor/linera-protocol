@@ -67,6 +67,13 @@ impl<E: KeyValueStoreError> From<bcs::Error> for ValueSplittingError<E> {
 
 impl<E: KeyValueStoreError + 'static> KeyValueStoreError for ValueSplittingError<E> {
     const BACKEND: &'static str = "value splitting";
+
+    fn must_reload_view(&self) -> bool {
+        match self {
+            ValueSplittingError::InnerStoreError(e) => e.must_reload_view(),
+            _ => false,
+        }
+    }
 }
 
 impl<S> WithError for ValueSplittingDatabase<S>
@@ -91,10 +98,6 @@ where
     S::Error: 'static,
 {
     const MAX_KEY_SIZE: usize = S::MAX_KEY_SIZE - 4;
-
-    fn max_stream_queries(&self) -> usize {
-        self.store.max_stream_queries()
-    }
 
     fn root_key(&self) -> Result<Vec<u8>, Self::Error> {
         Ok(self.store.root_key()?)
@@ -187,14 +190,11 @@ where
                 .read_multi_values_bytes(&keys_add)
                 .await?
                 .into_iter();
-            for (idx, count) in n_blocks.iter().enumerate() {
-                if count > &1 {
-                    let value = big_values.get_mut(idx).unwrap();
-                    if let Some(ref mut value) = value {
-                        for _ in 1..*count {
-                            let segment = segments.next().unwrap().unwrap();
-                            value.extend(segment);
-                        }
+            for (big_value, count) in big_values.iter_mut().zip(&n_blocks) {
+                if let Some(value) = big_value {
+                    for _ in 1..*count {
+                        let segment = segments.next().unwrap().unwrap();
+                        value.extend(segment);
                     }
                 }
             }
@@ -356,6 +356,15 @@ where
     }
 }
 
+#[cfg(with_testing)]
+impl<D: crate::backends::DatabaseBackup> crate::backends::DatabaseBackup
+    for ValueSplittingDatabase<D>
+{
+    fn backup_to(&self, dir: &std::path::Path) -> anyhow::Result<()> {
+        self.database.backup_to(dir)
+    }
+}
+
 impl<D> ValueSplittingStore<D>
 where
     D: WithError,
@@ -427,10 +436,6 @@ impl WithError for LimitedTestMemoryStore {
 #[cfg(with_testing)]
 impl ReadableKeyValueStore for LimitedTestMemoryStore {
     const MAX_KEY_SIZE: usize = usize::MAX;
-
-    fn max_stream_queries(&self) -> usize {
-        self.inner.max_stream_queries()
-    }
 
     fn root_key(&self) -> Result<Vec<u8>, MemoryStoreError> {
         self.inner.root_key()
@@ -516,11 +521,10 @@ mod tests {
     // The key splitting means that when a key is overwritten
     // some previous segments may still be present.
     #[tokio::test]
-    #[expect(clippy::assertions_on_constants)]
     async fn test_value_splitting1_testing_leftovers() {
         let store = LimitedTestMemoryStore::new();
         const MAX_LEN: usize = LimitedTestMemoryStore::MAX_VALUE_SIZE;
-        assert!(MAX_LEN > 10);
+        const _: () = assert!(MAX_LEN > 10);
         let big_store = ValueSplittingStore::new(store.clone());
         let key = vec![0, 0];
         // Write a key with a long value
@@ -568,7 +572,9 @@ mod tests {
             segment_key.extend(bytes);
             let value_read = store.read_value_bytes(&segment_key).await.unwrap();
             let Some(value_read) = value_read else {
-                unreachable!()
+                unreachable!(
+                    "value_splitting test: segment key not found in underlying store right after a multi-segment write"
+                )
             };
             if index == 0 {
                 value_concat.extend(&value_read[4..]);

@@ -2,7 +2,7 @@ name: Web
 
 on:
   push:
-    branches: [ 'devnet_*', 'testnet_*' ]
+    branches: [ main, 'devnet_*', 'testnet_*' ]
   merge_group:
   pull_request:
     branches:
@@ -21,7 +21,6 @@ env:
   RUST_BACKTRACE: full
   # We allow redundant explicit links because `cargo rdme` doesn't know how to resolve implicit intra-crate links.
   RUSTDOCFLAGS: -A rustdoc::redundant_explicit_links -D warnings
-  RUSTFLAGS: -D warnings
   RUSTUP_MAX_RETRIES: 10
   RUST_LOG: linera=debug
   RUST_LOG_FORMAT: plain
@@ -40,9 +39,11 @@ jobs:
     outputs:
       should-run: ${{ steps.files-changed.outputs.paths }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 0
       - name: Filter paths
-        uses: dorny/paths-filter@v3
+        uses: dorny/paths-filter@v4.0.1
         id: files-changed
         with:
           predicate-quantifier: 'every'
@@ -54,23 +55,33 @@ jobs:
               - '!kubernetes/**'
               - '!CONTRIBUTING.md'
               - '!INSTALL.md'
+              # Workflow-only PRs don't need heavy code tests; merge to main
+              # validates the workflow itself by running it for real.
+              - '!.github/workflows/**'
+              # Specification-only changes: doc comments on marker traits with no
+              # members, implementors or call sites. rust.yml still runs clippy,
+              # cargo doc and cargo fmt on them, which is all that can fail.
+              - '!linera-spec/**'
+              - '!linera-chain/src/proof/**'
+              - '!linera-chain/src/manager/proof/**'
+              - '!linera-chain/src/data_types/proof/**'
+              - '!linera-chain/src/justification/proof.rs'
+              - '!linera-core/src/proof/**'
 
   web:
     needs: changed-files
     if: needs.changed-files.outputs.should-run == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
 
     steps:
       # Install dependencies
-    - uses: actions/checkout@v4
-    - name: Switch to nightly Rust toolchain
-      run: |
-        ln -sf toolchains/nightly/rust-toolchain.toml
+    - uses: actions/checkout@v6.0.2
     - uses: actions-rust-lang/setup-rust-toolchain@v1
-    - uses: arduino/setup-protoc@v3
       with:
-        repo-token: ${{ secrets.GITHUB_TOKEN }}
+        rustflags: ""
+    - name: Install Protoc
+      uses: ./.github/actions/install-protoc
     - uses: nanasess/setup-chromedriver@v2
     - uses: jetli/wasm-pack-action@v0.4.0
       with:
@@ -78,10 +89,22 @@ jobs:
     - uses: jetli/wasm-bindgen-action@v0.2.0
       with:
         version: 0.2.100
+    - uses: actions/setup-node@v4
+      with:
+        node-version: '22'
     - name: Install pnpm
       uses: pnpm/action-setup@v4
       with:
-        version: 10.17
+        version: 11.0.9
+    - name: Install `wasm-split`
+      uses: jaxxstorm/action-install-gh-release@v3.0.0
+      with:
+          repo: getsentry/symbolicator
+          tag: 26.3.0
+          asset-name: wasm-split
+          extension-matching: disable
+          rename-to: wasm-split
+          chmod: 0755
 
     # Setup fixtures
     - name: Run the storage-service instance
@@ -102,9 +125,24 @@ jobs:
         bash scripts/wait-for-kubernetes-service.sh "$LINERA_FAUCET_URL" "$FAUCET_PID" "$LOG_FILE"
         # Create two epochs
         # See https://github.com/linera-io/linera-protocol/pull/2835 for details.
-        LINERA_STORAGE=rocksdb:/tmp/local-linera-net/client_1.db cargo run --bin linera -- storage initialize --genesis /tmp/local-linera-net/genesis.json
-        LINERA_STORAGE=rocksdb:/tmp/local-linera-net/client_1.db cargo run --bin linera -- resource-control-policy --http-request-timeout-ms 1000
-        LINERA_STORAGE=rocksdb:/tmp/local-linera-net/client_1.db cargo run --bin linera -- resource-control-policy --http-request-timeout-ms 500
+        LINERA_STORAGE=rocksdb:/tmp/local-linera-net/client_2.db cargo run --bin linera -- storage initialize --genesis /tmp/local-linera-net/genesis.json
+        LINERA_STORAGE=rocksdb:/tmp/local-linera-net/client_2.db cargo run --bin linera -- resource-control-policy --http-request-timeout-ms 1000
+        LINERA_STORAGE=rocksdb:/tmp/local-linera-net/client_2.db cargo run --bin linera -- resource-control-policy --http-request-timeout-ms 500
+
+    - name: Deploy the example applications
+      env:
+          LINERA_WALLET: /tmp/local-linera-net/wallet_2.json
+          LINERA_KEYSTORE: /tmp/local-linera-net/keystore_2.json
+          LINERA_STORAGE: rocksdb:/tmp/local-linera-net/client_2.db
+      run: |
+        cargo run --bin linera -- wallet init
+        cargo run --bin linera -- wallet request-chain
+        echo LINERA_COUNTER_APPLICATION_ID=$(cargo run --bin linera -- project publish-and-create examples/counter --json-argument 0) >> "$GITHUB_ENV"
+        echo LINERA_FUNGIBLE_APPLICATION_ID=$(cargo run --bin linera -- project publish-and-create examples/native-fungible --json-parameters '{ "ticker_symbol": "NAT" }' --json-argument '{ "accounts": {} }') >> "$GITHUB_ENV"
+
+    - name: Switch to nightly Rust toolchain
+      run: |
+        ln -sf toolchains/nightly/rust-toolchain.toml
 
     # Run tests
     - name: Test the npm packages
@@ -117,3 +155,14 @@ jobs:
       run: |
         cd linera-views
         WASM_BINDGEN_TEST_TIMEOUT=300 wasm-pack test --chrome --headless -- --features web-default
+    - name: Test the `counter` example
+      run: |
+        cd examples/counter
+        pnpm install --frozen-lockfile
+        LINERA_APPLICATION_ID=$LINERA_COUNTER_APPLICATION_ID pnpm test
+
+    - name: Test the `fungible` example
+      run: |
+        cd examples/native-fungible
+        pnpm install --frozen-lockfile
+        LINERA_APPLICATION_ID=$LINERA_FUNGIBLE_APPLICATION_ID pnpm test

@@ -14,22 +14,34 @@ use current_platform::CURRENT_PLATFORM;
 use fs_err::File;
 use tracing::debug;
 
+/// A Linera application project on disk, rooted at a given directory.
 pub struct Project {
     root: PathBuf,
 }
 
 impl Project {
-    pub fn create_new(name: &str, linera_root: Option<&Path>) -> Result<Self> {
+    /// Creates a new application project from the template, scaffolding its files.
+    pub fn create_new(
+        name: &str,
+        linera_root: Option<&Path>,
+        dir: Option<PathBuf>,
+    ) -> Result<Self> {
         ensure!(
             !name.contains(std::path::is_separator),
             "Project name {name} should not contain path-separators",
         );
-        let root = PathBuf::from(name);
-        ensure!(
-            !root.exists(),
-            "Directory {} already exists",
-            root.display(),
-        );
+        let root = match dir {
+            Some(dir) => dir,
+            None => {
+                let root = PathBuf::from(name);
+                ensure!(
+                    !root.exists(),
+                    "Directory {} already exists",
+                    root.display(),
+                );
+                root
+            }
+        };
         ensure!(
             root.extension().is_none(),
             "Project name {name} should not have a file extension",
@@ -70,10 +82,19 @@ impl Project {
         Ok(Self { root })
     }
 
-    pub fn from_existing_project(root: PathBuf) -> Result<Self> {
+    /// Opens an existing application project at the given root directory.
+    pub fn from_existing_project(root: &Path) -> Result<Self> {
+        let root = root.canonicalize().with_context(|| {
+            format!(
+                "Could not find project at {}. \
+                 Make sure the specified directory exists.",
+                root.display()
+            )
+        })?;
         ensure!(
-            root.exists(),
-            "could not find project at {}",
+            root.join("Cargo.toml").exists(),
+            "No Cargo.toml found at {}. \
+             The path must point to a Rust project directory.",
             root.display()
         );
         Ok(Self { root })
@@ -115,13 +136,13 @@ impl Project {
 
     fn create_source_directory(project_root: &Path) -> Result<PathBuf> {
         let source_directory = project_root.join("src");
-        fs_err::create_dir(&source_directory)?;
+        fs_err::create_dir_all(&source_directory)?;
         Ok(source_directory)
     }
 
     fn create_test_directory(project_root: &Path) -> Result<PathBuf> {
         let test_directory = project_root.join("tests");
-        fs_err::create_dir(&test_directory)?;
+        fs_err::create_dir_all(&test_directory)?;
         Ok(test_directory)
     }
 
@@ -138,7 +159,7 @@ impl Project {
         ensure!(
             output.status.success(),
             "failed to initialize git repository at {}",
-            &project_root.display()
+            project_root.display()
         );
 
         Self::write_string_to_file(&project_root.join(".gitignore"), "/target")
@@ -258,21 +279,21 @@ impl Project {
     /// Adds [`linera_sdk`] dependencies in production mode.
     fn linera_sdk_production_dependencies() -> (String, String) {
         let version = env!("CARGO_PKG_VERSION");
-        let linera_sdk_dep = format!("linera-sdk = \"{}\"", version);
+        let linera_sdk_dep = format!("linera-sdk = \"{version}\"");
         let linera_sdk_dev_dep = format!(
-            "linera-sdk = {{ version = \"{}\", features = [\"test\", \"wasmer\"] }}",
-            version
+            "linera-sdk = {{ version = \"{version}\", features = [\"test\", \"wasmer\"] }}"
         );
         (linera_sdk_dep, linera_sdk_dev_dep)
     }
 
+    /// Builds the project's contract and service to Wasm, returning their bytecode paths.
     pub fn build(&self, name: Option<String>) -> Result<(PathBuf, PathBuf), anyhow::Error> {
         let name = match name {
             Some(name) => name,
             None => self.project_package_name()?.replace('-', "_"),
         };
-        let contract_name = format!("{}_contract", name);
-        let service_name = format!("{}_service", name);
+        let contract_name = format!("{name}_contract");
+        let service_name = format!("{name}_service");
         let cargo_build = Command::new("cargo")
             .arg("build")
             .arg("--release")

@@ -1,0 +1,108 @@
+---
+source: hex-game/tests/format.rs
+expression: "HexApplication::pruned_formats().unwrap()"
+---
+REGISTRY:
+  Board:
+    STRUCT:
+      - cells:
+          SEQ:
+            TYPENAME: Cell
+      - size: U16
+      - active:
+          TYPENAME: Player
+  Cell:
+    STRUCT:
+      - stone:
+          OPTION:
+            TYPENAME: Player
+      - connected: BOOL
+  Clock:
+    STRUCT:
+      - time_left:
+          TUPLEARRAY:
+            CONTENT:
+              TYPENAME: TimeDelta
+            SIZE: 2
+      - increment:
+          TYPENAME: TimeDelta
+      - current_turn_start:
+          TYPENAME: Timestamp
+      - block_delay:
+          TYPENAME: TimeDelta
+  HexOutcome:
+    ENUM:
+      211312752:
+        Ok: UNIT
+      219530868:
+        Winner:
+          NEWTYPE:
+            TYPENAME: Player
+  Message:
+    ENUM:
+      0:
+        Start:
+          STRUCT:
+            - players:
+                TUPLEARRAY:
+                  CONTENT:
+                    TYPENAME: AccountOwner
+                  SIZE: 2
+            - board_size: U16
+            - timeouts:
+                TYPENAME: Timeouts
+      1:
+        End:
+          STRUCT:
+            - winner:
+                TYPENAME: AccountOwner
+            - loser:
+                TYPENAME: AccountOwner
+  Operation:
+    ENUM:
+      162697236:
+        Start:
+          STRUCT:
+            - players:
+                TUPLEARRAY:
+                  CONTENT:
+                    TYPENAME: AccountOwner
+                  SIZE: 2
+            - board_size: U16
+            - fee_budget:
+                TYPENAME: Amount
+            - timeouts:
+                OPTION:
+                  TYPENAME: Timeouts
+      201981744:
+        ClaimVictory: UNIT
+      237661708:
+        MakeMove:
+          STRUCT:
+            - x: U16
+            - y: U16
+  Player:
+    ENUM:
+      0:
+        One: UNIT
+      1:
+        Two: UNIT
+  TimeDelta:
+    NEWTYPESTRUCT: U64
+  Timeouts:
+    STRUCT:
+      - startTime:
+          TYPENAME: TimeDelta
+      - increment:
+          TYPENAME: TimeDelta
+      - blockDelay:
+          TYPENAME: TimeDelta
+  Timestamp:
+    NEWTYPESTRUCT: U64
+OPERATION:
+  TYPENAME: Operation
+RESPONSE:
+  TYPENAME: HexOutcome
+MESSAGE:
+  TYPENAME: Message
+EVENT_VALUE: UNIT

@@ -1,6 +1,17 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+// The GraphQL spec only has signed integer scalars; this module casts at
+// the API boundary between Rust's unsigned types and GraphQL's `Int`/`BigInt`.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+// The `GraphQLQuery` derives and the `pub use types::*` re-exports generate
+// public items that cannot carry doc comments.
+#![expect(missing_docs)]
+
 use graphql_client::GraphQLQuery;
 use linera_base::{
     crypto::CryptoHash,
@@ -9,15 +20,18 @@ use linera_base::{
 };
 use thiserror::Error;
 
+/// The GraphQL `JSONObject` scalar, represented as an arbitrary JSON value.
 pub type JSONObject = serde_json::Value;
 
 #[cfg(target_arch = "wasm32")]
 mod types {
-    use linera_base::data_types::Round;
+    use std::collections::BTreeSet;
+
+    use linera_base::identifiers::StreamId;
     use serde::{Deserialize, Serialize};
     use serde_json::Value;
 
-    use super::{BlockHeight, ChainId, CryptoHash};
+    use super::{BlockHeight, ChainId, CryptoHash, Round};
 
     pub type ChainManager = Value;
     pub type ChainOwnership = Value;
@@ -31,26 +45,38 @@ mod types {
     pub type ApplicationDescription = Value;
     pub type OperationResult = Value;
 
+    /// Mirrors `linera_core::worker::Notification`.
+    /// Duplicated because `linera-core` doesn't compile for wasm32.
     #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
     pub struct Notification {
         pub chain_id: ChainId,
         pub reason: Reason,
     }
 
+    /// Mirrors `linera_core::worker::Reason`.
+    /// Duplicated because `linera-core` doesn't compile for wasm32.
     #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-    #[expect(clippy::enum_variant_names)]
     pub enum Reason {
         NewBlock {
             height: BlockHeight,
             hash: CryptoHash,
         },
+        NewEvents {
+            height: BlockHeight,
+            block_hash: CryptoHash,
+            event_streams: BTreeSet<StreamId>,
+        },
         NewIncomingBundle {
-            origin: Origin,
+            origin: ChainId,
             height: BlockHeight,
         },
         NewRound {
             height: BlockHeight,
             round: Round,
+        },
+        BlockExecuted {
+            height: BlockHeight,
+            hash: CryptoHash,
         },
     }
 }
@@ -70,8 +96,10 @@ mod types {
 }
 
 pub use types::*;
+/// The GraphQL representation of an application ID, as a string.
 pub type ApplicationId = String;
 
+/// GraphQL query for a single chain.
 #[derive(GraphQLQuery)]
 #[graphql(
     schema_path = "gql/service_schema.graphql",
@@ -80,6 +108,7 @@ pub type ApplicationId = String;
 )]
 pub struct Chain;
 
+/// GraphQL query for the list of chains.
 #[derive(GraphQLQuery)]
 #[graphql(
     schema_path = "gql/service_schema.graphql",
@@ -88,6 +117,7 @@ pub struct Chain;
 )]
 pub struct Chains;
 
+/// GraphQL query for the applications on a chain.
 #[derive(GraphQLQuery)]
 #[graphql(
     schema_path = "gql/service_schema.graphql",
@@ -96,6 +126,7 @@ pub struct Chains;
 )]
 pub struct Applications;
 
+/// GraphQL query for a range of blocks.
 #[derive(GraphQLQuery)]
 #[graphql(
     schema_path = "gql/service_schema.graphql",
@@ -104,6 +135,7 @@ pub struct Applications;
 )]
 pub struct Blocks;
 
+/// GraphQL query for a single block.
 #[derive(GraphQLQuery)]
 #[graphql(
     schema_path = "gql/service_schema.graphql",
@@ -112,6 +144,7 @@ pub struct Blocks;
 )]
 pub struct Block;
 
+/// GraphQL subscription for node notifications.
 #[derive(GraphQLQuery)]
 #[graphql(
     schema_path = "gql/service_schema.graphql",
@@ -128,10 +161,13 @@ pub struct Notifications;
 )]
 pub struct Transfer;
 
+/// An error that occurs while converting GraphQL responses into native types.
 #[derive(Error, Debug)]
 pub enum ConversionError {
+    /// A `serde_json` error.
     #[error(transparent)]
     Serde(#[from] serde_json::Error),
+    /// The response contained an unexpected or unknown certificate type.
     #[error("Unexpected certificate type: {0}")]
     UnexpectedCertificateType(String),
 }
@@ -207,6 +243,7 @@ mod from {
 
                 Ok(SystemOperation::OpenChain(OpenChainConfig {
                     ownership,
+                    account: open_chain.account,
                     balance: open_chain.balance,
                     application_permissions,
                 }))
@@ -313,10 +350,10 @@ mod from {
                     )
                 })?;
 
-                let module_id: ModuleId = publish_module.module_id.parse().map_err(|_| {
-                    ConversionError::UnexpectedCertificateType(
-                        "Invalid module_id format".to_string(),
-                    )
+                let module_id: ModuleId = publish_module.module_id.parse().map_err(|e| {
+                    ConversionError::UnexpectedCertificateType(format!(
+                        "Invalid module_id format: {e}"
+                    ))
                 })?;
 
                 Ok(SystemOperation::PublishModule { module_id })
@@ -349,10 +386,10 @@ mod from {
                     )
                 })?;
 
-                let module_id: ModuleId = create_application.module_id.parse().map_err(|_| {
-                    ConversionError::UnexpectedCertificateType(
-                        "Invalid module_id format".to_string(),
-                    )
+                let module_id: ModuleId = create_application.module_id.parse().map_err(|e| {
+                    ConversionError::UnexpectedCertificateType(format!(
+                        "Invalid module_id format: {e}"
+                    ))
                 })?;
 
                 let parameters = hex::decode(create_application.parameters_hex).map_err(|_| {
@@ -444,37 +481,31 @@ mod from {
                 })?;
                 Ok(SystemOperation::ProcessNewEpoch(Epoch(epoch_val as u32)))
             }
-            "ProcessRemovedEpoch" => {
-                let epoch_val = system_op.epoch.ok_or_else(|| {
+            "UpdateStream" => {
+                let stream = system_op.update_stream.ok_or_else(|| {
                     ConversionError::UnexpectedCertificateType(
-                        "Missing epoch for ProcessRemovedEpoch operation".to_string(),
+                        "Missing update_stream metadata for UpdateStream operation".to_string(),
                     )
                 })?;
-                Ok(SystemOperation::ProcessRemovedEpoch(Epoch(
-                    epoch_val as u32,
-                )))
-            }
-            "UpdateStreams" => {
-                let update_streams = system_op.update_streams.ok_or_else(|| {
-                    ConversionError::UnexpectedCertificateType(
-                        "Missing update_streams metadata for UpdateStreams operation".to_string(),
-                    )
+                let stream_id: StreamId = stream.stream_id.parse().map_err(|e| {
+                    ConversionError::UnexpectedCertificateType(format!("Invalid stream_id: {e}"))
                 })?;
-
-                let streams = update_streams
-                    .into_iter()
-                    .map(|stream| {
-                        let stream_id_parsed: StreamId =
-                            stream.stream_id.parse().map_err(|_| {
-                                ConversionError::UnexpectedCertificateType(
-                                    "Invalid stream_id format".to_string(),
-                                )
-                            })?;
-                        Ok((stream.chain_id, stream_id_parsed, stream.next_index as u32))
-                    })
-                    .collect::<Result<Vec<_>, ConversionError>>()?;
-
-                Ok(SystemOperation::UpdateStreams(streams))
+                let application_id =
+                    stream
+                        .application_id
+                        .parse::<RealApplicationId>()
+                        .map_err(|e| {
+                            ConversionError::UnexpectedCertificateType(format!(
+                                "Invalid application_id: {e}"
+                            ))
+                        })?;
+                Ok(SystemOperation::UpdateStream {
+                    application_id,
+                    chain_id: stream.chain_id,
+                    stream_id,
+                    first_index: stream.first_index as u32,
+                    next_index: stream.next_index as u32,
+                })
             }
             _ => Err(ConversionError::UnexpectedCertificateType(format!(
                 "Unknown system operation type: {}",
@@ -514,7 +545,6 @@ mod from {
                                     owner: rgt.owner,
                                 }),
                                 kind: msg.kind,
-                                index: msg.index as u32,
                                 message: msg.message,
                             })
                             .collect(),

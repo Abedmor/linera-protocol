@@ -6,6 +6,7 @@
 use async_graphql::{scalar, Request, Response};
 use linera_sdk::{
     abis::fungible::FungibleTokenAbi,
+    formats::StableEnum,
     graphql::GraphQLMutationRoot,
     linera_base_types::{AccountOwner, Amount, ApplicationId, ContractAbi, ServiceAbi},
 };
@@ -24,7 +25,7 @@ impl ServiceAbi for AmmAbi {
 }
 
 /// Operations that can be sent to the application.
-#[derive(Debug, Serialize, Deserialize, GraphQLMutationRoot)]
+#[derive(Debug, StableEnum, GraphQLMutationRoot)]
 pub enum Operation {
     // TODO(#969): Need to also implement Swap Bids here
     /// Swap operation
@@ -72,8 +73,6 @@ pub enum Operation {
     CloseChain,
 }
 
-scalar!(Operation);
-
 #[derive(Debug, Deserialize, Serialize)]
 pub enum Message {
     Swap {
@@ -104,3 +103,50 @@ pub struct Parameters {
 }
 
 scalar!(Parameters);
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod formats {
+    use linera_sdk::{
+        formats::{BcsApplication, Formats, TracerExt},
+        linera_base_types::AccountOwner,
+    };
+    use serde_reflection::{Samples, Tracer, TracerConfig};
+
+    use super::{AmmAbi, Message, Operation, Parameters};
+
+    /// The AMM application.
+    pub struct AmmApplication;
+
+    impl BcsApplication for AmmApplication {
+        type Abi = AmmAbi;
+
+        fn formats() -> serde_reflection::Result<Formats> {
+            let mut tracer = Tracer::new(
+                TracerConfig::default()
+                    .record_samples_for_newtype_structs(true)
+                    .record_samples_for_tuple_structs(true),
+            );
+            let samples = Samples::new();
+
+            // Trace the ABI types
+            let operation = tracer.trace_stable_enum_type::<Operation>(&samples)?;
+            let (response, _) = tracer.trace_type::<()>(&samples)?;
+            let (message, _) = tracer.trace_type::<Message>(&samples)?;
+            let (event_value, _) = tracer.trace_type::<()>(&samples)?;
+
+            // Trace additional supporting types (notably all enums) to populate the registry
+            tracer.trace_type::<Parameters>(&samples)?;
+            tracer.trace_type::<AccountOwner>(&samples)?;
+
+            let registry = tracer.registry()?;
+
+            Ok(Formats {
+                registry,
+                operation,
+                response,
+                message,
+                event_value,
+            })
+        }
+    }
+}

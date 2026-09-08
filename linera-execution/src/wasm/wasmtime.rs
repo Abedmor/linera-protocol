@@ -8,9 +8,11 @@ use std::sync::LazyLock;
 use linera_base::data_types::{Bytecode, StreamUpdate};
 use linera_witty::{wasmtime::EntrypointInstance, ExportTo};
 use tokio::sync::Mutex;
+use tracing::instrument;
 use wasmtime::{Config, Engine, Linker, Module, Store};
 
 use super::{
+    add_metering,
     module_cache::ModuleCache,
     runtime_api::{BaseRuntimeApi, ContractRuntimeApi, RuntimeApiData, ServiceRuntimeApi},
     ContractEntrypoints, ServiceEntrypoints, WasmExecutionError,
@@ -60,8 +62,9 @@ impl WasmContractModule {
     pub async fn from_wasmtime(contract_bytecode: Bytecode) -> Result<Self, WasmExecutionError> {
         let mut contract_cache = CONTRACT_CACHE.lock().await;
         let module = contract_cache
-            .get_or_insert_with(contract_bytecode, |bytecode| {
-                Module::new(&CONTRACT_ENGINE, bytecode)
+            .get_or_insert_with(contract_bytecode, "contract", |bytecode| {
+                let metered_bytecode = add_metering(&bytecode)?;
+                Module::new(&CONTRACT_ENGINE, metered_bytecode)
             })
             .map_err(WasmExecutionError::LoadContractModule)?;
         Ok(WasmContractModule::Wasmtime { module })
@@ -96,7 +99,7 @@ impl WasmServiceModule {
     pub async fn from_wasmtime(service_bytecode: Bytecode) -> Result<Self, WasmExecutionError> {
         let mut service_cache = SERVICE_CACHE.lock().await;
         let module = service_cache
-            .get_or_insert_with(service_bytecode, |bytecode| {
+            .get_or_insert_with(service_bytecode, "service", |bytecode| {
                 Module::new(&SERVICE_ENGINE, bytecode)
             })
             .map_err(WasmExecutionError::LoadServiceModule)?;
@@ -131,6 +134,7 @@ impl<Runtime> crate::UserContract for WasmtimeContractInstance<Runtime>
 where
     Runtime: ContractRuntime + 'static,
 {
+    #[instrument(skip_all)]
     fn instantiate(&mut self, argument: Vec<u8>) -> Result<(), ExecutionError> {
         ContractEntrypoints::new(&mut self.instance)
             .instantiate(argument)
@@ -138,6 +142,7 @@ where
         Ok(())
     }
 
+    #[instrument(skip_all)]
     fn execute_operation(&mut self, operation: Vec<u8>) -> Result<Vec<u8>, ExecutionError> {
         let result = ContractEntrypoints::new(&mut self.instance)
             .execute_operation(operation)
@@ -145,6 +150,7 @@ where
         Ok(result)
     }
 
+    #[instrument(skip_all)]
     fn execute_message(&mut self, message: Vec<u8>) -> Result<(), ExecutionError> {
         ContractEntrypoints::new(&mut self.instance)
             .execute_message(message)
@@ -152,6 +158,7 @@ where
         Ok(())
     }
 
+    #[instrument(skip_all)]
     fn process_streams(&mut self, updates: Vec<StreamUpdate>) -> Result<(), ExecutionError> {
         ContractEntrypoints::new(&mut self.instance)
             .process_streams(updates)
@@ -159,6 +166,15 @@ where
         Ok(())
     }
 
+    #[instrument(skip_all)]
+    fn summarize_events(&mut self, updates: Vec<StreamUpdate>) -> Result<(), ExecutionError> {
+        ContractEntrypoints::new(&mut self.instance)
+            .summarize_events(updates)
+            .map_err(WasmExecutionError::from)?;
+        Ok(())
+    }
+
+    #[instrument(skip_all)]
     fn finalize(&mut self) -> Result<(), ExecutionError> {
         ContractEntrypoints::new(&mut self.instance)
             .finalize()

@@ -3,22 +3,23 @@
 
 /* ABI of the Fungible Token Example Application */
 
-use async_graphql::scalar;
+pub mod state;
+
 pub use linera_sdk::abis::fungible::*;
 use linera_sdk::linera_base_types::{Account, AccountOwner, Amount};
 use serde::{Deserialize, Serialize};
 #[cfg(all(any(test, feature = "test"), not(target_arch = "wasm32")))]
 use {
-    async_graphql::InputType,
     futures::{stream, StreamExt},
     linera_sdk::{
         linera_base_types::{ApplicationId, ModuleId},
-        test::{ActiveChain, QueryOutcome, TestValidator},
+        test::{ActiveChain, TestValidator},
     },
 };
 
 /// A message.
 #[derive(Debug, Deserialize, Serialize)]
+#[doc(hidden)]
 pub enum Message {
     /// Credits the given `target` account, unless the message is bouncing, in which case
     /// `source` is credited instead.
@@ -42,22 +43,55 @@ pub enum Message {
     },
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct OwnerSpender {
-    /// Account to withdraw from
-    pub owner: AccountOwner,
-    /// Account to do the withdrawing
-    pub spender: AccountOwner,
-}
+#[cfg(not(target_arch = "wasm32"))]
+pub mod formats {
+    use linera_sdk::{
+        formats::{BcsApplication, Formats, TracerExt},
+        linera_base_types::AccountOwner,
+    };
+    use serde_reflection::{Samples, Tracer, TracerConfig};
 
-scalar!(OwnerSpender);
+    use super::{
+        Account, FungibleOperation, FungibleResponse, FungibleTokenAbi, InitialState, Message,
+        Parameters,
+    };
 
-impl OwnerSpender {
-    pub fn new(owner: AccountOwner, spender: AccountOwner) -> Self {
-        if owner == spender {
-            panic!("owner should be different from spender");
+    /// The Fungible Token application.
+    pub struct FungibleApplication;
+
+    impl BcsApplication for FungibleApplication {
+        type Abi = FungibleTokenAbi;
+
+        fn formats() -> serde_reflection::Result<Formats> {
+            let mut tracer = Tracer::new(
+                TracerConfig::default()
+                    .record_samples_for_newtype_structs(true)
+                    .record_samples_for_tuple_structs(true),
+            );
+            let samples = Samples::new();
+
+            // Trace the ABI types
+            let operation = tracer.trace_stable_enum_type::<FungibleOperation>(&samples)?;
+            let response = tracer.trace_stable_enum_type::<FungibleResponse>(&samples)?;
+            let (message, _) = tracer.trace_type::<Message>(&samples)?;
+            let (event_value, _) = tracer.trace_type::<()>(&samples)?;
+
+            // Trace additional supporting types (notably all enums) to populate the registry
+            tracer.trace_type::<Parameters>(&samples)?;
+            tracer.trace_type::<InitialState>(&samples)?;
+            tracer.trace_type::<Account>(&samples)?;
+            tracer.trace_type::<AccountOwner>(&samples)?;
+
+            let registry = tracer.registry()?;
+
+            Ok(Formats {
+                registry,
+                operation,
+                response,
+                message,
+                event_value,
+            })
         }
-        Self { owner, spender }
     }
 }
 
@@ -114,9 +148,10 @@ pub async fn create_with_accounts(
             })
             .await;
 
+        let (claim_certificate, _) = claim_certificate;
         assert_eq!(claim_certificate.outgoing_message_count(), 1);
 
-        let transfer_certificate = token_chain
+        let (transfer_certificate, _) = token_chain
             .add_block(|block| {
                 block.with_messages_from(&claim_certificate);
             })
@@ -132,25 +167,4 @@ pub async fn create_with_accounts(
     }
 
     (application_id, accounts)
-}
-
-/// Queries the balance of an account owned by `account_owner` on a specific `chain`.
-#[cfg(all(any(test, feature = "test"), not(target_arch = "wasm32")))]
-pub async fn query_account(
-    application_id: ApplicationId<FungibleTokenAbi>,
-    chain: &ActiveChain,
-    account_owner: AccountOwner,
-) -> Option<Amount> {
-    let query = format!(
-        "query {{ accounts {{ entry(key: {}) {{ value }} }} }}",
-        account_owner.to_value()
-    );
-    let QueryOutcome { response, .. } = chain.graphql_query(application_id, query).await;
-    let balance = response.pointer("/accounts/entry/value")?.as_str()?;
-
-    Some(
-        balance
-            .parse()
-            .expect("Account balance cannot be parsed as a number"),
-    )
 }

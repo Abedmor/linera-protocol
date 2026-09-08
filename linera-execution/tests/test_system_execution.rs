@@ -1,8 +1,6 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-#![allow(clippy::field_reassign_with_default)]
-
 use linera_base::{
     crypto::AccountSecretKey,
     data_types::{Amount, BlockHeight, Timestamp},
@@ -77,6 +75,7 @@ async fn test_simple_system_message() -> anyhow::Result<()> {
     let context = MessageContext {
         chain_id,
         origin: chain_id,
+        origin_timestamp: Default::default(),
         is_bouncing: false,
         height: BlockHeight(0),
         round: Some(0),

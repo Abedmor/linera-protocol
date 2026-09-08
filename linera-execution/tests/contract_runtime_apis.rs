@@ -990,10 +990,10 @@ async fn test_publish_module_different_bytecode() -> anyhow::Result<()> {
     application.expect_call(ExpectedCall::execute_operation(
         move |runtime, _operation| {
             let module_id1 = runtime
-                .publish_module(contract_bytecode1, service_bytecode1, vm_runtime)
+                .publish_module(contract_bytecode1, service_bytecode1, vm_runtime, None)
                 .unwrap();
             let module_id2 = runtime
-                .publish_module(contract_bytecode2, service_bytecode2, vm_runtime)
+                .publish_module(contract_bytecode2, service_bytecode2, vm_runtime, None)
                 .unwrap();
 
             // Different bytecode should produce different module IDs
@@ -1089,5 +1089,95 @@ async fn test_callee_api_calls() -> anyhow::Result<()> {
         .unwrap();
     let txn_outcome = txn_tracker.into_outcome().unwrap();
     assert!(txn_outcome.outgoing_messages.is_empty());
+    Ok(())
+}
+
+/// Tests the contract system API to change the chain ownership.
+#[test_log::test(tokio::test)]
+async fn test_change_ownership_system_api() -> anyhow::Result<()> {
+    let (state, chain_id) = SystemExecutionState::dummy_chain_state(0);
+    let mut view = state.into_view().await;
+
+    let (application_id, application, blobs) = view.register_mock_application(0).await?;
+
+    let new_ownership = ChainOwnership {
+        super_owners: BTreeSet::from([AccountOwner::from(AccountPublicKey::test_key(1))]),
+        ..ChainOwnership::default()
+    };
+
+    // Grant the application permission to manage the chain.
+    view.system
+        .application_permissions
+        .set(ApplicationPermissions {
+            manage_chain: vec![application_id],
+            ..ApplicationPermissions::default()
+        });
+
+    let expected_ownership = new_ownership.clone();
+    application.expect_call(ExpectedCall::execute_operation(
+        move |runtime, _operation| {
+            runtime.change_ownership(expected_ownership.clone())?;
+            Ok(vec![])
+        },
+    ));
+    application.expect_call(ExpectedCall::default_finalize());
+
+    let context = create_dummy_operation_context(chain_id);
+    let mut controller = ResourceController::default();
+    let mut txn_tracker = TransactionTracker::new_replaying_blobs(blobs.iter());
+    ExecutionStateActor::new(&mut view, &mut txn_tracker, &mut controller)
+        .execute_operation(
+            context,
+            Operation::User {
+                application_id,
+                bytes: vec![],
+            },
+        )
+        .await?;
+
+    // Verify the ownership was changed.
+    assert_eq!(*view.system.ownership.get().await?, new_ownership);
+
+    Ok(())
+}
+
+/// Tests that an unauthorized application cannot change the chain ownership.
+#[test_log::test(tokio::test)]
+async fn test_unauthorized_change_ownership_system_api() -> anyhow::Result<()> {
+    let (state, chain_id) = SystemExecutionState::dummy_chain_state(0);
+    let mut view = state.into_view().await;
+
+    let (application_id, application, blobs) = view.register_mock_application(0).await?;
+
+    let new_ownership = ChainOwnership {
+        super_owners: BTreeSet::from([AccountOwner::from(AccountPublicKey::test_key(1))]),
+        ..ChainOwnership::default()
+    };
+
+    // Do NOT grant the application permission to close the chain.
+
+    application.expect_call(ExpectedCall::execute_operation(
+        move |runtime, _operation| {
+            runtime.change_ownership(new_ownership.clone())?;
+            Ok(vec![])
+        },
+    ));
+    application.expect_call(ExpectedCall::default_finalize());
+
+    let context = create_dummy_operation_context(chain_id);
+    let mut controller = ResourceController::default();
+    let mut txn_tracker = TransactionTracker::new_replaying_blobs(blobs.iter());
+    let result = ExecutionStateActor::new(&mut view, &mut txn_tracker, &mut controller)
+        .execute_operation(
+            context,
+            Operation::User {
+                application_id,
+                bytes: vec![],
+            },
+        )
+        .await;
+
+    assert_matches!(result, Err(ExecutionError::UnauthorizedApplication(_)));
+
     Ok(())
 }

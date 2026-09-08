@@ -3,6 +3,8 @@
 
 //! Runtime types to simulate interfacing with the host executing the contract.
 
+#![allow(clippy::cast_possible_truncation)]
+
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     sync::{Arc, Mutex, MutexGuard},
@@ -11,16 +13,15 @@ use std::{
 use linera_base::{
     abi::{ContractAbi, ServiceAbi},
     data_types::{
-        Amount, ApplicationPermissions, BlockHeight, Bytecode, Resources, SendMessageRequest,
-        Timestamp,
+        Amount, ApplicationDescription, ApplicationPermissions, BlockHeight, Bytecode, Resources,
+        SendMessageRequest, Timestamp,
     },
     ensure, http,
     identifiers::{
-        Account, AccountOwner, ApplicationId, BlobId, ChainId, DataBlobHash, ModuleId, StreamName,
+        Account, AccountOwner, ApplicationId, BlobId, ChainId, DataBlobHash, ModuleId,
+        OwnerSpender, StreamName,
     },
-    ownership::{
-        AccountPermissionError, ChainOwnership, ChangeApplicationPermissionsError, CloseChainError,
-    },
+    ownership::{AccountPermissionError, ChainOwnership, ManageChainError},
     vm::VmRuntime,
 };
 use serde::Serialize;
@@ -31,6 +32,7 @@ struct ExpectedPublishModuleCall {
     contract: Bytecode,
     service: Bytecode,
     vm_runtime: VmRuntime,
+    formats: Option<Vec<u8>>,
     module_id: ModuleId,
 }
 
@@ -55,19 +57,22 @@ where
     application_parameters: Option<Application::Parameters>,
     application_id: Option<ApplicationId<Application::Abi>>,
     application_creator_chain_id: Option<ChainId>,
+    application_descriptions: HashMap<ApplicationId, ApplicationDescription>,
     chain_id: Option<ChainId>,
     authenticated_owner: Option<Option<AccountOwner>>,
     block_height: Option<BlockHeight>,
     round: Option<u32>,
     message_is_bouncing: Option<Option<bool>>,
     message_origin_chain_id: Option<Option<ChainId>>,
+    message_origin_timestamp: Option<Option<Timestamp>>,
     authenticated_caller_id: Option<Option<ApplicationId>>,
     timestamp: Option<Timestamp>,
     chain_balance: Option<Amount>,
     owner_balances: Option<HashMap<AccountOwner, Amount>>,
+    allowances: HashMap<OwnerSpender, Amount>,
     chain_ownership: Option<ChainOwnership>,
-    can_close_chain: Option<bool>,
-    can_change_application_permissions: Option<bool>,
+    application_permissions: Option<ApplicationPermissions>,
+    can_manage_chain: Option<bool>,
     call_application_handler: Option<CallApplicationHandler>,
     send_message_requests: Arc<Mutex<Vec<SendMessageRequest<Application::Message>>>>,
     outgoing_transfers: HashMap<Account, Amount>,
@@ -79,10 +84,17 @@ where
     expected_read_data_blob_requests: VecDeque<(DataBlobHash, Vec<u8>)>,
     expected_assert_data_blob_exists_requests: VecDeque<(DataBlobHash, Option<()>)>,
     expected_has_empty_storage_requests: VecDeque<(ApplicationId, bool)>,
-    expected_open_chain_calls: VecDeque<(ChainOwnership, ApplicationPermissions, Amount, ChainId)>,
+    expected_open_chain_calls: VecDeque<(
+        ChainOwnership,
+        ApplicationPermissions,
+        AccountOwner,
+        Amount,
+        ChainId,
+    )>,
     expected_publish_module_calls: VecDeque<ExpectedPublishModuleCall>,
     expected_create_application_calls: VecDeque<ExpectedCreateApplicationCall>,
     expected_create_data_blob_calls: VecDeque<ExpectedCreateDataBlobCall>,
+    remaining_fuel: Option<u64>,
     key_value_store: KeyValueStore,
 }
 
@@ -105,19 +117,22 @@ where
             application_parameters: None,
             application_id: None,
             application_creator_chain_id: None,
+            application_descriptions: HashMap::new(),
             chain_id: None,
             authenticated_owner: None,
             block_height: None,
             round: None,
             message_is_bouncing: None,
             message_origin_chain_id: None,
+            message_origin_timestamp: None,
             authenticated_caller_id: None,
             timestamp: None,
             chain_balance: None,
             owner_balances: None,
+            allowances: HashMap::new(),
             chain_ownership: None,
-            can_close_chain: None,
-            can_change_application_permissions: None,
+            application_permissions: None,
+            can_manage_chain: None,
             call_application_handler: None,
             send_message_requests: Arc::default(),
             outgoing_transfers: HashMap::new(),
@@ -133,6 +148,7 @@ where
             expected_publish_module_calls: VecDeque::new(),
             expected_create_application_calls: VecDeque::new(),
             expected_create_data_blob_calls: VecDeque::new(),
+            remaining_fuel: None,
             key_value_store: KeyValueStore::mock().to_mut(),
         }
     }
@@ -214,6 +230,44 @@ where
             "Application creator chain ID has not been mocked, \
             please call `MockContractRuntime::set_application_creator_chain_id` first",
         )
+    }
+
+    /// Configures the application description to return for a specific application during the test.
+    pub fn with_application_description(
+        mut self,
+        application_id: ApplicationId,
+        description: ApplicationDescription,
+    ) -> Self {
+        self.application_descriptions
+            .insert(application_id, description);
+        self
+    }
+
+    /// Configures the application description to return for a specific application during the test.
+    pub fn set_application_description(
+        &mut self,
+        application_id: ApplicationId,
+        description: ApplicationDescription,
+    ) -> &mut Self {
+        self.application_descriptions
+            .insert(application_id, description);
+        self
+    }
+
+    /// Returns the description of the given application.
+    pub fn read_application_description(
+        &mut self,
+        application_id: ApplicationId,
+    ) -> ApplicationDescription {
+        self.application_descriptions
+            .get(&application_id)
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!(
+                    "Application description for {application_id:?} has not been mocked, \
+                    please call `MockContractRuntime::set_application_description` first"
+                )
+            })
     }
 
     /// Configures the chain ID to return during the test.
@@ -339,6 +393,24 @@ where
         )
     }
 
+    /// Configures the `message_origin_timestamp` to return during the test.
+    pub fn set_message_origin_timestamp(
+        &mut self,
+        message_origin_timestamp: impl Into<Option<Timestamp>>,
+    ) -> &mut Self {
+        self.message_origin_timestamp = Some(message_origin_timestamp.into());
+        self
+    }
+
+    /// Returns the timestamp of the block on the origin chain that sent the incoming message,
+    /// or [`None`] if not executing an incoming message.
+    pub fn message_origin_timestamp(&mut self) -> Option<Timestamp> {
+        self.message_origin_timestamp.expect(
+            "`message_origin_timestamp` has not been mocked, \
+            please call `MockContractRuntime::set_message_origin_timestamp` first",
+        )
+    }
+
     /// Configures the authenticated caller ID to return during the test.
     pub fn with_authenticated_caller_id(
         mut self,
@@ -461,6 +533,76 @@ where
         *self.owner_balance_mut(owner)
     }
 
+    /// Configures the allowances on the chain to use during the test.
+    pub fn with_allowances(
+        mut self,
+        allowances: impl IntoIterator<Item = (AccountOwner, AccountOwner, Amount)>,
+    ) -> Self {
+        self.set_allowances(allowances);
+        self
+    }
+
+    /// Configures the allowances on the chain to use during the test.
+    pub fn set_allowances(
+        &mut self,
+        allowances: impl IntoIterator<Item = (AccountOwner, AccountOwner, Amount)>,
+    ) -> &mut Self {
+        self.allowances = allowances
+            .into_iter()
+            .filter_map(|(owner, spender, amount)| {
+                if amount == Amount::ZERO {
+                    None
+                } else {
+                    Some((OwnerSpender::new(owner, spender), amount))
+                }
+            })
+            .collect();
+        self
+    }
+
+    /// Configures the allowance of one owner-spender pair on the chain to use during the test.
+    pub fn with_allowance(
+        mut self,
+        owner: AccountOwner,
+        spender: AccountOwner,
+        allowance: Amount,
+    ) -> Self {
+        self.set_allowance(owner, spender, allowance);
+        self
+    }
+
+    /// Configures the allowance of one owner-spender pair on the chain to use during the test.
+    pub fn set_allowance(
+        &mut self,
+        owner: AccountOwner,
+        spender: AccountOwner,
+        allowance: Amount,
+    ) -> &mut Self {
+        let owner_spender = OwnerSpender::new(owner, spender);
+        if allowance == Amount::ZERO {
+            self.allowances.remove(&owner_spender);
+        } else {
+            self.allowances.insert(owner_spender, allowance);
+        }
+        self
+    }
+
+    /// Returns the allowance of one owner-spender pair on this chain.
+    pub fn allowance(&self, owner: AccountOwner, spender: AccountOwner) -> Amount {
+        self.allowances
+            .get(&OwnerSpender::new(owner, spender))
+            .copied()
+            .unwrap_or(Amount::ZERO)
+    }
+
+    /// Returns all allowances on this chain.
+    pub fn allowances(&self) -> Vec<(AccountOwner, AccountOwner, Amount)> {
+        self.allowances
+            .iter()
+            .map(|(owner_spender, amount)| (owner_spender.owner, owner_spender.spender, *amount))
+            .collect()
+    }
+
     /// Returns a mutable reference to the balance of one of the accounts on this chain.
     fn owner_balance_mut(&mut self, owner: AccountOwner) -> &mut Amount {
         self.owner_balances
@@ -571,6 +713,47 @@ where
         &self.claim_requests
     }
 
+    /// Approves `spender` to withdraw `amount` of native tokens from `owner`'s account.
+    pub fn approve(&mut self, owner: AccountOwner, spender: AccountOwner, amount: Amount) {
+        self.set_allowance(owner, spender, amount);
+    }
+
+    /// Transfers `amount` of native tokens from `owner` to `destination` using `spender`'s
+    /// allowance.
+    pub fn transfer_from(
+        &mut self,
+        owner: AccountOwner,
+        spender: AccountOwner,
+        destination: Account,
+        amount: Amount,
+    ) {
+        let owner_spender = OwnerSpender::new(owner, spender);
+        let remaining_allowance = self
+            .allowances
+            .get(&owner_spender)
+            .copied()
+            .unwrap_or(Amount::ZERO)
+            .try_sub(amount)
+            .expect("Insufficient allowance for transfer_from");
+
+        if remaining_allowance == Amount::ZERO {
+            self.allowances.remove(&owner_spender);
+        } else {
+            self.allowances.insert(owner_spender, remaining_allowance);
+        }
+
+        self.debit(owner, amount);
+
+        if Some(destination.chain_id) == self.chain_id {
+            self.credit(destination.owner, amount);
+        } else {
+            let destination_entry = self.outgoing_transfers.entry(destination).or_default();
+            *destination_entry = destination_entry
+                .try_add(amount)
+                .expect("Outgoing transfer value overflow");
+        }
+    }
+
     /// Configures the chain ownership configuration to return during the test.
     pub fn with_chain_ownership(mut self, chain_ownership: ChainOwnership) -> Self {
         self.chain_ownership = Some(chain_ownership);
@@ -591,50 +774,74 @@ where
         )
     }
 
-    /// Configures if the application being tested is allowed to close the chain its in.
-    pub fn with_can_close_chain(mut self, can_close_chain: bool) -> Self {
-        self.can_close_chain = Some(can_close_chain);
-        self
-    }
-
-    /// Configures if the application being tested is allowed to close the chain its in.
-    pub fn set_can_close_chain(&mut self, can_close_chain: bool) -> &mut Self {
-        self.can_close_chain = Some(can_close_chain);
-        self
-    }
-
-    /// Configures if the application being tested is allowed to change the application
-    /// permissions on the chain.
-    pub fn with_can_change_application_permissions(
+    /// Configures the application permissions to return during the test.
+    pub fn with_application_permissions(
         mut self,
-        can_change_application_permissions: bool,
+        application_permissions: ApplicationPermissions,
     ) -> Self {
-        self.can_change_application_permissions = Some(can_change_application_permissions);
+        self.application_permissions = Some(application_permissions);
         self
     }
 
-    /// Configures if the application being tested is allowed to change the application
-    /// permissions on the chain.
-    pub fn set_can_change_application_permissions(
+    /// Configures the application permissions to return during the test.
+    pub fn set_application_permissions(
         &mut self,
-        can_change_application_permissions: bool,
+        application_permissions: ApplicationPermissions,
     ) -> &mut Self {
-        self.can_change_application_permissions = Some(can_change_application_permissions);
+        self.application_permissions = Some(application_permissions);
+        self
+    }
+
+    /// Retrieves the application permissions for the current chain.
+    pub fn application_permissions(&mut self) -> ApplicationPermissions {
+        self.application_permissions.clone().expect(
+            "Application permissions have not been mocked, \
+            please call `MockContractRuntime::set_application_permissions` first",
+        )
+    }
+
+    /// Configures if the application being tested is allowed to manage the chain, i.e. close
+    /// it, change the application permissions, and change the ownership.
+    pub fn with_can_manage_chain(mut self, can_manage_chain: bool) -> Self {
+        self.can_manage_chain = Some(can_manage_chain);
+        self
+    }
+
+    /// Configures if the application being tested is allowed to manage the chain, i.e. close
+    /// it, change the application permissions, and change the ownership.
+    pub fn set_can_manage_chain(&mut self, can_manage_chain: bool) -> &mut Self {
+        self.can_manage_chain = Some(can_manage_chain);
         self
     }
 
     /// Closes the current chain. Returns an error if the application doesn't have
     /// permission to do so.
-    pub fn close_chain(&mut self) -> Result<(), CloseChainError> {
-        let authorized = self.can_close_chain.expect(
-            "Authorization to close the chain has not been mocked, \
-            please call `MockContractRuntime::set_can_close_chain` first",
+    pub fn close_chain(&mut self) -> Result<(), ManageChainError> {
+        let authorized = self.can_manage_chain.expect(
+            "Authorization to manage the chain has not been mocked, \
+            please call `MockContractRuntime::set_can_manage_chain` first",
         );
 
         if authorized {
             Ok(())
         } else {
-            Err(CloseChainError::NotPermitted)
+            Err(ManageChainError::NotPermitted)
+        }
+    }
+
+    /// Changes the ownership of the current chain. Returns an error if the application doesn't
+    /// have permission to do so.
+    pub fn change_ownership(&mut self, ownership: ChainOwnership) -> Result<(), ManageChainError> {
+        let authorized = self.can_manage_chain.expect(
+            "Authorization to manage the chain has not been mocked, \
+            please call `MockContractRuntime::set_can_manage_chain` first",
+        );
+
+        if authorized {
+            self.chain_ownership = Some(ownership);
+            Ok(())
+        } else {
+            Err(ManageChainError::NotPermitted)
         }
     }
 
@@ -643,10 +850,10 @@ where
     pub fn change_application_permissions(
         &mut self,
         application_permissions: ApplicationPermissions,
-    ) -> Result<(), ChangeApplicationPermissionsError> {
-        let authorized = self.can_change_application_permissions.expect(
-            "Authorization to change the application permissions has not been mocked, \
-            please call `MockContractRuntime::set_can_change_application_permissions` first",
+    ) -> Result<(), ManageChainError> {
+        let authorized = self.can_manage_chain.expect(
+            "Authorization to manage the chain has not been mocked, \
+            please call `MockContractRuntime::set_can_manage_chain` first",
         );
 
         if authorized {
@@ -654,12 +861,10 @@ where
                 .application_id
                 .expect("The application doesn't have an ID!")
                 .forget_abi();
-            self.can_close_chain = Some(application_permissions.can_close_chain(&application_id));
-            self.can_change_application_permissions =
-                Some(application_permissions.can_change_application_permissions(&application_id));
+            self.can_manage_chain = Some(application_permissions.can_manage_chain(&application_id));
             Ok(())
         } else {
-            Err(ChangeApplicationPermissionsError::NotPermitted)
+            Err(ManageChainError::NotPermitted)
         }
     }
 
@@ -668,31 +873,42 @@ where
         &mut self,
         ownership: ChainOwnership,
         application_permissions: ApplicationPermissions,
+        account: AccountOwner,
         balance: Amount,
         chain_id: ChainId,
     ) {
         self.expected_open_chain_calls.push_back((
             ownership,
             application_permissions,
+            account,
             balance,
             chain_id,
         ));
     }
 
-    /// Opens a new chain, configuring it with the provided `chain_ownership`,
-    /// `application_permissions` and initial `balance` (debited from the current chain).
+    /// Opens a new chain, configuring it with the provided `chain_ownership` and
+    /// `application_permissions`, and crediting `balance` (debited from the current chain) to
+    /// `account` on the new chain.
     pub fn open_chain(
         &mut self,
         ownership: ChainOwnership,
         application_permissions: ApplicationPermissions,
+        account: AccountOwner,
         balance: Amount,
     ) -> ChainId {
-        let (expected_ownership, expected_permissions, expected_balance, chain_id) = self
+        let (
+            expected_ownership,
+            expected_permissions,
+            expected_account,
+            expected_balance,
+            chain_id,
+        ) = self
             .expected_open_chain_calls
             .pop_front()
             .expect("Unexpected open_chain call");
-        assert_eq!(ownership, expected_ownership);
-        assert_eq!(application_permissions, expected_permissions);
+        assert_eq!(&ownership, &expected_ownership);
+        assert_eq!(&application_permissions, &expected_permissions);
+        assert_eq!(account, expected_account);
         assert_eq!(balance, expected_balance);
         chain_id
     }
@@ -703,6 +919,7 @@ where
         contract: Bytecode,
         service: Bytecode,
         vm_runtime: VmRuntime,
+        formats: Option<Vec<u8>>,
         module_id: ModuleId,
     ) {
         self.expected_publish_module_calls
@@ -710,6 +927,7 @@ where
                 contract,
                 service,
                 vm_runtime,
+                formats,
                 module_id,
             });
     }
@@ -718,17 +936,17 @@ where
     pub fn add_expected_create_application_call<Parameters, InstantiationArgument>(
         &mut self,
         module_id: ModuleId,
-        parameters: &Parameters,
-        argument: &InstantiationArgument,
+        parameters: Parameters,
+        argument: InstantiationArgument,
         required_application_ids: Vec<ApplicationId>,
         application_id: ApplicationId,
     ) where
         Parameters: Serialize,
         InstantiationArgument: Serialize,
     {
-        let parameters = serde_json::to_vec(parameters)
+        let parameters = serde_json::to_vec(&parameters)
             .expect("Failed to serialize `Parameters` type for a cross-application call");
-        let argument = serde_json::to_vec(argument).expect(
+        let argument = serde_json::to_vec(&argument).expect(
             "Failed to serialize `InstantiationArgument` type for a cross-application call",
         );
         self.expected_create_application_calls
@@ -753,19 +971,22 @@ where
         contract: Bytecode,
         service: Bytecode,
         vm_runtime: VmRuntime,
+        formats: Option<Vec<u8>>,
     ) -> ModuleId {
         let ExpectedPublishModuleCall {
             contract: expected_contract,
             service: expected_service,
             vm_runtime: expected_vm_runtime,
+            formats: expected_formats,
             module_id,
         } = self
             .expected_publish_module_calls
             .pop_front()
             .expect("Unexpected publish_module call");
-        assert_eq!(contract, expected_contract);
-        assert_eq!(service, expected_service);
+        assert_eq!(&contract, &expected_contract);
+        assert_eq!(&service, &expected_service);
         assert_eq!(vm_runtime, expected_vm_runtime);
+        assert_eq!(formats, expected_formats);
         module_id
     }
 
@@ -800,12 +1021,15 @@ where
         assert_eq!(module_id, expected_module_id);
         assert_eq!(parameters, expected_parameters);
         assert_eq!(argument, expected_argument);
-        assert_eq!(required_application_ids, expected_required_app_ids);
+        assert_eq!(
+            required_application_ids.as_slice(),
+            expected_required_app_ids.as_slice()
+        );
         application_id.with_abi::<Abi>()
     }
 
     /// Creates a new data blob and returns its hash.
-    pub fn create_data_blob(&mut self, bytes: &[u8]) -> DataBlobHash {
+    pub fn create_data_blob(&mut self, bytes: Vec<u8>) -> DataBlobHash {
         let ExpectedCreateDataBlobCall {
             bytes: expected_bytes,
             blob_id,
@@ -813,7 +1037,7 @@ where
             .expected_create_data_blob_calls
             .pop_front()
             .expect("Unexpected create_data_blob call");
-        assert_eq!(bytes, &expected_bytes);
+        assert_eq!(bytes, expected_bytes);
         DataBlobHash(blob_id.hash)
     }
 
@@ -842,7 +1066,7 @@ where
         application: ApplicationId<A>,
         call: &A::Operation,
     ) -> A::Response {
-        let call_bytes = A::serialize_operation(call)
+        let call_bytes = <A as ContractAbi>::serialize_operation(call)
             .expect("Failed to serialize `Operation` in test runtime cross-application call");
 
         let handler = self.call_application_handler.as_mut().expect(
@@ -958,13 +1182,13 @@ where
     pub fn query_service<A: ServiceAbi + Send>(
         &mut self,
         application_id: ApplicationId<A>,
-        query: &A::Query,
+        query: A::Query,
     ) -> A::QueryResponse {
         let maybe_query = self.expected_service_queries.pop_front();
         let (expected_id, expected_query, response) =
             maybe_query.expect("Unexpected service query");
         assert_eq!(application_id.forget_abi(), expected_id);
-        let query = serde_json::to_string(query).expect("Failed to serialize query");
+        let query = serde_json::to_string(&query).expect("Failed to serialize query");
         assert_eq!(query, expected_query);
         serde_json::from_str(&response).expect("Failed to deserialize response")
     }
@@ -979,7 +1203,7 @@ where
     pub fn http_request(&mut self, request: http::Request) -> http::Response {
         let maybe_request = self.expected_http_requests.pop_front();
         let (expected_request, response) = maybe_request.expect("Unexpected HTTP request");
-        assert_eq!(request, expected_request);
+        assert_eq!(&request, &expected_request);
         response
     }
 
@@ -1021,6 +1245,23 @@ where
     /// Returns the multi-leader round in which this block was validated.
     pub fn validation_round(&mut self) -> Option<u32> {
         self.round
+    }
+
+    /// Configures the remaining fuel to return during the test.
+    pub fn with_remaining_fuel(mut self, remaining_fuel: u64) -> Self {
+        self.remaining_fuel = Some(remaining_fuel);
+        self
+    }
+
+    /// Configures the remaining fuel to return during the test.
+    pub fn set_remaining_fuel(&mut self, remaining_fuel: u64) -> &mut Self {
+        self.remaining_fuel = Some(remaining_fuel);
+        self
+    }
+
+    /// Returns the amount of execution fuel remaining before execution is aborted.
+    pub fn remaining_fuel(&mut self) -> u64 {
+        self.remaining_fuel.unwrap_or(u64::MAX)
     }
 }
 

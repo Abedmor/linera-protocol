@@ -41,7 +41,7 @@ impl Contract for CrowdFundingContract {
 
     async fn instantiate(&mut self, argument: InstantiationArgument) {
         // Validate that the application parameters were configured correctly.
-        let _ = self.runtime.application_parameters();
+        self.runtime.application_parameters();
 
         self.state.instantiation_argument.set(Some(argument));
 
@@ -80,8 +80,11 @@ impl Contract for CrowdFundingContract {
         }
     }
 
-    async fn store(mut self) {
-        self.state.save().await.expect("Failed to save state");
+    async fn store(self) {
+        self.state
+            .save_and_drop()
+            .await
+            .expect("Failed to save state");
     }
 }
 

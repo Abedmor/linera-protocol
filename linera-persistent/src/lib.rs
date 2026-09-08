@@ -5,14 +5,8 @@
 This crate handles persisting data types to disk with a variety of backends.
 */
 
+#![deny(missing_docs)]
 #![allow(async_fn_in_trait)]
-
-cfg_if::cfg_if! {
-    if #[cfg(with_indexed_db)] {
-        pub mod indexed_db;
-        pub use indexed_db::IndexedDb;
-    }
-}
 
 cfg_if::cfg_if! {
     if #[cfg(feature = "fs")] {
@@ -32,6 +26,7 @@ pub use memory::Memory;
 /// the value in memory.
 #[cfg_attr(not(web), trait_variant::make(Send))]
 pub trait Persist: Deref {
+    /// The type of error that persisting the value can produce.
     type Error: std::error::Error + Send + Sync + 'static;
 
     /// Gets a mutable reference to the value. This is not expressed as a
@@ -48,6 +43,7 @@ pub trait Persist: Deref {
         Self::Target: Sized;
 }
 
+/// Extension methods provided for every [`Persist`] implementation.
 pub trait PersistExt: Persist {
     /// Applies a mutation to the value, persisting when done.
     async fn mutate<R>(

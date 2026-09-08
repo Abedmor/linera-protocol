@@ -11,8 +11,9 @@ use allocative::Allocative;
 use futures::{FutureExt, StreamExt};
 use linera_base::{
     crypto::{BcsHashable, CryptoHash},
-    data_types::{BlobContent, BlockHeight, StreamUpdate},
-    identifiers::{AccountOwner, BlobId, ChainId, StreamId},
+    data_types::{Blob, BlobContent, BlockHeight, OracleResponse, StreamUpdate},
+    ensure,
+    identifiers::{AccountOwner, BlobId, BlobType, ChainId, GenericApplicationId, StreamId},
     time::Instant,
 };
 use linera_views::{
@@ -30,18 +31,19 @@ use {
     crate::{
         ResourceControlPolicy, ResourceTracker, TestExecutionRuntimeContext, UserContractCode,
     },
-    linera_base::data_types::Blob,
     linera_views::context::MemoryContext,
     std::sync::Arc,
 };
 
 use super::{execution_state_actor::ExecutionRequest, runtime::ServiceRuntimeRequest};
 use crate::{
-    execution_state_actor::ExecutionStateActor, resources::ResourceController,
-    system::SystemExecutionStateView, ApplicationDescription, ApplicationId, ExecutionError,
-    ExecutionRuntimeConfig, ExecutionRuntimeContext, JsVec, MessageContext, OperationContext,
-    ProcessStreamsContext, Query, QueryContext, QueryOutcome, ServiceSyncRuntime, Timestamp,
-    TransactionTracker,
+    execution_state_actor::ExecutionStateActor,
+    resources::ResourceController,
+    system::{SystemExecutionStateView, SystemMessage},
+    transaction_tracker::PreparedCheckpoint,
+    ApplicationDescription, ApplicationId, ExecutionError, ExecutionRuntimeContext, JsVec, Message,
+    MessageContext, OperationContext, OutgoingMessage, ProcessStreamsContext, Query, QueryContext,
+    QueryOutcome, ServiceSyncRuntime, Timestamp, TransactionTracker,
 };
 
 /// An inner view accessing the execution state of a chain, for hashing purposes.
@@ -97,15 +99,118 @@ impl<C> DerefMut for ExecutionStateView<C> {
 
 impl<C> ExecutionStateView<C>
 where
-    C: Context + Clone + Send + Sync + 'static,
+    C: Context + Clone + 'static,
     C::Extra: ExecutionRuntimeContext,
 {
+    /// Computes the cryptographic hash of the execution state.
     pub async fn crypto_hash_mut(&mut self) -> Result<CryptoHash, ViewError> {
         #[derive(Serialize, Deserialize)]
         struct ExecutionStateViewHash([u8; 32]);
         impl BcsHashable<'_> for ExecutionStateViewHash {}
         let hash = self.inner.historical_hash().await?;
         Ok(CryptoHash::new(&ExecutionStateViewHash(hash.into())))
+    }
+
+    /// Validates the execution-state-level preconditions for a `SystemOperation::Checkpoint`
+    /// and dumps the inner view's persisted content as one or more [`Blob`]s. The dump is
+    /// split into chunks of at most `maximum_blob_size` bytes (from the current epoch's
+    /// resource policy) so each chunk respects the per-blob size limit even for very
+    /// large states. The blobs are not yet published; the caller is expected to register
+    /// them during transaction execution via [`Self::apply_checkpoint`].
+    ///
+    /// This is a *pre-block* operation: it must run before the block-level setup mutates
+    /// the chain state (e.g. setting `system.progress`), because `dump_content` reads
+    /// from storage and refuses to run with pending in-memory changes. Splitting the
+    /// dump out of the operation handler also guarantees the captured bytes represent
+    /// the chain's pre-block state, which is exactly what a bootstrapping node will
+    /// `restore_from_content` from before re-applying the certified checkpoint block.
+    pub async fn prepare_checkpoint(
+        &mut self,
+        maximum_blob_size: u64,
+    ) -> Result<Vec<Blob>, ExecutionError> {
+        // User event streams are summarized and pruned by the checkpoint itself (see
+        // `ExecutionStateActor`'s checkpoint handler), so they do not block checkpointing.
+        // System event streams (e.g. the epoch streams on the admin chain) are not
+        // summarized, so a chain that published any is still not allowed to checkpoint.
+        let mut had_system_event_block = false;
+        self.previous_event_blocks
+            .for_each_index_while(|stream_id| {
+                if matches!(stream_id.application_id, GenericApplicationId::System) {
+                    had_system_event_block = true;
+                    Ok(false)
+                } else {
+                    Ok(true)
+                }
+            })
+            .await?;
+        ensure!(
+            !had_system_event_block,
+            ExecutionError::CheckpointPreconditionFailed("chain has published system events")
+        );
+
+        let (bytes, _content_hash) = self.inner.dump_content().await?;
+        let chunk_size = usize::try_from(maximum_blob_size).unwrap_or(usize::MAX);
+        Ok(bytes
+            .chunks(chunk_size)
+            .map(|chunk| {
+                Blob::new(BlobContent::new(
+                    BlobType::CheckpointExecutionState,
+                    chunk.to_vec(),
+                ))
+            })
+            .collect())
+    }
+
+    /// Registers the pre-block-computed checkpoint inputs (from
+    /// [`Self::prepare_checkpoint`]) with the transaction tracker. This: publishes the
+    /// execution-state blobs, records the matching [`OracleResponse::Checkpoint`] (which
+    /// also lists every blob the chain currently references in `used_blobs` so a
+    /// bootstrapping node can fetch them from shared storage), and emits a
+    /// [`SystemMessage::CheckpointAck`] to each origin chain so the origin can later trim
+    /// its outbox dump of already-delivered messages.
+    pub async fn apply_checkpoint(
+        &mut self,
+        prepared: PreparedCheckpoint,
+        txn_tracker: &mut TransactionTracker,
+    ) -> Result<(), ExecutionError> {
+        let PreparedCheckpoint {
+            blobs,
+            origin_cursors,
+            inbox_cursors,
+            outbox_block_hashes,
+        } = prepared;
+        let execution_state_blobs = blobs.iter().map(|blob| blob.id().hash).collect();
+        let used_blobs = self.system.used_blobs.indices().await?;
+        for blob in blobs {
+            txn_tracker.add_created_blob(blob);
+        }
+        txn_tracker.replay_oracle_response(OracleResponse::Checkpoint {
+            execution_state_blobs,
+            used_blobs,
+            outbox_block_hashes,
+            inbox_cursors,
+        })?;
+        for (origin, latest_received_cursor) in origin_cursors {
+            txn_tracker.add_outgoing_message(OutgoingMessage::new(
+                origin,
+                Message::System(SystemMessage::CheckpointAck {
+                    latest_received_cursor,
+                }),
+            ));
+        }
+        // We just emitted notifications for everyone in `pending_checkpoint_ack_targets`;
+        // reset the set so the next own checkpoint only fires for origins that send
+        // us a fresh non-`Checkpoint` message in the meantime.
+        self.system.pending_checkpoint_ack_targets.clear();
+        Ok(())
+    }
+
+    /// Replaces the persisted execution state with the content of a checkpoint blob,
+    /// recording the hash of the bytes as the new stored hash. The caller is
+    /// contractually obliged to reload the view after this returns.
+    pub async fn restore_from_content(&mut self, bytes: &[u8]) -> Result<(), ViewError> {
+        self.inner.restore_from_content(bytes).await?;
+        Ok(())
     }
 }
 
@@ -133,7 +238,7 @@ pub struct ServiceRuntimeEndpoint {
 #[cfg(with_testing)]
 impl ExecutionStateView<MemoryContext<TestExecutionRuntimeContext>>
 where
-    MemoryContext<TestExecutionRuntimeContext>: Context + Clone + Send + Sync + 'static,
+    MemoryContext<TestExecutionRuntimeContext>: Context + Clone + 'static,
 {
     /// Simulates the instantiation of an application.
     pub async fn simulate_instantiation(
@@ -208,6 +313,7 @@ pub enum UserAction {
     Operation(OperationContext, Vec<u8>),
     Message(MessageContext, Vec<u8>),
     ProcessStreams(ProcessStreamsContext, Vec<StreamUpdate>),
+    SummarizeEvents(ProcessStreamsContext, Vec<StreamUpdate>),
 }
 
 impl UserAction {
@@ -216,6 +322,7 @@ impl UserAction {
             UserAction::Instantiate(context, _) => context.authenticated_owner,
             UserAction::Operation(context, _) => context.authenticated_owner,
             UserAction::ProcessStreams(_, _) => None,
+            UserAction::SummarizeEvents(_, _) => None,
             UserAction::Message(context, _) => context.authenticated_owner,
         }
     }
@@ -225,6 +332,7 @@ impl UserAction {
             UserAction::Instantiate(context, _) => context.height,
             UserAction::Operation(context, _) => context.height,
             UserAction::ProcessStreams(context, _) => context.height,
+            UserAction::SummarizeEvents(context, _) => context.height,
             UserAction::Message(context, _) => context.height,
         }
     }
@@ -234,6 +342,7 @@ impl UserAction {
             UserAction::Instantiate(context, _) => context.round,
             UserAction::Operation(context, _) => context.round,
             UserAction::ProcessStreams(context, _) => context.round,
+            UserAction::SummarizeEvents(context, _) => context.round,
             UserAction::Message(context, _) => context.round,
         }
     }
@@ -243,6 +352,7 @@ impl UserAction {
             UserAction::Instantiate(context, _) => context.timestamp,
             UserAction::Operation(context, _) => context.timestamp,
             UserAction::ProcessStreams(context, _) => context.timestamp,
+            UserAction::SummarizeEvents(context, _) => context.timestamp,
             UserAction::Message(context, _) => context.timestamp,
         }
     }
@@ -250,9 +360,10 @@ impl UserAction {
 
 impl<C> ExecutionStateView<C>
 where
-    C: Context + Clone + Send + Sync + 'static,
+    C: Context + Clone + 'static,
     C::Extra: ExecutionRuntimeContext,
 {
+    /// Runs a query against the given application and returns its response.
     pub async fn query_application(
         &mut self,
         context: QueryContext,
@@ -269,7 +380,6 @@ where
                 application_id,
                 bytes,
             } => {
-                let ExecutionRuntimeConfig {} = self.context().extra().execution_runtime_config();
                 let outcome = match endpoint {
                     Some(endpoint) => {
                         self.query_user_application_with_long_lived_service(
@@ -277,7 +387,7 @@ where
                             context,
                             bytes,
                             &mut endpoint.incoming_execution_requests,
-                            &mut endpoint.runtime_request_sender,
+                            &endpoint.runtime_request_sender,
                         )
                         .await?
                     }
@@ -319,21 +429,26 @@ where
             futures::channel::mpsc::unbounded();
         let mut txn_tracker = TransactionTracker::default().with_blobs(created_blobs);
         let mut resource_controller = ResourceController::default();
+        let thread_pool = self.context().extra().thread_pool().clone();
         let mut actor = ExecutionStateActor::new(self, &mut txn_tracker, &mut resource_controller);
 
         let (codes, descriptions) = actor.service_and_dependencies(application_id).await?;
 
-        let thread = web_thread::Thread::new();
-        let service_runtime_task = thread.run_send(JsVec(codes), move |codes| async move {
-            let mut runtime =
-                ServiceSyncRuntime::new_with_deadline(execution_state_sender, context, deadline);
+        let service_runtime_task = thread_pool
+            .run_send(JsVec(codes), move |codes| async move {
+                let mut runtime = ServiceSyncRuntime::new_with_deadline(
+                    execution_state_sender,
+                    context,
+                    deadline,
+                );
 
-            for (code, description) in codes.0.into_iter().zip(descriptions) {
-                runtime.preload_service(ApplicationId::from(&description), code, description)?;
-            }
+                for (code, description) in codes.0.into_iter().zip(descriptions) {
+                    runtime.preload_service(ApplicationId::from(&description), code, description);
+                }
 
-            runtime.run_query(application_id, query)
-        });
+                runtime.run_query(application_id, query)
+            })
+            .await;
 
         while let Some(request) = execution_state_receiver.next().await {
             actor.handle_request(request).await?;
@@ -350,7 +465,7 @@ where
         incoming_execution_requests: &mut futures::channel::mpsc::UnboundedReceiver<
             ExecutionRequest,
         >,
-        runtime_request_sender: &mut std::sync::mpsc::Sender<ServiceRuntimeRequest>,
+        runtime_request_sender: &std::sync::mpsc::Sender<ServiceRuntimeRequest>,
     ) -> Result<QueryOutcome<Vec<u8>>, ExecutionError> {
         let (outcome_sender, outcome_receiver) = oneshot::channel();
         let mut outcome_receiver = outcome_receiver.fuse();
@@ -382,6 +497,7 @@ where
         }
     }
 
+    /// Returns the descriptions of all applications registered on this chain.
     pub async fn list_applications(
         &self,
     ) -> Result<Vec<(ApplicationId, ApplicationDescription)>, ExecutionError> {

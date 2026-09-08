@@ -20,6 +20,7 @@ wasmtime = ["linera-execution/wasmtime", "linera-storage/wasmtime"]
 test = [
     "anyhow",
     "linera-base/test",
+    "linera-cache/test",
     "linera-chain/test",
     "linera-execution/test",
     "linera-storage/test",
@@ -30,13 +31,13 @@ test = [
     "test-strategy",
     "tokio/parking_lot",
 ]
-rocksdb = ["linera-views/rocksdb"]
-dynamodb = ["linera-views/dynamodb"]
+rocksdb = ["linera-views/rocksdb", "dep:rocksdb"]
 scylladb = ["linera-views/scylladb"]
 storage-service = ["linera-storage-service"]
 metrics = [
     "prometheus",
     "linera-base/metrics",
+    "linera-cache/metrics",
     "linera-chain/metrics",
     "linera-execution/metrics",
     "linera-storage/metrics",
@@ -49,7 +50,6 @@ web = [
     "linera-storage/web",
     "linera-views/web",
     "wasm-bindgen-futures",
-    "web-thread/web",
 ]
 
 [dependencies]
@@ -58,34 +58,36 @@ async-graphql.workspace = true
 async-trait.workspace = true
 bcs.workspace = true
 cfg-if.workspace = true
-clap.workspace = true
 custom_debug_derive.workspace = true
 futures.workspace = true
 linera-base.workspace = true
+linera-cache.workspace = true
 linera-chain.workspace = true
 linera-execution.workspace = true
 linera-storage.workspace = true
 linera-version.workspace = true
 linera-views.workspace = true
-lru.workspace = true
 papaya = { workspace = true, features = ["serde"] }
 prometheus = { workspace = true, optional = true }
 proptest = { workspace = true, optional = true }
 rand = { workspace = true, features = ["std_rng"] }
+rocksdb = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
+strum.workspace = true
+sync_wrapper.workspace = true
 test-log = { workspace = true, optional = true }
 test-strategy = { workspace = true, optional = true }
 thiserror.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
-tokio-util.workspace = true
 tonic.workspace = true
 tracing.workspace = true
 trait-set.workspace = true
 trait-variant.workspace = true
+wasm-bindgen.workspace = true
 wasm-bindgen-futures = { workspace = true, optional = true }
-web-thread.workspace = true
+web-thread-pool.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 linera-storage-service = { workspace = true, optional = true }
@@ -108,6 +110,7 @@ publish-read-data-blob.workspace = true
 serde_json.workspace = true
 sha3.workspace = true
 social.workspace = true
+tempfile.workspace = true
 test-case.workspace = true
 time-expiry.workspace = true
 tracing-subscriber = { workspace = true, features = ["fmt"] }
@@ -118,7 +121,7 @@ criterion = { workspace = true, default-features = true, features = [
 ] }
 
 [package.metadata.cargo-machete]
-ignored = ["proptest"]
+ignored = ["proptest", "wasm-bindgen"]
 
 [[bench]]
 name = "client_benchmarks"

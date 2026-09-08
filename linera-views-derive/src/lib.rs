@@ -3,6 +3,9 @@
 
 //! The procedural macros for the crate `linera-views`.
 
+#![deny(missing_docs)]
+#![allow(clippy::cast_possible_truncation)]
+
 use proc_macro::TokenStream;
 use proc_macro2::{Span, TokenStream as TokenStream2};
 use quote::{format_ident, quote};
@@ -49,7 +52,7 @@ fn get_extended_entry(e: Type) -> Result<TokenStream2, Error> {
     Ok(quote! { #ident :: #arguments })
 }
 
-fn generate_view_code(input: ItemStruct, root: bool) -> Result<TokenStream2, Error> {
+fn generate_view_code(input: &ItemStruct, root: bool) -> Result<TokenStream2, Error> {
     // Validate that all fields are named
     for field in &input.fields {
         if field.ident.is_none() {
@@ -61,10 +64,10 @@ fn generate_view_code(input: ItemStruct, root: bool) -> Result<TokenStream2, Err
         input_constraints,
         impl_generics,
         type_generics,
-    } = Constraints::get(&input);
+    } = Constraints::get(input);
 
-    let attrs: StructAttrs = deluxe::parse_attributes(&input)
-        .map_err(|e| Error::new_spanned(&input, format!("Failed to parse attributes: {e}")))?;
+    let attrs: StructAttrs = deluxe::parse_attributes(input)
+        .map_err(|e| Error::new_spanned(input, format!("Failed to parse attributes: {e}")))?;
     let context = attrs.context.or_else(|| {
         input.generics.type_params().next().map(|param| {
             let ident = &param.ident;
@@ -72,7 +75,7 @@ fn generate_view_code(input: ItemStruct, root: bool) -> Result<TokenStream2, Err
         })
     }).ok_or_else(|| {
         Error::new_spanned(
-            &input,
+            input,
             "Missing context: either add a generic type parameter or specify the context with #[view(context = YourContextType)]"
         )
     })?;
@@ -147,10 +150,9 @@ fn generate_view_code(input: ItemStruct, root: bool) -> Result<TokenStream2, Err
         }
     };
 
-    let first_name_quote = name_quotes.first().ok_or(Error::new_spanned(
-        &input,
-        "Struct must have at least one field",
-    ))?;
+    let first_name_quote = name_quotes
+        .first()
+        .ok_or_else(|| Error::new_spanned(input, "Struct must have at least one field"))?;
 
     let load_metrics = if root && cfg!(feature = "metrics") {
         quote! {
@@ -238,15 +240,15 @@ fn generate_view_code(input: ItemStruct, root: bool) -> Result<TokenStream2, Err
     })
 }
 
-fn generate_root_view_code(input: ItemStruct) -> TokenStream2 {
+fn generate_root_view_code(input: &ItemStruct) -> TokenStream2 {
     let Constraints {
         input_constraints,
         impl_generics,
         type_generics,
-    } = Constraints::get(&input);
+    } = Constraints::get(input);
     let struct_name = &input.ident;
 
-    let increment_counter = if cfg!(feature = "metrics") {
+    let metrics_code = if cfg!(feature = "metrics") {
         quote! {
             #[cfg(not(target_arch = "wasm32"))]
             linera_views::metrics::increment_counter(
@@ -259,6 +261,29 @@ fn generate_root_view_code(input: ItemStruct) -> TokenStream2 {
         quote! {}
     };
 
+    let write_batch_with_metrics = if cfg!(feature = "metrics") {
+        quote! {
+            if !batch.is_empty() {
+                #[cfg(not(target_arch = "wasm32"))]
+                let start = std::time::Instant::now();
+                self.context().store().write_batch(batch).await?;
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+                    linera_views::metrics::SAVE_VIEW_LATENCY
+                        .with_label_values(&[stringify!(#struct_name)])
+                        .observe(latency_ms);
+                }
+            }
+        }
+    } else {
+        quote! {
+            if !batch.is_empty() {
+                self.context().store().write_batch(batch).await?;
+            }
+        }
+    };
+
     quote! {
         impl #impl_generics linera_views::views::RootView for #struct_name #type_generics
         where
@@ -267,20 +292,27 @@ fn generate_root_view_code(input: ItemStruct) -> TokenStream2 {
         {
             async fn save(&mut self) -> Result<(), linera_views::ViewError> {
                 use linera_views::{context::Context as _, batch::Batch, store::WritableKeyValueStore as _, views::View as _};
-                #increment_counter
+                #metrics_code
                 let mut batch = Batch::new();
                 self.pre_save(&mut batch)?;
-                if !batch.is_empty() {
-                    self.context().store().write_batch(batch).await?;
-                }
+                #write_batch_with_metrics
                 self.post_save();
+                Ok(())
+            }
+
+            async fn save_and_drop(self) -> Result<(), linera_views::ViewError> {
+                use linera_views::{context::Context as _, batch::Batch, store::WritableKeyValueStore as _, views::View as _};
+                #metrics_code
+                let mut batch = Batch::new();
+                self.pre_save(&mut batch)?;
+                #write_batch_with_metrics
                 Ok(())
             }
         }
     }
 }
 
-fn generate_hash_view_code(input: ItemStruct) -> Result<TokenStream2, Error> {
+fn generate_hash_view_code(input: &ItemStruct) -> Result<TokenStream2, Error> {
     // Validate that all fields are named
     for field in &input.fields {
         if field.ident.is_none() {
@@ -292,7 +324,7 @@ fn generate_hash_view_code(input: ItemStruct) -> Result<TokenStream2, Error> {
         input_constraints,
         impl_generics,
         type_generics,
-    } = Constraints::get(&input);
+    } = Constraints::get(input);
     let struct_name = &input.ident;
 
     let field_types = input.fields.iter().map(|field| &field.ty);
@@ -332,12 +364,12 @@ fn generate_hash_view_code(input: ItemStruct) -> Result<TokenStream2, Error> {
     })
 }
 
-fn generate_crypto_hash_code(input: ItemStruct) -> TokenStream2 {
+fn generate_crypto_hash_code(input: &ItemStruct) -> TokenStream2 {
     let Constraints {
         input_constraints,
         impl_generics,
         type_generics,
-    } = Constraints::get(&input);
+    } = Constraints::get(input);
     let field_types = input.fields.iter().map(|field| &field.ty);
     let struct_name = &input.ident;
     let hash_type = syn::Ident::new(&format!("{struct_name}Hash"), Span::call_site());
@@ -380,7 +412,7 @@ fn generate_crypto_hash_code(input: ItemStruct) -> TokenStream2 {
     }
 }
 
-fn generate_clonable_view_code(input: ItemStruct) -> Result<TokenStream2, Error> {
+fn generate_clonable_view_code(input: &ItemStruct) -> Result<TokenStream2, Error> {
     // Validate that all fields are named
     for field in &input.fields {
         if field.ident.is_none() {
@@ -392,7 +424,7 @@ fn generate_clonable_view_code(input: ItemStruct) -> Result<TokenStream2, Error>
         input_constraints,
         impl_generics,
         type_generics,
-    } = Constraints::get(&input);
+    } = Constraints::get(input);
     let struct_name = &input.ident;
 
     let mut clone_constraints = vec![];
@@ -428,100 +460,107 @@ fn to_token_stream(input: Result<TokenStream2, Error>) -> TokenStream {
     }
 }
 
+/// Derives the `View` trait for a struct whose fields are themselves views.
 #[proc_macro_derive(View, attributes(view))]
 pub fn derive_view(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as ItemStruct);
-    let input = generate_view_code(input, false);
+    let input = generate_view_code(&input, false);
     to_token_stream(input)
 }
 
-fn derive_hash_view_token_stream2(input: ItemStruct) -> Result<TokenStream2, Error> {
-    let mut stream = generate_view_code(input.clone(), false)?;
+fn derive_hash_view_token_stream2(input: &ItemStruct) -> Result<TokenStream2, Error> {
+    let mut stream = generate_view_code(input, false)?;
     stream.extend(generate_hash_view_code(input)?);
     Ok(stream)
 }
 
+/// Derives the `View` and `HashableView` traits for a struct.
 #[proc_macro_derive(HashableView, attributes(view))]
 pub fn derive_hash_view(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as ItemStruct);
 
-    let stream = derive_hash_view_token_stream2(input);
+    let stream = derive_hash_view_token_stream2(&input);
     to_token_stream(stream)
 }
 
-fn derive_root_view_token_stream2(input: ItemStruct) -> Result<TokenStream2, Error> {
-    let mut stream = generate_view_code(input.clone(), true)?;
+fn derive_root_view_token_stream2(input: &ItemStruct) -> Result<TokenStream2, Error> {
+    let mut stream = generate_view_code(input, true)?;
     stream.extend(generate_root_view_code(input));
     Ok(stream)
 }
 
+/// Derives the `View` and `RootView` traits for a struct.
 #[proc_macro_derive(RootView, attributes(view))]
 pub fn derive_root_view(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as ItemStruct);
 
-    let stream = derive_root_view_token_stream2(input);
+    let stream = derive_root_view_token_stream2(&input);
     to_token_stream(stream)
 }
 
-fn derive_crypto_hash_view_token_stream2(input: ItemStruct) -> Result<TokenStream2, Error> {
-    let mut stream = generate_view_code(input.clone(), false)?;
-    stream.extend(generate_hash_view_code(input.clone())?);
+fn derive_crypto_hash_view_token_stream2(input: &ItemStruct) -> Result<TokenStream2, Error> {
+    let mut stream = generate_view_code(input, false)?;
+    stream.extend(generate_hash_view_code(input)?);
     stream.extend(generate_crypto_hash_code(input));
     Ok(stream)
 }
 
+/// Derives the `View`, `HashableView` and `CryptoHashView` traits for a struct.
 #[proc_macro_derive(CryptoHashView, attributes(view))]
 pub fn derive_crypto_hash_view(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as ItemStruct);
 
-    let stream = derive_crypto_hash_view_token_stream2(input);
+    let stream = derive_crypto_hash_view_token_stream2(&input);
     to_token_stream(stream)
 }
 
-fn derive_crypto_hash_root_view_token_stream2(input: ItemStruct) -> Result<TokenStream2, Error> {
-    let mut stream = generate_view_code(input.clone(), true)?;
-    stream.extend(generate_root_view_code(input.clone()));
-    stream.extend(generate_hash_view_code(input.clone())?);
+fn derive_crypto_hash_root_view_token_stream2(input: &ItemStruct) -> Result<TokenStream2, Error> {
+    let mut stream = generate_view_code(input, true)?;
+    stream.extend(generate_root_view_code(input));
+    stream.extend(generate_hash_view_code(input)?);
     stream.extend(generate_crypto_hash_code(input));
     Ok(stream)
 }
 
+/// Derives the `View`, `RootView`, `HashableView` and `CryptoHashView` traits for a struct.
 #[proc_macro_derive(CryptoHashRootView, attributes(view))]
 pub fn derive_crypto_hash_root_view(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as ItemStruct);
 
-    let stream = derive_crypto_hash_root_view_token_stream2(input);
+    let stream = derive_crypto_hash_root_view_token_stream2(&input);
     to_token_stream(stream)
 }
 
 #[cfg(test)]
-fn derive_hashable_root_view_token_stream2(input: ItemStruct) -> Result<TokenStream2, Error> {
-    let mut stream = generate_view_code(input.clone(), true)?;
-    stream.extend(generate_root_view_code(input.clone()));
+fn derive_hashable_root_view_token_stream2(input: &ItemStruct) -> Result<TokenStream2, Error> {
+    let mut stream = generate_view_code(input, true)?;
+    stream.extend(generate_root_view_code(input));
     stream.extend(generate_hash_view_code(input)?);
     Ok(stream)
 }
 
+/// Derives the `View`, `RootView` and `HashableView` traits for a struct (used in tests).
 #[proc_macro_derive(HashableRootView, attributes(view))]
 #[cfg(test)]
 pub fn derive_hashable_root_view(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as ItemStruct);
 
-    let stream = derive_hashable_root_view_token_stream2(input);
+    let stream = derive_hashable_root_view_token_stream2(&input);
     to_token_stream(stream)
 }
 
+/// Derives the `ClonableView` trait for a struct whose fields are clonable views.
 #[proc_macro_derive(ClonableView, attributes(view))]
 pub fn derive_clonable_view(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as ItemStruct);
-    match generate_clonable_view_code(input) {
+    match generate_clonable_view_code(&input) {
         Ok(tokens) => tokens.into(),
         Err(err) => err.to_compile_error().into(),
     }
 }
 
 #[cfg(test)]
-pub mod tests {
+mod tests {
 
     use quote::quote;
     use syn::{parse_quote, AngleBracketedGenericArguments};
@@ -548,7 +587,7 @@ pub mod tests {
                     },
                     context.name,
                 ),
-                pretty(generate_view_code(input, true).unwrap())
+                pretty(generate_view_code(&input, true).unwrap())
             );
         }
     }
@@ -559,7 +598,7 @@ pub mod tests {
             let input = context.test_view_input();
             insta::assert_snapshot!(
                 format!("test_generate_hash_view_code_{}", context.name),
-                pretty(generate_hash_view_code(input).unwrap())
+                pretty(generate_hash_view_code(&input).unwrap())
             );
         }
     }
@@ -578,7 +617,7 @@ pub mod tests {
                     },
                     context.name,
                 ),
-                pretty(generate_root_view_code(input))
+                pretty(generate_root_view_code(&input))
             );
         }
     }
@@ -587,7 +626,7 @@ pub mod tests {
     fn test_generate_crypto_hash_code() {
         for context in SpecificContextInfo::test_cases() {
             let input = context.test_view_input();
-            insta::assert_snapshot!(pretty(generate_crypto_hash_code(input)));
+            insta::assert_snapshot!(pretty(generate_crypto_hash_code(&input)));
         }
     }
 
@@ -595,7 +634,7 @@ pub mod tests {
     fn test_generate_clonable_view_code() {
         for context in SpecificContextInfo::test_cases() {
             let input = context.test_view_input();
-            insta::assert_snapshot!(pretty(generate_clonable_view_code(input).unwrap()));
+            insta::assert_snapshot!(pretty(generate_clonable_view_code(&input).unwrap()));
         }
     }
 
@@ -688,7 +727,7 @@ pub mod tests {
         let input: ItemStruct = parse_quote! {
             struct TestView<C>(RegisterView<C, u64>);
         };
-        let result = generate_view_code(input, false);
+        let result = generate_view_code(&input, false);
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
         assert!(error_msg.contains("All fields must be named"));
@@ -699,7 +738,7 @@ pub mod tests {
         let input: ItemStruct = parse_quote! {
             struct TestView<C> {}
         };
-        let result = generate_view_code(input, false);
+        let result = generate_view_code(&input, false);
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
         assert!(error_msg.contains("Struct must have at least one field"));
@@ -712,7 +751,7 @@ pub mod tests {
                 register: RegisterView<CustomContext, u64>,
             }
         };
-        let result = generate_view_code(input, false);
+        let result = generate_view_code(&input, false);
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
         assert!(error_msg.contains("Missing context"));
@@ -725,7 +764,7 @@ pub mod tests {
                 register: RegisterView<CustomContext, u64>,
             }
         };
-        let result = generate_view_code(input, false);
+        let result = generate_view_code(&input, false);
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
         assert!(error_msg.contains("Missing context"));
@@ -738,7 +777,7 @@ pub mod tests {
                 field: fn() -> i32,
             }
         };
-        let result = generate_view_code(input, false);
+        let result = generate_view_code(&input, false);
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
         assert!(error_msg.contains("Expected a path type"));
@@ -749,7 +788,7 @@ pub mod tests {
         let input: ItemStruct = parse_quote! {
             struct TestView<C>(RegisterView<C, u64>);
         };
-        let result = generate_hash_view_code(input);
+        let result = generate_hash_view_code(&input);
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
         assert!(error_msg.contains("All fields must be named"));
@@ -760,7 +799,7 @@ pub mod tests {
         let input: ItemStruct = parse_quote! {
             struct TestView<C>(RegisterView<C, u64>);
         };
-        let result = generate_clonable_view_code(input);
+        let result = generate_clonable_view_code(&input);
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
         assert!(error_msg.contains("All fields must be named"));
@@ -773,7 +812,7 @@ pub mod tests {
                 field: [u8; 32],
             }
         };
-        let result = generate_view_code(input, false);
+        let result = generate_view_code(&input, false);
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
         assert!(error_msg.contains("Expected a path type"));
@@ -786,7 +825,7 @@ pub mod tests {
                 field: &'static str,
             }
         };
-        let result = generate_view_code(input, false);
+        let result = generate_view_code(&input, false);
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
         assert!(error_msg.contains("Expected a path type"));
@@ -799,7 +838,7 @@ pub mod tests {
                 field: *const i32,
             }
         };
-        let result = generate_view_code(input, false);
+        let result = generate_view_code(&input, false);
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
         assert!(error_msg.contains("Expected a path type"));
@@ -811,7 +850,7 @@ pub mod tests {
             struct TestView<C> {}
         };
         // Root view generation depends on view generation, so this should fail at the view level
-        let result = generate_view_code(input.clone(), true);
+        let result = generate_view_code(&input, true);
         assert!(result.is_err());
         let error_msg = result.unwrap_err().to_string();
         assert!(error_msg.contains("Struct must have at least one field"));
@@ -827,17 +866,17 @@ pub mod tests {
         };
 
         // View code generation validates field types and should fail
-        let view_result = generate_view_code(input.clone(), false);
+        let view_result = generate_view_code(&input, false);
         assert!(view_result.is_err());
         let error_msg = view_result.unwrap_err().to_string();
         assert!(error_msg.contains("Expected a path type"));
 
         // Hash view generation doesn't validate field types in the same way
-        let hash_result = generate_hash_view_code(input.clone());
+        let hash_result = generate_hash_view_code(&input);
         assert!(hash_result.is_ok());
 
         // Crypto hash code generation also succeeds
-        let _result = generate_crypto_hash_code(input);
+        let _result = generate_crypto_hash_code(&input);
     }
 
     #[test]
@@ -848,6 +887,6 @@ pub mod tests {
                 register: RegisterView<C, usize>,
             }
         };
-        let _result = generate_crypto_hash_code(input);
+        let _result = generate_crypto_hash_code(&input);
     }
 }

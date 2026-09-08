@@ -35,6 +35,12 @@ use crate::{
     Clone, Copy, Eq, Hash, Ord, PartialEq, PartialOrd, WitLoad, WitStore, WitType, Allocative,
 )]
 #[cfg_attr(with_testing, derive(test_strategy::Arbitrary))]
+// TODO(#5166) we can be more specific here
+#[cfg_attr(
+    web,
+    derive(tsify::Tsify),
+    tsify(from_wasm_abi, into_wasm_abi, type = "string")
+)]
 pub enum AccountOwner {
     /// Short addresses reserved for the protocol.
     Reserved(u8),
@@ -48,7 +54,7 @@ impl fmt::Debug for AccountOwner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Reserved(byte) => f.debug_tuple("Reserved").field(byte).finish(),
-            Self::Address32(hash) => write!(f, "Address32({:?})", hash),
+            Self::Address32(hash) => write!(f, "Address32({hash:?})"),
             Self::Address20(bytes) => write!(f, "Address20({})", hex::encode(bytes)),
         }
     }
@@ -90,6 +96,22 @@ impl From<Address> for AccountOwner {
     }
 }
 
+impl From<[u8; 32]> for AccountOwner {
+    /// Converts a 32-byte array to an `AccountOwner`.
+    ///
+    /// If the first 12 bytes are zero, the remaining 20 bytes are treated as an
+    /// EVM-compatible `Address20`. Otherwise, the full 32 bytes become an `Address32`.
+    fn from(bytes: [u8; 32]) -> Self {
+        if bytes[..12].iter().all(|&b| b == 0) {
+            let mut addr = [0u8; 20];
+            addr.copy_from_slice(&bytes[12..]);
+            AccountOwner::Address20(addr)
+        } else {
+            AccountOwner::Address32(CryptoHash::from(bytes))
+        }
+    }
+}
+
 #[cfg(with_testing)]
 impl From<CryptoHash> for AccountOwner {
     fn from(address: CryptoHash) -> Self {
@@ -102,6 +124,8 @@ impl From<CryptoHash> for AccountOwner {
     Debug,
     PartialEq,
     Eq,
+    PartialOrd,
+    Ord,
     Hash,
     Copy,
     Clone,
@@ -115,6 +139,7 @@ impl From<CryptoHash> for AccountOwner {
     Allocative,
 )]
 #[graphql(name = "AccountOutput", input_name = "Account")]
+#[cfg_attr(web, derive(tsify::Tsify), tsify(from_wasm_abi, into_wasm_abi))]
 pub struct Account {
     /// The chain of the account.
     pub chain_id: ChainId,
@@ -149,7 +174,7 @@ impl Account {
 
 impl fmt::Display for Account {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}", self.chain_id, self.owner)
+        write!(f, "{}@{}", self.owner, self.chain_id)
     }
 }
 
@@ -157,21 +182,36 @@ impl std::str::FromStr for Account {
     type Err = anyhow::Error;
 
     fn from_str(string: &str) -> Result<Self, Self::Err> {
-        let mut parts = string.splitn(2, ':');
-
-        let chain_id = parts
-            .next()
-            .context(
-                "Expecting an account formatted as `chain-id` or `chain-id:owner-type:address`",
-            )?
-            .parse()?;
-
-        if let Some(owner_string) = parts.next() {
+        if let Some((owner_string, chain_string)) = string.rsplit_once('@') {
             let owner = owner_string.parse::<AccountOwner>()?;
+            let chain_id = chain_string.parse()?;
             Ok(Account::new(chain_id, owner))
         } else {
+            let chain_id = string
+                .parse()
+                .context("Expecting an account formatted as `chain-id` or `owner@chain-id`")?;
             Ok(Account::chain(chain_id))
         }
+    }
+}
+
+/// A pair of owner and spender accounts for managing allowances.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Allocative)]
+pub struct OwnerSpender {
+    /// Account to withdraw from
+    pub owner: AccountOwner,
+    /// Account to do the withdrawing
+    pub spender: AccountOwner,
+}
+
+impl OwnerSpender {
+    /// Creates a new `OwnerSpender` pair.
+    /// Panics if owner and spender are the same.
+    pub fn new(owner: AccountOwner, spender: AccountOwner) -> Self {
+        if owner == spender {
+            panic!("owner should be different from spender");
+        }
+        Self { owner, spender }
     }
 }
 
@@ -194,6 +234,7 @@ impl std::str::FromStr for Account {
 )]
 #[cfg_attr(with_testing, derive(test_strategy::Arbitrary))]
 #[cfg_attr(with_testing, derive(Default))]
+#[cfg_attr(web, derive(tsify::Tsify), tsify(from_wasm_abi, into_wasm_abi))]
 pub struct ChainId(pub CryptoHash);
 
 /// The type of the blob.
@@ -232,26 +273,33 @@ pub enum BlobType {
     Committee,
     /// A blob containing a chain description.
     ChainDescription,
+    /// A blob containing the BCS-encoded `Formats` description published
+    /// alongside an application's contract and service blobs.
+    ApplicationFormats,
+    /// A blob containing one ordered chunk of a chain's execution-state dump at a
+    /// checkpoint, used to bootstrap a node without replaying the chain's history.
+    /// A single checkpoint produces a sequence of such blobs whose content hashes
+    /// are listed in `OracleResponse::Checkpoint`.
+    CheckpointExecutionState,
 }
 
 impl BlobType {
     /// Returns whether the blob is of [`BlobType::Committee`] variant.
     pub fn is_committee_blob(&self) -> bool {
-        match self {
-            BlobType::Data
-            | BlobType::ContractBytecode
-            | BlobType::ServiceBytecode
-            | BlobType::EvmBytecode
-            | BlobType::ApplicationDescription
-            | BlobType::ChainDescription => false,
-            BlobType::Committee => true,
-        }
+        matches!(self, BlobType::Committee)
+    }
+
+    /// Returns whether the blob carries a chunk of a checkpoint's execution-state dump.
+    /// Such blobs are produced by `ExecutionStateView::prepare_checkpoint` and exempt
+    /// from per-block published-blob counts and per-blob fees.
+    pub fn is_checkpoint_blob(&self) -> bool {
+        matches!(self, BlobType::CheckpointExecutionState)
     }
 }
 
 impl fmt::Display for BlobType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }
 
@@ -259,8 +307,7 @@ impl std::str::FromStr for BlobType {
     type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        serde_json::from_str(&format!("\"{s}\""))
-            .with_context(|| format!("Invalid BlobType: {}", s))
+        serde_json::from_str(&format!("\"{s}\"")).with_context(|| format!("Invalid BlobType: {s}"))
     }
 }
 
@@ -302,7 +349,7 @@ impl std::str::FromStr for BlobId {
                 blob_type,
             })
         } else {
-            Err(anyhow!("Invalid blob ID: {}", s))
+            Err(anyhow!("Invalid blob ID: {s}"))
         }
     }
 }
@@ -358,6 +405,10 @@ impl From<DataBlobHash> for BlobId {
     }
 }
 
+// TODO(#5166) we can be more specific here (and also more generic)
+#[cfg_attr(web, wasm_bindgen::prelude::wasm_bindgen(typescript_custom_section))]
+const _: &str = "export type ApplicationId = string;";
+
 /// A unique identifier for a user application from a blob.
 #[derive(Debug, WitLoad, WitStore, WitType, Allocative)]
 #[cfg_attr(with_testing, derive(Default, test_strategy::Arbitrary))]
@@ -368,7 +419,7 @@ pub struct ApplicationId<A = ()> {
     #[witty(skip)]
     #[debug(skip)]
     #[allocative(skip)]
-    _phantom: PhantomData<A>,
+    phantom: PhantomData<A>,
 }
 
 /// A unique identifier for an application.
@@ -388,6 +439,7 @@ pub struct ApplicationId<A = ()> {
     WitType,
     Allocative,
 )]
+#[cfg_attr(web, derive(tsify::Tsify), tsify(from_wasm_abi, into_wasm_abi))]
 pub enum GenericApplicationId {
     /// The system application.
     System,
@@ -419,17 +471,6 @@ impl std::str::FromStr for GenericApplicationId {
             return Ok(GenericApplicationId::User(application_id));
         }
         Err(anyhow!("Invalid parsing of GenericApplicationId"))
-    }
-}
-
-impl GenericApplicationId {
-    /// Returns the `ApplicationId`, or `None` if it is `System`.
-    pub fn user_application_id(&self) -> Option<&ApplicationId> {
-        if let GenericApplicationId::User(app_id) = self {
-            Some(app_id)
-        } else {
-            None
-        }
     }
 }
 
@@ -488,9 +529,13 @@ pub struct ModuleId<Abi = (), Parameters = (), InstantiationArgument = ()> {
     pub service_blob_hash: CryptoHash,
     /// The virtual machine being used.
     pub vm_runtime: VmRuntime,
+    /// The hash of an optional blob containing the BCS-encoded `Formats`
+    /// description for this module's application. Published alongside the
+    /// contract and service blobs when available.
+    pub formats_blob_hash: Option<CryptoHash>,
     #[witty(skip)]
     #[debug(skip)]
-    _phantom: PhantomData<(Abi, Parameters, InstantiationArgument)>,
+    phantom: PhantomData<(Abi, Parameters, InstantiationArgument)>,
 }
 
 /// The name of an event stream.
@@ -548,8 +593,6 @@ impl std::str::FromStr for StreamName {
     Ord,
     PartialEq,
     PartialOrd,
-    Serialize,
-    Deserialize,
     WitLoad,
     WitStore,
     WitType,
@@ -563,6 +606,47 @@ pub struct StreamId {
     pub application_id: GenericApplicationId,
     /// The name of this stream: an application can have multiple streams with different names.
     pub stream_name: StreamName,
+}
+
+impl serde::Serialize for StreamId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::ser::Serializer,
+    {
+        if serializer.is_human_readable() {
+            serializer.serialize_str(&self.to_string())
+        } else {
+            use serde::ser::SerializeStruct;
+            let mut state = serializer.serialize_struct("StreamId", 2)?;
+            state.serialize_field("application_id", &self.application_id)?;
+            state.serialize_field("stream_name", &self.stream_name)?;
+            state.end()
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for StreamId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::de::Deserializer<'de>,
+    {
+        if deserializer.is_human_readable() {
+            let s = String::deserialize(deserializer)?;
+            Self::from_str(&s).map_err(serde::de::Error::custom)
+        } else {
+            #[derive(serde::Deserialize)]
+            #[serde(rename = "StreamId")]
+            struct StreamIdHelper {
+                application_id: GenericApplicationId,
+                stream_name: StreamName,
+            }
+            let helper = StreamIdHelper::deserialize(deserializer)?;
+            Ok(StreamId {
+                application_id: helper.application_id,
+                stream_name: helper.stream_name,
+            })
+        }
+    }
 }
 
 impl StreamId {
@@ -620,7 +704,7 @@ impl std::str::FromStr for StreamId {
                 stream_name,
             })
         } else {
-            Err(anyhow!("Invalid blob ID: {}", s))
+            Err(anyhow!("Invalid stream ID: {s}"))
         }
     }
 }
@@ -684,11 +768,13 @@ impl<Abi, Parameters, InstantiationArgument> PartialEq
             contract_blob_hash,
             service_blob_hash,
             vm_runtime,
-            _phantom,
+            formats_blob_hash,
+            phantom: _,
         } = other;
         self.contract_blob_hash == *contract_blob_hash
             && self.service_blob_hash == *service_blob_hash
             && self.vm_runtime == *vm_runtime
+            && self.formats_blob_hash == *formats_blob_hash
     }
 }
 
@@ -713,14 +799,21 @@ impl<Abi, Parameters, InstantiationArgument> Ord
             contract_blob_hash,
             service_blob_hash,
             vm_runtime,
-            _phantom,
+            formats_blob_hash,
+            phantom: _,
         } = other;
         (
             self.contract_blob_hash,
             self.service_blob_hash,
             self.vm_runtime,
+            self.formats_blob_hash,
         )
-            .cmp(&(*contract_blob_hash, *service_blob_hash, *vm_runtime))
+            .cmp(&(
+                *contract_blob_hash,
+                *service_blob_hash,
+                *vm_runtime,
+                *formats_blob_hash,
+            ))
     }
 }
 
@@ -732,11 +825,13 @@ impl<Abi, Parameters, InstantiationArgument> Hash
             contract_blob_hash: contract_blob_id,
             service_blob_hash: service_blob_id,
             vm_runtime: vm_runtime_id,
-            _phantom,
+            formats_blob_hash,
+            phantom: _,
         } = self;
         contract_blob_id.hash(state);
         service_blob_id.hash(state);
         vm_runtime_id.hash(state);
+        formats_blob_hash.hash(state);
     }
 }
 
@@ -746,6 +841,8 @@ struct SerializableModuleId {
     contract_blob_hash: CryptoHash,
     service_blob_hash: CryptoHash,
     vm_runtime: VmRuntime,
+    #[serde(default)]
+    formats_blob_hash: Option<CryptoHash>,
 }
 
 impl<Abi, Parameters, InstantiationArgument> Serialize
@@ -759,6 +856,7 @@ impl<Abi, Parameters, InstantiationArgument> Serialize
             contract_blob_hash: self.contract_blob_hash,
             service_blob_hash: self.service_blob_hash,
             vm_runtime: self.vm_runtime,
+            formats_blob_hash: self.formats_blob_hash,
         };
         if serializer.is_human_readable() {
             let bytes =
@@ -786,7 +884,8 @@ impl<'de, Abi, Parameters, InstantiationArgument> Deserialize<'de>
                 contract_blob_hash: serializable_module_id.contract_blob_hash,
                 service_blob_hash: serializable_module_id.service_blob_hash,
                 vm_runtime: serializable_module_id.vm_runtime,
-                _phantom: PhantomData,
+                formats_blob_hash: serializable_module_id.formats_blob_hash,
+                phantom: PhantomData,
             })
         } else {
             let serializable_module_id = SerializableModuleId::deserialize(deserializer)?;
@@ -794,7 +893,8 @@ impl<'de, Abi, Parameters, InstantiationArgument> Deserialize<'de>
                 contract_blob_hash: serializable_module_id.contract_blob_hash,
                 service_blob_hash: serializable_module_id.service_blob_hash,
                 vm_runtime: serializable_module_id.vm_runtime,
-                _phantom: PhantomData,
+                formats_blob_hash: serializable_module_id.formats_blob_hash,
+                phantom: PhantomData,
             })
         }
     }
@@ -811,7 +911,25 @@ impl ModuleId {
             contract_blob_hash,
             service_blob_hash,
             vm_runtime,
-            _phantom: PhantomData,
+            formats_blob_hash: None,
+            phantom: PhantomData,
+        }
+    }
+
+    /// Creates a module ID from contract/service hashes, the VM runtime, and an
+    /// optional formats blob hash.
+    pub fn new_with_formats(
+        contract_blob_hash: CryptoHash,
+        service_blob_hash: CryptoHash,
+        vm_runtime: VmRuntime,
+        formats_blob_hash: Option<CryptoHash>,
+    ) -> Self {
+        ModuleId {
+            contract_blob_hash,
+            service_blob_hash,
+            vm_runtime,
+            formats_blob_hash,
+            phantom: PhantomData,
         }
     }
 
@@ -823,7 +941,8 @@ impl ModuleId {
             contract_blob_hash: self.contract_blob_hash,
             service_blob_hash: self.service_blob_hash,
             vm_runtime: self.vm_runtime,
-            _phantom: PhantomData,
+            formats_blob_hash: self.formats_blob_hash,
+            phantom: PhantomData,
         }
     }
 
@@ -843,15 +962,27 @@ impl ModuleId {
         }
     }
 
-    /// Gets all bytecode `BlobId`s of the module
+    /// Gets the `BlobId` of the application formats blob, if one was registered
+    /// at module publication.
+    pub fn formats_blob_id(&self) -> Option<BlobId> {
+        self.formats_blob_hash
+            .map(|hash| BlobId::new(hash, BlobType::ApplicationFormats))
+    }
+
+    /// Gets all bytecode `BlobId`s of the module, including the optional
+    /// application formats blob when present.
     pub fn bytecode_blob_ids(&self) -> Vec<BlobId> {
-        match self.vm_runtime {
+        let mut blobs = match self.vm_runtime {
             VmRuntime::Wasm => vec![
                 BlobId::new(self.contract_blob_hash, BlobType::ContractBytecode),
                 BlobId::new(self.service_blob_hash, BlobType::ServiceBytecode),
             ],
             VmRuntime::Evm => vec![BlobId::new(self.contract_blob_hash, BlobType::EvmBytecode)],
+        };
+        if let Some(blob_id) = self.formats_blob_id() {
+            blobs.push(blob_id);
         }
+        blobs
     }
 }
 
@@ -862,7 +993,8 @@ impl<Abi, Parameters, InstantiationArgument> ModuleId<Abi, Parameters, Instantia
             contract_blob_hash: self.contract_blob_hash,
             service_blob_hash: self.service_blob_hash,
             vm_runtime: self.vm_runtime,
-            _phantom: PhantomData,
+            formats_blob_hash: self.formats_blob_hash,
+            phantom: PhantomData,
         }
     }
 }
@@ -944,13 +1076,13 @@ impl<'de, A> Deserialize<'de> for ApplicationId<A> {
                 bcs::from_bytes(&application_id_bytes).map_err(serde::de::Error::custom)?;
             Ok(ApplicationId {
                 application_description_hash: application_id.application_description_hash,
-                _phantom: PhantomData,
+                phantom: PhantomData,
             })
         } else {
             let value = SerializableApplicationId::deserialize(deserializer)?;
             Ok(ApplicationId {
                 application_description_hash: value.application_description_hash,
-                _phantom: PhantomData,
+                phantom: PhantomData,
             })
         }
     }
@@ -961,7 +1093,7 @@ impl ApplicationId {
     pub fn new(application_description_hash: CryptoHash) -> Self {
         ApplicationId {
             application_description_hash,
-            _phantom: PhantomData,
+            phantom: PhantomData,
         }
     }
 
@@ -978,7 +1110,7 @@ impl ApplicationId {
     pub fn with_abi<A>(self) -> ApplicationId<A> {
         ApplicationId {
             application_description_hash: self.application_description_hash,
-            _phantom: PhantomData,
+            phantom: PhantomData,
         }
     }
 }
@@ -988,7 +1120,7 @@ impl<A> ApplicationId<A> {
     pub fn forget_abi(self) -> ApplicationId {
         ApplicationId {
             application_description_hash: self.application_description_hash,
-            _phantom: PhantomData,
+            phantom: PhantomData,
         }
     }
 }
@@ -1008,7 +1140,7 @@ impl From<Address> for ApplicationId {
         arr[..20].copy_from_slice(address.as_slice());
         ApplicationId {
             application_description_hash: arr.into(),
-            _phantom: PhantomData,
+            phantom: PhantomData,
         }
     }
 }
@@ -1074,7 +1206,7 @@ impl fmt::Display for AccountOwner {
             AccountOwner::Reserved(value) => {
                 write!(f, "0x{}", hex::encode(&value.to_be_bytes()[..]))?
             }
-            AccountOwner::Address32(value) => write!(f, "0x{}", value)?,
+            AccountOwner::Address32(value) => write!(f, "0x{value}")?,
             AccountOwner::Address20(value) => write!(f, "0x{}", hex::encode(&value[..]))?,
         };
 
@@ -1094,7 +1226,7 @@ impl std::str::FromStr for AccountOwner {
             } else if s.len() == 40 {
                 let address = hex::decode(s)?;
                 if address.len() != 20 {
-                    anyhow::bail!("Invalid address length: {}", s);
+                    anyhow::bail!("Invalid address length: {s}");
                 }
                 let address = <[u8; 20]>::try_from(address.as_slice()).unwrap();
                 return Ok(AccountOwner::Address20(address));
@@ -1107,7 +1239,7 @@ impl std::str::FromStr for AccountOwner {
                 }
             }
         }
-        anyhow::bail!("Invalid address value: {}", s);
+        anyhow::bail!("Invalid address value: {s}");
     }
 }
 
@@ -1175,9 +1307,15 @@ doc_scalar!(
     BlobId,
     "A content-addressed blob ID i.e. the hash of the `BlobContent`"
 );
+bcs_scalar!(
+    OwnerSpender,
+    "A pair of owner and spender accounts for managing allowances"
+);
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+
     use std::str::FromStr as _;
 
     use assert_matches::assert_matches;
@@ -1196,9 +1334,8 @@ mod tests {
         let example_chain_config = InitialChainConfig {
             epoch: Epoch::ZERO,
             ownership: ChainOwnership::single(AccountOwner::Reserved(0)),
+            account: AccountOwner::CHAIN,
             balance: Amount::ZERO,
-            min_active_epoch: Epoch::ZERO,
-            max_active_epoch: Epoch::ZERO,
             application_permissions: Default::default(),
         };
         let description = ChainDescription::new(
@@ -1208,7 +1345,7 @@ mod tests {
         );
         assert_eq!(
             description.id().to_string(),
-            "ea15bcf049a65569c12dd07ba0566f52e0880d571e41203341a153fe47008275"
+            "bfd664d8c9bee7196b6baee3190abdf8c42d936f720c8cf7e5c6f7557f75fbeb"
         );
     }
 
@@ -1224,6 +1361,7 @@ mod tests {
     #[test]
     fn addresses() {
         assert_eq!(&AccountOwner::Reserved(0).to_string(), "0x00");
+        assert_eq!(AccountOwner::from_str("0x00").unwrap(), AccountOwner::CHAIN);
 
         let address = AccountOwner::from_str("0x10").unwrap();
         assert_eq!(address, AccountOwner::Reserved(16));
@@ -1252,6 +1390,31 @@ mod tests {
             "5487b70625ce71f7ee29154ad32aefa1c526cb483bdb783dea2e1d17bc497844"
         )
         .is_err());
+    }
+
+    #[test]
+    fn accounts() {
+        use super::{Account, ChainId};
+
+        const CHAIN: &str = "76e3a8c7b2449e6bc238642ac68b4311a809cb57328bea0a1ef9122f08a0053d";
+        const OWNER: &str = "0x5487b70625ce71f7ee29154ad32aefa1c526cb483bdb783dea2e1d17bc497844";
+
+        let chain_id = ChainId::from_str(CHAIN).unwrap();
+        let owner = AccountOwner::from_str(OWNER).unwrap();
+
+        // Chain-only account.
+        let account = Account::from_str(CHAIN).unwrap();
+        assert_eq!(
+            account,
+            Account::from_str(&format!("0x00@{CHAIN}")).unwrap()
+        );
+        assert_eq!(account, Account::chain(chain_id));
+        assert_eq!(account.to_string(), format!("0x00@{CHAIN}"));
+
+        // Account with owner.
+        let account = Account::from_str(&format!("{OWNER}@{CHAIN}")).unwrap();
+        assert_eq!(account, Account::new(chain_id, owner));
+        assert_eq!(account.to_string(), format!("{OWNER}@{CHAIN}"));
     }
 
     #[test]
@@ -1303,5 +1466,46 @@ mod tests {
         let account_owner = AccountOwner::from(address1);
         let address2 = account_owner.to_evm_address().unwrap();
         assert_eq!(address1, address2);
+    }
+
+    #[test]
+    fn ed25519_public_key_to_account_owner_known_vector() {
+        use crate::crypto::Ed25519PublicKey;
+        // Pins the entire derivation pipeline against silent drift, not just BCS.
+        // The chain executed:
+        //
+        //   [u8; 32]
+        //     -> Ed25519PublicKey                       (newtype wrap)
+        //     -> AccountOwner::from(public_key)         (impl From, this file)
+        //          -> CryptoHash::new(&public_key)
+        //               -> Hashable::write into a Keccak256 hasher
+        //                    -> BcsHashable blanket impl writes:
+        //                         * type-name discriminator prefix
+        //                         * BCS body (32 raw bytes for [u8; 32])
+        //               -> Keccak256 finalize -> 32-byte hash
+        //     -> AccountOwner::Address32(hash)
+        //     -> Display: "0x" + lowercase hex
+        //
+        // Any change in any link breaks this test: BCS format, the
+        // `BcsHashable` type-name discriminator, the hash function, the
+        // `From<Ed25519PublicKey>` impl, the `Address32` carrier, or the
+        // `Display` formatting.
+        //
+        // Fixed 32-byte public key (0x01..0x20).
+        let pubkey_bytes: [u8; 32] = [
+            0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+            0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c,
+            0x1d, 0x1e, 0x1f, 0x20,
+        ];
+        let pubkey = Ed25519PublicKey(pubkey_bytes);
+        let owner = AccountOwner::from(pubkey);
+        // The expected hex is the pinned output of `Keccak256(BCS(Ed25519PublicKey))`.
+        // Do not update it without understanding why the derivation changed — the JS
+        // test in `@linera/client` cross-checks this exact value.
+        assert_eq!(
+            owner.to_string(),
+            "0xeacee5344cbec9569e836f95029d476c700f4f5bc007c71c0752c73fba149043",
+            "Ed25519 owner derivation drifted; verify intentional before updating"
+        );
     }
 }

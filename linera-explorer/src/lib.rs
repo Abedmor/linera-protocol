@@ -4,13 +4,18 @@
 //! This module provides web files to run a block explorer from Linera service node and Linera indexer.
 
 #![recursion_limit = "256"]
+// UI-facing crate; floating-point/UI casts are intentional and not
+// protocol-relevant.
+#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#![deny(missing_docs)]
 
 mod entrypoint;
+mod formats;
 mod graphql;
 mod input_type;
 mod js_utils;
 
-use std::str::FromStr;
+use std::{cell::RefCell, collections::HashMap, str::FromStr};
 
 use anyhow::{anyhow, Context as _, Result};
 use futures::prelude::*;
@@ -19,7 +24,7 @@ use gql_service::{
     block::{self, BlockBlock as Block},
     blocks::{self, BlocksBlocks as Blocks},
     chain::{self, ChainChain as Chain},
-    chains, notifications, request, Chains, Reason,
+    chains, notifications, request, transfer, Chains, Reason,
 };
 use graphql_client::Response;
 use js_utils::{getf, log_str, parse, setf, stringify, SER};
@@ -48,6 +53,22 @@ use ws_stream_wasm::*;
 
 static WEBSOCKET: OnceCell<WsMeta> = OnceCell::new();
 
+thread_local! {
+    /// Memoizes the `Formats` resolved for each `application_id` so a block with many
+    /// operations from the same application only pays the two node round-trips
+    /// (blob-hash resolution + formats fetch) once per page session. An
+    /// `application_id` is globally unique and its formats are immutable, so the
+    /// chain it is observed on is irrelevant to the key.
+    ///
+    /// Both outcomes are cached: `Some(formats)` (positive) and `None` (negative —
+    /// the app has no formats blob, or the node has none). Formats are immutable, so
+    /// neither can change without a reload. Transient `Err` outcomes are *not*
+    /// cached so they get retried. Wasm runs single-threaded, so a `thread_local`
+    /// `RefCell` is the whole story and reloading the page clears the cache.
+    static FORMATS_CACHE: RefCell<HashMap<String, Option<formats::Formats>>> =
+        RefCell::new(HashMap::new());
+}
+
 pub(crate) fn reqwest_client() -> reqwest::Client {
     // timeouts cannot be enforced when compiling to wasm-js.
     reqwest::ClientBuilder::new().build().unwrap()
@@ -63,7 +84,10 @@ enum Page {
         blocks: Vec<Blocks>,
         apps: Vec<Application>,
     },
-    Blocks(Vec<Blocks>),
+    Blocks {
+        blocks: Vec<Blocks>,
+        limit: u32,
+    },
     Block(Box<Block>),
     Applications(Vec<Application>),
     Application {
@@ -78,6 +102,9 @@ enum Page {
         name: String,
         link: String,
         queries: Value,
+    },
+    Transfer {
+        result: Option<String>,
     },
     Error(String),
 }
@@ -148,17 +175,23 @@ pub struct GQuery<T> {
     payload: Option<T>,
 }
 
+/// The network protocol used to reach a service.
 pub enum Protocol {
+    /// Plain HTTP(S).
     Http,
+    /// A WebSocket connection.
     Websocket,
 }
 
+/// The kind of endpoint to connect to.
 pub enum AddressKind {
+    /// A Linera node service.
     Node,
+    /// A Linera indexer.
     Indexer,
 }
 
-fn url(config: &Config, protocol: Protocol, kind: AddressKind) -> String {
+fn url(config: &Config, protocol: &Protocol, kind: &AddressKind) -> String {
     let protocol = match protocol {
         Protocol::Http => "http",
         Protocol::Websocket => "ws",
@@ -168,7 +201,7 @@ fn url(config: &Config, protocol: Protocol, kind: AddressKind) -> String {
         AddressKind::Node => &config.node,
         AddressKind::Indexer => &config.indexer,
     };
-    format!("{}{}://{}", protocol, tls, address)
+    format!("{protocol}{tls}://{address}")
 }
 
 async fn get_chain(node: &str, chain_id: ChainId) -> Result<Box<Chain>> {
@@ -181,7 +214,7 @@ async fn get_chain(node: &str, chain_id: ChainId) -> Result<Box<Chain>> {
     let chain = request::<gql_service::Chain, _>(&client, node, variables)
         .await?
         .chain;
-    log_str(&serde_json::to_string_pretty(&chain).unwrap());
+    // log_str(&serde_json::to_string_pretty(&chain).unwrap());
     Ok(Box::new(chain))
 }
 
@@ -214,7 +247,7 @@ async fn get_applications(node: &str, chain_id: ChainId) -> Result<Vec<Applicati
 
 async fn get_operations(indexer: &str, chain_id: ChainId) -> Result<Vec<Operations>> {
     let client = reqwest_client();
-    let operations_indexer = format!("{}/operations", indexer);
+    let operations_indexer = format!("{indexer}/operations");
     let variables = operations::Variables {
         from: OperationsKeyKind::Last(chain_id),
         limit: None,
@@ -242,7 +275,7 @@ async fn home(node: &str, chain_id: ChainId) -> Result<(Page, String)> {
             blocks,
             apps,
         },
-        format!("/?chain={}", chain_id),
+        format!("/?chain={chain_id}"),
     ))
 }
 
@@ -251,11 +284,13 @@ async fn blocks(
     node: &str,
     chain_id: ChainId,
     from: Option<CryptoHash>,
-    limit: Option<u32>,
+    limit: u32,
 ) -> Result<(Page, String)> {
-    // TODO: limit is not used in the UI, it should be implemented with some path arguments and select input
-    let blocks = get_blocks(node, chain_id, from, limit).await?;
-    Ok((Page::Blocks(blocks), format!("/blocks?chain={}", chain_id)))
+    let blocks = get_blocks(node, chain_id, from, Some(limit)).await?;
+    Ok((
+        Page::Blocks { blocks, limit },
+        format!("/blocks?chain={chain_id}"),
+    ))
 }
 
 /// Returns the block page.
@@ -269,7 +304,7 @@ async fn block(node: &str, chain_id: ChainId, hash: Option<CryptoHash>) -> Resul
     let hash = block.hash;
     Ok((
         Page::Block(Box::new(block)),
-        format!("/block/{}?chain={}", hash, chain_id),
+        format!("/block/{hash}?chain={chain_id}"),
     ))
 }
 
@@ -307,7 +342,7 @@ async fn applications(node: &str, chain_id: ChainId) -> Result<(Page, String)> {
     let applications = get_applications(node, chain_id).await?;
     Ok((
         Page::Applications(applications),
-        format!("/applications?chain={}", chain_id),
+        format!("/applications?chain={chain_id}"),
     ))
 }
 
@@ -316,7 +351,7 @@ async fn operations(indexer: &str, chain_id: ChainId) -> Result<(Page, String)> 
     let operations = get_operations(indexer, chain_id).await?;
     Ok((
         Page::Operations(operations),
-        format!("/operations?chain={}", chain_id),
+        format!("/operations?chain={chain_id}"),
     ))
 }
 
@@ -327,7 +362,7 @@ async fn operation(
     chain_id: ChainId,
 ) -> Result<(Page, String)> {
     let client = reqwest_client();
-    let operations_indexer = format!("{}/operations", indexer);
+    let operations_indexer = format!("{indexer}/operations");
     let key = match key {
         Some(key) => OperationKeyKind::Key(key),
         None => OperationKeyKind::Last(chain_id),
@@ -469,7 +504,7 @@ async fn application(app: Application) -> Result<(Page, String)> {
 
 /// Returns the plugin page.
 async fn plugin(plugin: &str, indexer: &str) -> Result<(Page, String)> {
-    let link = format!("{}/{}", indexer, plugin);
+    let link = format!("{indexer}/{plugin}");
     let schema = graphql::introspection(&link).await?;
     let sch = &schema["data"]["__schema"];
     let types = sch["types"]
@@ -479,7 +514,7 @@ async fn plugin(plugin: &str, indexer: &str) -> Result<(Page, String)> {
     let queries =
         list_entrypoints(&types, &sch["queryType"]["name"]).unwrap_or(Value::Array(Vec::new()));
     let queries = fill_type(&queries, &types);
-    let pathname = format!("/plugin?plugin={}", plugin);
+    let pathname = format!("/plugin?plugin={plugin}");
     Ok((
         Page::Plugin {
             name: plugin.to_string(),
@@ -491,35 +526,50 @@ async fn plugin(plugin: &str, indexer: &str) -> Result<(Page, String)> {
 }
 
 fn format_bytes(value: &JsValue) -> JsValue {
-    let modified_value = value.clone();
-    if let Some(object) = js_sys::Object::try_from(value) {
-        js_sys::Object::keys(object)
-            .iter()
-            .for_each(|k: JsValue| match k.as_string() {
-                None => (),
-                Some(key_str) => {
-                    if &key_str == "bytes" {
-                        let array: Vec<u8> =
-                            js_sys::Uint8Array::from(getf(&modified_value, "bytes")).to_vec();
-                        let array_hex = hex::encode(array);
-                        let hex_len = array_hex.len();
-                        let hex_elided = if hex_len > 128 {
-                            // don't show all hex digits if the bytes array is too long
-                            format!("{}..{}", &array_hex[0..4], &array_hex[hex_len - 4..])
-                        } else {
-                            array_hex
-                        };
-                        setf(&modified_value, "bytes", &JsValue::from_str(&hex_elided))
-                    } else {
-                        setf(
-                            &modified_value,
-                            &key_str,
-                            &format_bytes(&getf(&modified_value, &key_str)),
-                        )
-                    }
-                }
-            });
+    // Skip non-object types (primitives, null, undefined, BigInt, etc.)
+    let object = match js_sys::Object::try_from(value) {
+        Some(obj) => obj,
+        None => return value.clone(),
     };
+    let modified_value = value.clone();
+    for k in js_sys::Object::keys(object).iter() {
+        let key_str = match k.as_string() {
+            Some(s) => s,
+            None => continue,
+        };
+        let child = match js_sys::Reflect::get(&modified_value, &k) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if key_str == "bytes" && js_sys::Array::is_array(&child) {
+            let js_arr = js_sys::Array::from(&child);
+            let mut valid = true;
+            let mut array = Vec::with_capacity(js_arr.length() as usize);
+            for v in js_arr.iter() {
+                if let Some(f) = v.as_f64() {
+                    array.push(f as u8);
+                } else {
+                    valid = false;
+                    break;
+                }
+            }
+            if valid {
+                let array_hex = hex::encode(array);
+                let hex_len = array_hex.len();
+                let hex_elided = if hex_len > 128 {
+                    format!("{}..{}", &array_hex[0..4], &array_hex[hex_len - 4..])
+                } else {
+                    array_hex
+                };
+                setf(&modified_value, "bytes", &JsValue::from_str(&hex_elided));
+            }
+        } else {
+            let formatted = format_bytes(&child);
+            // Reflect::set only fails on frozen/sealed objects; `modified_value` is a fresh
+            // object we just constructed, so failure is impossible in practice.
+            js_sys::Reflect::set(&modified_value, &k, &formatted).ok();
+        }
+    }
     modified_value
 }
 
@@ -527,7 +577,7 @@ fn page_name_and_args(page: &Page) -> (&str, Vec<(String, String)>) {
     match page {
         Page::Unloaded | Page::Home { .. } => ("", Vec::new()),
         Page::Block(b) => ("block", vec![("block".to_string(), b.hash.to_string())]),
-        Page::Blocks { .. } => ("blocks", Vec::new()),
+        Page::Blocks { limit, .. } => ("blocks", vec![("limit".to_string(), limit.to_string())]),
         Page::Applications(_) => ("applications", Vec::new()),
         Page::Application { app, .. } => (
             "application",
@@ -542,6 +592,7 @@ fn page_name_and_args(page: &Page) -> (&str, Vec<(String, String)>) {
             ],
         ),
         Page::Plugin { name, .. } => ("plugin", vec![("plugin".to_string(), name.to_string())]),
+        Page::Transfer { .. } => ("transfer", Vec::new()),
         Page::Error(_) => ("error", Vec::new()),
     }
 }
@@ -596,7 +647,11 @@ async fn page(
             let hash = find_arg_map(args, "block", CryptoHash::from_str)?;
             block(node, chain_id, hash).await
         }
-        "blocks" => blocks(node, chain_id, None, Some(20)).await,
+        "blocks" => {
+            let from = find_arg_map(args, "from", CryptoHash::from_str)?;
+            let limit = find_arg_map(args, "limit", u32::from_str)?.unwrap_or(20);
+            blocks(node, chain_id, from, limit).await
+        }
         "applications" => applications(node, chain_id).await,
         "application" => {
             let app_arg = find_arg(args, "app").context("unknown application")?;
@@ -619,13 +674,50 @@ async fn page(
                 }
             }
         }
+        "transfer" => {
+            let recipient_chain = find_arg(args, "recipient_chain");
+            let recipient_owner = find_arg(args, "recipient_owner");
+            let amount = find_arg(args, "amount");
+            match (recipient_chain, amount) {
+                (Some(recipient_chain), Some(amount)) => {
+                    let owner = find_arg(args, "owner").context("missing owner")?;
+                    let recipient_owner = recipient_owner.unwrap_or_else(|| owner.clone());
+                    let variables = transfer::Variables {
+                        chain_id,
+                        owner: serde_json::from_value(Value::String(owner))
+                            .context("invalid owner")?,
+                        recipient: transfer::Account {
+                            chain_id: ChainId::from_str(&recipient_chain)
+                                .context("invalid recipient chain")?,
+                            owner: serde_json::from_value(Value::String(recipient_owner))
+                                .context("invalid recipient owner")?,
+                        },
+                        amount: serde_json::from_value(Value::String(amount))
+                            .context("invalid amount")?,
+                    };
+                    let client = reqwest_client();
+                    let node_url = url(&Config::load(), &Protocol::Http, &AddressKind::Node);
+                    request::<gql_service::Transfer, _>(&client, &node_url, variables).await?;
+                    Ok((
+                        Page::Transfer {
+                            result: Some("Transfer successful!".to_string()),
+                        },
+                        format!("/transfer?chain={chain_id}"),
+                    ))
+                }
+                _ => Ok((
+                    Page::Transfer { result: None },
+                    format!("/transfer?chain={chain_id}"),
+                )),
+            }
+        }
         "operations" => operations(indexer, chain_id).await,
         "plugin" => {
             let name = find_arg(args, "plugin").context("unknown plugin")?;
             plugin(&name, indexer).await
         }
         "error" => {
-            let msg = find_arg(args, "msg").unwrap_or("unknown error".to_string());
+            let msg = find_arg(args, "msg").unwrap_or_else(|| "unknown error".to_string());
             Err(anyhow::Error::msg(msg))
         }
         _ => Err(anyhow!("unknown page")),
@@ -645,17 +737,18 @@ async fn route_aux(
         (Some(p), _) => (p, args.to_vec()),
         (_, p) => page_name_and_args(p),
     };
-    let node = url(&data.config, Protocol::Http, AddressKind::Node);
-    let indexer = url(&data.config, Protocol::Http, AddressKind::Indexer);
+    let node = url(&data.config, &Protocol::Http, &AddressKind::Node);
+    let indexer = url(&data.config, &Protocol::Http, &AddressKind::Indexer);
     let result = match chain_info {
         Err(e) => Err(e),
         Ok((chain_id, chain_changed)) => {
             let page_result = page(page_name, &node, &indexer, chain_id, &args).await;
             if chain_changed {
                 if let Some(ws) = WEBSOCKET.get() {
-                    let _ = ws.close().await;
+                    // Ignore close errors; we're switching to a new connection anyway.
+                    ws.close().await.ok();
                 }
-                let address = url(&data.config, Protocol::Websocket, AddressKind::Node);
+                let address = url(&data.config, &Protocol::Websocket, &AddressKind::Node);
                 subscribe_chain(app, &address, chain_id).await;
             };
             page_result
@@ -664,14 +757,22 @@ async fn route_aux(
     let (page, new_path) = result.unwrap_or_else(|e| error(&e));
     let page_js = format_bytes(&page.serialize(&SER).unwrap());
     setf(app, "page", &page_js);
-    web_sys::window()
+    let history = web_sys::window()
         .expect("window object not found")
         .history()
-        .expect("history object not found")
-        .push_state_with_url(&page_js, &new_path, Some(&new_path))
-        .expect("push_state failed");
+        .expect("history object not found");
+    if init {
+        history
+            .replace_state_with_url(&page_js, &new_path, Some(&new_path))
+            .expect("replace_state failed");
+    } else {
+        history
+            .push_state_with_url(&page_js, &new_path, Some(&new_path))
+            .expect("push_state failed");
+    }
 }
 
+/// Routes a request from the JavaScript UI to the appropriate handler and updates the app state.
 #[wasm_bindgen]
 pub async fn route(app: JsValue, path: JsValue, args: JsValue) {
     let path = path.as_string();
@@ -682,15 +783,36 @@ pub async fn route(app: JsValue, path: JsValue, args: JsValue) {
     route_aux(&app, &data, &path, &args, false).await
 }
 
+/// Returns a shortened representation of a crypto hash string.
+///
+/// Identifiers that are not crypto hashes are elided in the middle instead: these
+/// helpers are called from templates, where a panic tears down the whole UI rather
+/// than just the offending value.
 #[wasm_bindgen]
-pub fn short_crypto_hash(s: String) -> String {
-    let hash = CryptoHash::from_str(&s).expect("not a crypto hash");
-    format!("{:?}", hash)
+pub fn short_crypto_hash(s: &str) -> String {
+    match CryptoHash::from_str(s) {
+        // Use `Display`, which honours the precision; `Debug` prints the full hash.
+        Ok(hash) => format!("{hash:.16}"),
+        Err(_) => short_id(s),
+    }
 }
 
+/// Returns a shortened representation of an identifier, eliding its middle.
 #[wasm_bindgen]
-pub fn short_app_id(s: String) -> String {
-    format!("{}..{}..{}..", &s[..4], &s[64..68], &s[152..156])
+pub fn short_id(s: &str) -> String {
+    let chars = s.chars().collect::<Vec<_>>();
+    if chars.len() <= 12 {
+        return s.to_string();
+    }
+    let head = chars[..4].iter().collect::<String>();
+    let tail = chars[chars.len() - 4..].iter().collect::<String>();
+    format!("{head}..{tail}")
+}
+
+/// Returns a shortened representation of an application ID string.
+#[wasm_bindgen]
+pub fn short_app_id(s: &str) -> String {
+    short_id(s)
 }
 
 fn set_onpopstate(app: JsValue) {
@@ -705,12 +827,10 @@ fn set_onpopstate(app: JsValue) {
 
 /// Subscribes to notifications for one chain
 async fn subscribe_chain(app: &JsValue, address: &str, chain: ChainId) {
-    let (ws, mut wsio) = WsMeta::connect(
-        &format!("{}/ws", address),
-        Some(vec!["graphql-transport-ws"]),
-    )
-    .await
-    .expect("cannot connect to websocket");
+    let (ws, mut wsio) =
+        WsMeta::connect(&format!("{address}/ws"), Some(vec!["graphql-transport-ws"]))
+            .await
+            .expect("cannot connect to websocket");
     wsio.send(WsMessage::Text(
         "{\"type\": \"connection_init\", \"payload\": {}}".to_string(),
     ))
@@ -718,13 +838,9 @@ async fn subscribe_chain(app: &JsValue, address: &str, chain: ChainId) {
     .expect("cannot send to websocket");
     wsio.next().await;
     let uuid = Uuid::new_v3(&Uuid::NAMESPACE_DNS, b"linera.dev");
-    let payload_query = format!(
-        r#"subscription {{ notifications(chainId: \"{}\") }}"#,
-        chain
-    );
+    let payload_query = format!(r#"subscription {{ notifications(chainId: \"{chain}\") }}"#);
     let query = format!(
-        r#"{{ "id": "{}", "type": "subscribe", "payload": {{"query": "{}"}} }}"#,
-        uuid, payload_query
+        r#"{{ "id": "{uuid}", "type": "subscribe", "payload": {{"query": "{payload_query}"}} }}"#
     );
     wsio.send(WsMessage::Text(query))
         .await
@@ -734,18 +850,28 @@ async fn subscribe_chain(app: &JsValue, address: &str, chain: ChainId) {
         while let Some(evt) = wsio.next().await {
             match evt {
                 WsMessage::Text(message) => {
-                    let graphql_message = serde_json::from_str::<
+                    let graphql_message = match serde_json::from_str::<
                         GQuery<Response<notifications::ResponseData>>,
                     >(&message)
-                    .expect("unexpected websocket response");
+                    {
+                        Ok(msg) => msg,
+                        Err(e) => {
+                            log_str(&format!("ignoring websocket message: {e}"));
+                            continue;
+                        }
+                    };
                     if let Some(payload) = graphql_message.payload {
                         if let Some(message_data) = payload.data {
                             let data =
                                 from_value::<Data>(app.clone()).expect("cannot parse vue data");
-                            if let Reason::NewBlock { .. } = message_data.notifications.reason {
-                                if message_data.notifications.chain_id == chain {
-                                    route_aux(&app, &data, &None, &Vec::new(), false).await
-                                }
+                            let should_refresh = matches!(
+                                &message_data.notifications.reason,
+                                Reason::NewBlock { .. }
+                                    | Reason::BlockExecuted { .. }
+                                    | Reason::NewEvents { .. }
+                            );
+                            if should_refresh && message_data.notifications.chain_id == chain {
+                                route_aux(&app, &data, &None, &Vec::new(), false).await
                             }
                         }
                         if let Some(errors) = payload.errors {
@@ -758,7 +884,8 @@ async fn subscribe_chain(app: &JsValue, address: &str, chain: ChainId) {
             }
         }
     });
-    let _ = WEBSOCKET.set(ws);
+    // Ignore if already set; this can happen during re-subscription.
+    WEBSOCKET.set(ws).ok();
 }
 
 /// Initializes pages and subscribes to notifications.
@@ -767,7 +894,7 @@ pub async fn start(app: JsValue) {
     console_error_panic_hook::set_once();
     set_onpopstate(app.clone());
     let data = from_value::<Data>(app.clone()).expect("cannot parse vue data");
-    let address = url(&data.config, Protocol::Http, AddressKind::Node);
+    let address = url(&data.config, &Protocol::Http, &AddressKind::Node);
     let default_chain = chains(&app, &address).await;
     match default_chain {
         Err(e) => {
@@ -781,8 +908,8 @@ pub async fn start(app: JsValue) {
             .await
         }
         Ok(default_chain) => {
-            let indexer = url(&data.config, Protocol::Http, AddressKind::Indexer);
-            let _ = plugins(&app, &indexer).await;
+            let indexer = url(&data.config, &Protocol::Http, &AddressKind::Indexer);
+            plugins(&app, &indexer).await;
             let uri = web_sys::window()
                 .expect("window object not found")
                 .location()
@@ -797,6 +924,7 @@ pub async fn start(app: JsValue) {
                 "/applications" => Some("applications".to_string()),
                 "/operations" => Some("operations".to_string()),
                 "/operation" => Some("operation".to_string()),
+                "/transfer" => Some("transfer".to_string()),
                 "/plugin" => Some("plugin".to_string()),
                 pathname => match (
                     pathname.strip_prefix("/block/"),
@@ -807,7 +935,7 @@ pub async fn start(app: JsValue) {
                         Some("block".to_string())
                     }
                     (_, Some(app_id)) => {
-                        let link = format!("{}/applications/{}", address, app_id);
+                        let link = format!("{address}/applications/{app_id}");
                         let app =
                             serde_json::json!({"id": app_id, "link": link, "description": ""})
                                 .to_string();
@@ -818,6 +946,254 @@ pub async fn start(app: JsValue) {
                 },
             };
             route_aux(&app, &data, &path, &args, true).await;
+        }
+    }
+}
+
+/// Looks up the optional `formats_blob_hash` for an application by reading its
+/// `ApplicationDescription.module_id` on the active chain. Returns `Ok(None)`
+/// if the application does not exist on that chain or has no formats blob hash
+/// registered (i.e. the module was published without `--formats`).
+async fn application_formats_blob_hash(
+    node: &str,
+    chain_id: ChainId,
+    application_id: &str,
+) -> Result<Option<String>> {
+    let apps = get_applications(node, chain_id).await?;
+    let Some(app) = apps.into_iter().find(|a| a.id == application_id) else {
+        return Ok(None);
+    };
+    let description: Value = serde_json::to_value(&app.description)
+        .context("application description is not JSON-serializable")?;
+    // `linera-explorer` runs on `wasm32` and the GraphQL client substitutes
+    // `ApplicationDescription` for `serde_json::Value`. The `module_id` field
+    // serializes as a hex string when human-readable; decode it back into a
+    // `ModuleId` so we can read its optional `formats_blob_hash`.
+    let module_id_hex = description
+        .get("module_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("application description has no module_id field"))?;
+    let module_id: linera_base::identifiers::ModuleId =
+        serde_json::from_value(Value::String(module_id_hex.to_owned()))
+            .context("failed to deserialize module_id as ModuleId")?;
+    Ok(module_id.formats_blob_hash.map(|hash| hash.to_string()))
+}
+
+/// Fetch the registered `Formats` for a deployed application via its module's
+/// `formats_blob_hash`. Returns `None` when the app has no formats blob hash
+/// in its module id, or the local node has no such blob. All failures are
+/// logged to the JS console with the caller's `op` label so the explorer
+/// never throws into Vue.
+async fn fetch_user_app_formats(
+    op: &str,
+    app: JsValue,
+    application_id: &str,
+) -> Option<formats::Formats> {
+    let data = match from_value::<Data>(app) {
+        Ok(d) => d,
+        Err(e) => {
+            log_str(&format!("{op}: cannot parse vue data: {e}"));
+            return None;
+        }
+    };
+    let cache_key = application_id.to_string();
+    if let Some(cached) = FORMATS_CACHE.with(|c| c.borrow().get(&cache_key).cloned()) {
+        log_str(&format!(
+            "{op}: formats cache hit for app {application_id} ({})",
+            if cached.is_some() {
+                "formats"
+            } else {
+                "no formats"
+            }
+        ));
+        return cached;
+    }
+
+    let node = url(&data.config, &Protocol::Http, &AddressKind::Node);
+    log_str(&format!(
+        "{op}: looking up formats blob hash for app {application_id} on chain {} (node={node})",
+        data.chain
+    ));
+    let formats_blob_hash_hex =
+        match application_formats_blob_hash(&node, data.chain, application_id).await {
+            Ok(Some(hash)) => {
+                log_str(&format!("{op}: resolved formats_blob_hash={hash}"));
+                hash
+            }
+            Ok(None) => {
+                // App genuinely has no formats blob hash: a definitive negative, cache it.
+                log_str(&format!(
+                    "{op}: application {application_id} has no formats blob hash"
+                ));
+                FORMATS_CACHE.with(|c| c.borrow_mut().insert(cache_key, None));
+                return None;
+            }
+            Err(e) => {
+                // Transient lookup failure: do not cache, let the next call retry.
+                log_str(&format!("{op}: failed to resolve formats_blob_hash: {e}"));
+                return None;
+            }
+        };
+    let result = match formats::fetch_formats(
+        &node,
+        &data.chain.to_string(),
+        &formats_blob_hash_hex,
+    )
+    .await
+    {
+        Ok(Some(f)) => {
+            log_str(&format!("{op}: node returned formats"));
+            Some(f)
+        }
+        Ok(None) => {
+            log_str(&format!(
+                "{op}: node has no formats blob with hash {formats_blob_hash_hex}"
+            ));
+            None
+        }
+        Err(e) => {
+            // Transient formats query failure: do not cache, let the next call retry.
+            log_str(&format!("{op}: formats query failed: {e}"));
+            return None;
+        }
+    };
+    FORMATS_CACHE.with(|c| c.borrow_mut().insert(cache_key, result.clone()));
+    result
+}
+
+/// Run a `Formats::decode_*` method against `bytes_hex`, returning a JS value or
+/// `JsValue::NULL` if anything in the pipeline fails. Errors are logged with
+/// the `op` label.
+async fn decode_user_bytes(
+    op: &str,
+    app: JsValue,
+    application_id: String,
+    bytes_hex: String,
+    decode: fn(&formats::Formats, &[u8]) -> linera_sdk::bcs::Result<Value>,
+) -> JsValue {
+    let bytes = match hex::decode(&bytes_hex) {
+        Ok(b) => b,
+        Err(e) => {
+            log_str(&format!("{op}: invalid hex: {e}"));
+            return JsValue::NULL;
+        }
+    };
+    let Some(formats) = fetch_user_app_formats(op, app, &application_id).await else {
+        return JsValue::NULL;
+    };
+    match decode(&formats, &bytes) {
+        Ok(value) => value.serialize(&SER).unwrap_or(JsValue::NULL),
+        Err(e) => {
+            log_str(&format!("{op}: BCS decode failed: {e}"));
+            JsValue::NULL
+        }
+    }
+}
+
+/// Decode the bytes of a `User` operation against the formats blob registered
+/// for its module. Returns `JsValue::NULL` if the application has no formats
+/// blob hash, the node has no such blob, or decoding fails for any reason; in
+/// the failure case the error is also logged to the JS console.
+#[wasm_bindgen]
+pub async fn decode_user_operation(
+    app: JsValue,
+    application_id: String,
+    bytes_hex: String,
+) -> JsValue {
+    decode_user_bytes(
+        "decode_user_operation",
+        app,
+        application_id,
+        bytes_hex,
+        formats::Formats::decode_operation,
+    )
+    .await
+}
+
+/// Decode the bytes of a user-application cross-chain message. See
+/// [`decode_user_operation`] for behaviour and error semantics.
+#[wasm_bindgen]
+pub async fn decode_user_message(
+    app: JsValue,
+    application_id: String,
+    bytes_hex: String,
+) -> JsValue {
+    decode_user_bytes(
+        "decode_user_message",
+        app,
+        application_id,
+        bytes_hex,
+        formats::Formats::decode_message,
+    )
+    .await
+}
+
+/// Decode the bytes of a user-application operation response. See
+/// [`decode_user_operation`] for behaviour and error semantics.
+#[wasm_bindgen]
+pub async fn decode_user_response(
+    app: JsValue,
+    application_id: String,
+    bytes_hex: String,
+) -> JsValue {
+    decode_user_bytes(
+        "decode_user_response",
+        app,
+        application_id,
+        bytes_hex,
+        formats::Formats::decode_response,
+    )
+    .await
+}
+
+/// Decode the bytes of a user-application event-stream value. See
+/// [`decode_user_operation`] for behaviour and error semantics.
+#[wasm_bindgen]
+pub async fn decode_user_event_value(
+    app: JsValue,
+    application_id: String,
+    bytes_hex: String,
+) -> JsValue {
+    decode_user_bytes(
+        "decode_user_event_value",
+        app,
+        application_id,
+        bytes_hex,
+        formats::Formats::decode_event_value,
+    )
+    .await
+}
+
+/// Fetch the registered `Formats` for a deployed application and return them
+/// as a JS object, or `JsValue::NULL` if no entry is available (no formats
+/// blob hash on the module, or the local node has no such blob).
+#[wasm_bindgen]
+pub async fn fetch_user_app_formats_js(app: JsValue, application_id: String) -> JsValue {
+    let Some(formats) =
+        fetch_user_app_formats("fetch_user_app_formats_js", app, &application_id).await
+    else {
+        return JsValue::NULL;
+    };
+    // `Formats` contains maps keyed by enum-variant indices (`u32`), which the
+    // `serde_wasm_bindgen` "maps as objects" path cannot serialize ("Map key is
+    // not a string and cannot be an object key"). Round-trip through a JSON
+    // string instead — `JSON.parse` produces a plain JS object with all keys
+    // coerced to strings, which is what the UI consumes anyway.
+    match serde_json::to_string(&formats) {
+        Ok(s) => match js_sys::JSON::parse(&s) {
+            Ok(v) => v,
+            Err(e) => {
+                log_str(&format!(
+                    "fetch_user_app_formats_js: JSON.parse failed for {application_id}: {e:?}"
+                ));
+                JsValue::NULL
+            }
+        },
+        Err(e) => {
+            log_str(&format!(
+                "fetch_user_app_formats_js: serde_json::to_string failed for {application_id}: {e}"
+            ));
+            JsValue::NULL
         }
     }
 }

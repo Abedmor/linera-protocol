@@ -46,6 +46,12 @@ web = [
 
 web-default = ["web"]
 
+opentelemetry = [
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+    "dep:tracing-opentelemetry",
+]
+
 [dependencies]
 anyhow.workspace = true
 async-trait.workspace = true
@@ -69,6 +75,7 @@ rand.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["sync"] }
+tokio-stream.workspace = true
 tokio-util = { workspace = true, optional = true, features = ["codec"] }
 tonic-health = { workspace = true, optional = true }
 tonic-reflection = { workspace = true, optional = true }
@@ -77,12 +84,20 @@ tracing.workspace = true
 
 [dev-dependencies]
 insta = { workspace = true, features = ["yaml"] }
-linera-rpc = { path = ".", default-features = false, features = ["test"] }
+linera-rpc = { path = ".", default-features = false, features = [
+    "server",
+    "test",
+] }
 proptest.workspace = true
 serde-reflection.workspace = true
 test-strategy.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+http.workspace = true
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
 tonic = { workspace = true, features = [
     "tls-webpki-roots",
     "codegen",

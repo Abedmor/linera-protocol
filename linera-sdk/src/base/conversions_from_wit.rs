@@ -5,10 +5,13 @@
 
 use linera_base::{
     crypto::CryptoHash,
-    data_types::{Amount, BlockHeight, TimeDelta, Timestamp},
+    data_types::{
+        Amount, ApplicationDescription, ApplicationPermissions, BlockHeight, TimeDelta, Timestamp,
+    },
     http,
-    identifiers::{AccountOwner, ApplicationId, ChainId, DataBlobHash},
+    identifiers::{AccountOwner, ApplicationId, ChainId, DataBlobHash, ModuleId},
     ownership::{ChainOwnership, TimeoutConfig},
+    vm::VmRuntime,
 };
 
 use crate::{
@@ -138,6 +141,31 @@ macro_rules! impl_from_wit {
             }
         }
 
+        impl From<$wit_base_api::ApplicationPermissions> for ApplicationPermissions {
+            fn from(guest: $wit_base_api::ApplicationPermissions) -> ApplicationPermissions {
+                let $wit_base_api::ApplicationPermissions {
+                    execute_operations,
+                    mandatory_applications,
+                    manage_chain,
+                    call_service_as_oracle,
+                    make_http_requests,
+                } = guest;
+                ApplicationPermissions {
+                    execute_operations: execute_operations
+                        .map(|apps| apps.into_iter().map(Into::into).collect()),
+                    mandatory_applications: mandatory_applications
+                        .into_iter()
+                        .map(Into::into)
+                        .collect(),
+                    manage_chain: manage_chain.into_iter().map(Into::into).collect(),
+                    call_service_as_oracle: call_service_as_oracle
+                        .map(|apps| apps.into_iter().map(Into::into).collect()),
+                    make_http_requests: make_http_requests
+                        .map(|apps| apps.into_iter().map(Into::into).collect()),
+                }
+            }
+        }
+
         impl From<$wit_base_api::HttpResponse> for http::Response {
             fn from(response: $wit_base_api::HttpResponse) -> http::Response {
                 http::Response {
@@ -155,6 +183,43 @@ macro_rules! impl_from_wit {
         impl From<$wit_base_api::HttpHeader> for http::Header {
             fn from(header: $wit_base_api::HttpHeader) -> http::Header {
                 http::Header::new(header.name, header.value)
+            }
+        }
+
+        impl From<$wit_base_api::VmRuntime> for VmRuntime {
+            fn from(vm_runtime: $wit_base_api::VmRuntime) -> Self {
+                match vm_runtime {
+                    $wit_base_api::VmRuntime::Wasm => VmRuntime::Wasm,
+                    $wit_base_api::VmRuntime::Evm => VmRuntime::Evm,
+                }
+            }
+        }
+
+        impl From<$wit_base_api::ModuleId> for ModuleId {
+            fn from(module_id: $wit_base_api::ModuleId) -> Self {
+                ModuleId::new_with_formats(
+                    module_id.contract_blob_hash.into(),
+                    module_id.service_blob_hash.into(),
+                    module_id.vm_runtime.into(),
+                    module_id.formats_blob_hash.map(Into::into),
+                )
+            }
+        }
+
+        impl From<$wit_base_api::ApplicationDescription> for ApplicationDescription {
+            fn from(description: $wit_base_api::ApplicationDescription) -> Self {
+                ApplicationDescription {
+                    module_id: description.module_id.into(),
+                    creator_chain_id: description.creator_chain_id.into(),
+                    block_height: description.block_height.into(),
+                    application_index: description.application_index,
+                    parameters: description.parameters,
+                    required_application_ids: description
+                        .required_application_ids
+                        .into_iter()
+                        .map(Into::into)
+                        .collect(),
+                }
             }
         }
     };

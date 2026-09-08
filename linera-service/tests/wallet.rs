@@ -8,9 +8,9 @@ use linera_base::{
     data_types::{Amount, Blob, BlockHeight, Epoch},
 };
 use linera_chain::data_types::ProposedBlock;
-use linera_client::{client_context::ClientContext, config::GenesisConfig};
+use linera_client::client_context::ClientContext;
 use linera_core::{
-    client::{Client, PendingProposal},
+    client::{Client, ListeningMode, PendingProposal},
     join_set_ext::JoinSet,
     test_utils::{MemoryStorageBuilder, StorageBuilder, TestBuilder},
     wallet,
@@ -38,8 +38,10 @@ pub async fn new_test_client_context(
         recv_timeout: send_recv_timeout,
         retry_delay,
         max_retries,
+        ..Default::default()
     };
     let chain_ids: Vec<_> = wallet.chain_ids();
+    let chain_modes = chain_ids.iter().map(|id| (*id, ListeningMode::FullChain));
     let name = match chain_ids.len() {
         0 => "Client node".to_string(),
         1 => format!("Client node for {:.8}", chain_ids[0]),
@@ -56,19 +58,20 @@ pub async fn new_test_client_context(
                 signer,
                 wallet,
             },
-            genesis_config.admin_id(),
+            genesis_config.admin_chain_id(),
             false,
-            chain_ids,
+            chain_modes,
             name,
-            chain_worker_ttl,
-            sender_chain_worker_ttl,
+            Some(chain_worker_ttl),
+            Some(sender_chain_worker_ttl),
+            1000,
             chain_client::Options {
                 cross_chain_message_delivery: CrossChainMessageDelivery::Blocking,
                 ..chain_client::Options::test_default()
             },
             block_cache_size,
             execution_state_cache_size,
-            linera_core::client::RequestsSchedulerConfig::default(),
+            &linera_core::client::RequestsSchedulerConfig::default(),
         )
         .into(),
         genesis_config,
@@ -76,6 +79,7 @@ pub async fn new_test_client_context(
         recv_timeout: send_recv_timeout,
         retry_delay,
         max_retries,
+        max_backoff: linera_rpc::node_provider::DEFAULT_MAX_BACKOFF,
         chain_listeners: JoinSet::default(),
         client_metrics: None,
     })
@@ -90,9 +94,9 @@ async fn test_save_wallet_with_pending_blobs() -> anyhow::Result<()> {
     let clock = storage_builder.clock().clone();
     let mut builder = TestBuilder::new(storage_builder, 4, 1, signer.clone()).await?;
     builder.add_root_chain(0, Amount::ONE).await?;
-    let chain_id = builder.admin_id();
+    let chain_id = builder.admin_chain_id();
 
-    let genesis_config = GenesisConfig::new_testing(&builder);
+    let genesis_config = linera_core::GenesisConfig::new_for_testing(&builder);
 
     let tmp_dir = tempfile::tempdir()?;
     let mut config_dir = tmp_dir.keep();
@@ -111,10 +115,10 @@ async fn test_save_wallet_with_pending_blobs() -> anyhow::Result<()> {
     wallet
         .insert(
             admin_description.id(),
-            wallet::Chain {
+            &wallet::Chain {
                 owner: Some(new_pubkey.into()),
                 timestamp: clock.current_time(),
-                pending_proposal: Some(PendingProposal {
+                pending_fast_proposal: Some(PendingProposal {
                     block: ProposedBlock {
                         chain_id,
                         epoch: Epoch::ZERO,
@@ -125,6 +129,8 @@ async fn test_save_wallet_with_pending_blobs() -> anyhow::Result<()> {
                         previous_block_hash: None,
                     },
                     blobs: vec![Blob::new_data(b"blob".to_vec())],
+                    auto_retry_outcome: None,
+                    round: None,
                 }),
                 ..admin_description.into()
             },

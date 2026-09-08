@@ -2,10 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! This module manages the state of a Linera chain, including cross-chain communication.
+//!
+//! The consensus protocol implemented here is specified and proved correct in the `linera-spec`
+//! crate, whose statements live next to the code they describe in [`manager::proof`],
+//! [`data_types::proof`] and [`justification::proof`].
 
+#![deny(missing_docs)]
+
+/// Block types and the wrappers that pair them with their execution outcomes.
 pub mod block;
 mod certificate;
 
+/// Convenience re-exports of the public block and certificate types.
 pub mod types {
     pub use super::{block::*, certificate::*};
 }
@@ -14,25 +22,31 @@ mod block_tracker;
 mod chain;
 pub mod data_types;
 mod inbox;
+pub mod justification;
 pub mod manager;
 mod outbox;
 mod pending_blobs;
+pub mod proof;
 #[cfg(with_testing)]
 pub mod test;
 
-pub use chain::ChainStateView;
+pub use chain::{
+    BlockExecution, BlockExecutionPhase, ChainIdSet, ChainStateView, ChainTipState, StreamCounts,
+};
 use data_types::{MessageBundle, PostedMessage};
 use linera_base::{
     bcs,
     crypto::CryptoError,
-    data_types::{ArithmeticError, BlockHeight, Round, Timestamp},
+    data_types::{ArithmeticError, BlockHeight, Epoch, Round, Timestamp},
     identifiers::{ApplicationId, ChainId},
 };
 use linera_execution::ExecutionError;
 use linera_views::ViewError;
 use thiserror::Error;
 
-#[derive(Error, Debug)]
+/// An error that occurred while validating or executing a block on a chain.
+#[derive(Error, Debug, strum::IntoStaticStr)]
+#[allow(missing_docs)]
 pub enum ChainError {
     #[error("Cryptographic error: {0}")]
     CryptoError(#[from] CryptoError),
@@ -46,13 +60,16 @@ pub enum ChainError {
     #[error("The chain being queried is not active {0}")]
     InactiveChain(ChainId),
     #[error(
-        "Cannot vote for block proposal of chain {chain_id} because a message \
-         from chain {origin} at height {height} has not been received yet"
+        "Cannot vote for block proposal of chain {chain_id} because {} cross-chain message \
+         bundle(s) have not been received yet",
+        bundles.len()
     )]
-    MissingCrossChainUpdate {
+    MissingCrossChainUpdates {
         chain_id: ChainId,
-        origin: ChainId,
-        height: BlockHeight,
+        /// The missing incoming message bundles, as `(origin chain, height)` pairs that must
+        /// all be received before this block can be validated. The validator reports every
+        /// missing bundle at once so the client can fetch them in a single round.
+        bundles: Vec<(ChainId, BlockHeight)>,
     },
     #[error(
         "Message in block proposed to {chain_id} does not match the previously received messages from \
@@ -137,12 +154,52 @@ pub enum ChainError {
     CertificateValidatorReuse,
     #[error("Signatures in a certificate must form a quorum")]
     CertificateRequiresQuorum,
+    #[error("Justification chain rounds must be strictly increasing")]
+    JustificationRoundsNotIncreasing,
+    #[error("Certificate unlocking round does not match the top of its justification chain")]
+    JustificationUnlockingRoundMismatch,
+    #[error("Certificate justification commitment does not match its justification chain")]
+    JustificationCommitmentMismatch,
+    #[error("Justification chain must lie in rounds strictly below the certificate's round")]
+    JustificationChainNotBelowCertificate,
+    #[error("Certificate carries the first-round attestation but was not confirmed in the chain's first round")]
+    FalseFirstRoundAttestation,
+    #[error("Equivocation proof must reference two different blocks")]
+    EquivocationProofSameBlock,
+    #[error("Equivocation proof references blocks on different chains or at different heights")]
+    EquivocationProofDifferentChainOrHeight,
+    #[error("Equivocation proof does not violate the lock claim")]
+    EquivocationProofNoLockViolation,
+    #[error("Equivocation proof's earlier vote is not below the attested first round")]
+    EquivocationProofNoFirstRoundViolation,
+    #[error("Equivocation proof's opened justification is a valid quorum")]
+    EquivocationProofValidJustification,
+    #[error(
+        "Inbox gap on chain {chain_id} from origin {origin}: \
+        expected height {expected_height}, got {actual_height}"
+    )]
+    InboxGapDetected {
+        chain_id: ChainId,
+        origin: ChainId,
+        expected_height: BlockHeight,
+        actual_height: BlockHeight,
+    },
     #[error("Internal error {0}")]
     InternalError(String),
+    #[error("Corrupted chain state: {0}")]
+    CorruptedChainState(String),
     #[error("Block proposal has size {0} which is too large")]
     BlockProposalTooLarge(usize),
     #[error(transparent)]
     BcsError(#[from] bcs::Error),
+    #[error(
+        "Block advances the chain's epoch from {start_epoch} to {end_epoch}; \
+         a block may advance the epoch at most once"
+    )]
+    MultipleEpochAdvances {
+        start_epoch: Epoch,
+        end_epoch: Epoch,
+    },
     #[error("Closed chains cannot have operations, accepted messages or empty blocks")]
     ClosedChain,
     #[error("Empty blocks are not allowed")]
@@ -157,6 +214,8 @@ pub enum ChainError {
     RoundDoesNotTimeOut,
     #[error("Not signing timeout certificate; current round times out at time {0}")]
     NotTimedOutYet(Timestamp),
+    #[error("Checkpoint precondition failed: {0}")]
+    CheckpointPreconditionFailed(&'static str),
 }
 
 impl ChainError {
@@ -186,7 +245,18 @@ impl ChainError {
             | ChainError::MissingEarlierBlocks { .. }
             | ChainError::CertificateValidatorReuse
             | ChainError::CertificateRequiresQuorum
+            | ChainError::JustificationRoundsNotIncreasing
+            | ChainError::JustificationUnlockingRoundMismatch
+            | ChainError::JustificationCommitmentMismatch
+            | ChainError::JustificationChainNotBelowCertificate
+            | ChainError::FalseFirstRoundAttestation
+            | ChainError::EquivocationProofSameBlock
+            | ChainError::EquivocationProofDifferentChainOrHeight
+            | ChainError::EquivocationProofNoLockViolation
+            | ChainError::EquivocationProofNoFirstRoundViolation
+            | ChainError::EquivocationProofValidJustification
             | ChainError::BlockProposalTooLarge(_)
+            | ChainError::MultipleEpochAdvances { .. }
             | ChainError::ClosedChain
             | ChainError::EmptyBlock
             | ChainError::AuthorizedApplications(_)
@@ -194,18 +264,38 @@ impl ChainError {
             | ChainError::MissingOracleResponseList
             | ChainError::RoundDoesNotTimeOut
             | ChainError::NotTimedOutYet(_)
-            | ChainError::MissingCrossChainUpdate { .. } => false,
+            | ChainError::CheckpointPreconditionFailed(_)
+            | ChainError::MissingCrossChainUpdates { .. } => false,
             ChainError::ViewError(_)
             | ChainError::UnexpectedMessage { .. }
+            | ChainError::InboxGapDetected { .. }
             | ChainError::InternalError(_)
+            | ChainError::CorruptedChainState(_)
             | ChainError::BcsError(_) => true,
             ChainError::ExecutionError(execution_error, _) => execution_error.is_local(),
         }
     }
+
+    /// Returns the qualified error variant name for the `error_type` metric label,
+    /// e.g. `"ChainError::UnexpectedBlockHeight"`.
+    ///
+    /// For `ExecutionError` variants, delegates to `ExecutionError::error_type()`
+    /// to surface the underlying error name rather than just `"ExecutionError"`.
+    pub fn error_type(&self) -> String {
+        match self {
+            ChainError::ExecutionError(execution_error, _) => execution_error.error_type(),
+            other => {
+                let variant: &'static str = other.into();
+                format!("ChainError::{variant}")
+            }
+        }
+    }
 }
 
+/// The phase of block execution during which an error occurred.
 #[derive(Copy, Clone, Debug)]
 #[cfg_attr(with_testing, derive(Eq, PartialEq))]
+#[allow(missing_docs)]
 pub enum ChainExecutionContext {
     Query,
     DescribeApplication,
@@ -214,7 +304,9 @@ pub enum ChainExecutionContext {
     Block,
 }
 
+/// Extension trait for attaching a [`ChainExecutionContext`] to an execution error.
 pub trait ExecutionResultExt<T> {
+    /// Converts the error into a [`ChainError`], tagging it with the given execution context.
     fn with_execution_context(self, context: ChainExecutionContext) -> Result<T, ChainError>;
 }
 
@@ -225,4 +317,20 @@ where
     fn with_execution_context(self, context: ChainExecutionContext) -> Result<T, ChainError> {
         self.map_err(|error| ChainError::ExecutionError(Box::new(error.into()), context))
     }
+}
+
+/// Registers every metric this crate declares.
+///
+/// Without this, a metric is only exported after the code path that observes it has run, so a
+/// rarely-taken path leaves its panels blank and makes a routine restart look like the metric
+/// was removed.
+#[cfg(with_metrics)]
+pub fn init_metrics() {
+    linera_base::init_metrics();
+    linera_execution::init_metrics();
+    linera_views::init_metrics();
+    chain::metrics::init_metrics();
+    inbox::metrics::init_metrics();
+    justification::metrics::init_metrics();
+    outbox::metrics::init_metrics();
 }

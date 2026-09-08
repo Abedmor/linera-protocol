@@ -1,0 +1,264 @@
+---
+source: linera-bridge/tests/format.rs
+expression: get_registry().unwrap()
+---
+AccountOwner:
+  ENUM:
+    0:
+      Reserved:
+        NEWTYPE: U8
+    1:
+      Address32:
+        NEWTYPE:
+          TYPENAME: CryptoHash
+    2:
+      Address20:
+        NEWTYPE:
+          TUPLEARRAY:
+            CONTENT: U8
+            SIZE: 20
+ApplicationId:
+  STRUCT:
+    - application_description_hash:
+        TYPENAME: CryptoHash
+BlobContent:
+  STRUCT:
+    - blob_type:
+        TYPENAME: BlobType
+    - bytes: BYTES
+BlobId:
+  STRUCT:
+    - hash:
+        TYPENAME: CryptoHash
+    - blob_type:
+        TYPENAME: BlobType
+BlobType:
+  ENUM:
+    0:
+      Data: UNIT
+    1:
+      ContractBytecode: UNIT
+    2:
+      ServiceBytecode: UNIT
+    3:
+      EvmBytecode: UNIT
+    4:
+      ApplicationDescription: UNIT
+    5:
+      Committee: UNIT
+    6:
+      ChainDescription: UNIT
+    7:
+      ApplicationFormats: UNIT
+    8:
+      CheckpointExecutionState: UNIT
+BlockHeader:
+  STRUCT:
+    - chain_id:
+        TYPENAME: ChainId
+    - epoch:
+        TYPENAME: Epoch
+    - height:
+        TYPENAME: BlockHeight
+    - timestamp:
+        TYPENAME: Timestamp
+    - state_hash:
+        TYPENAME: CryptoHash
+    - previous_block_hash:
+        OPTION:
+          TYPENAME: CryptoHash
+    - authenticated_owner:
+        OPTION:
+          TYPENAME: AccountOwner
+    - transactions_hash:
+        TYPENAME: CryptoHash
+    - messages_hash:
+        TYPENAME: CryptoHash
+    - previous_message_blocks_hash:
+        TYPENAME: CryptoHash
+    - previous_event_blocks_hash:
+        TYPENAME: CryptoHash
+    - oracle_responses_hash:
+        TYPENAME: CryptoHash
+    - events_hash:
+        TYPENAME: CryptoHash
+    - blobs_hash:
+        TYPENAME: CryptoHash
+    - operation_results_hash:
+        TYPENAME: CryptoHash
+BlockHeight:
+  NEWTYPESTRUCT: U64
+BlockProof:
+  STRUCT:
+    - header:
+        TYPENAME: BlockHeader
+    - round:
+        TYPENAME: Round
+    - first_round: BOOL
+    - justification_commitment:
+        OPTION:
+          TYPENAME: CryptoHash
+    - signatures:
+        SEQ:
+          TUPLE:
+            - TYPENAME: Secp256k1PublicKey
+            - TYPENAME: Secp256k1Signature
+CertificateKind:
+  ENUM:
+    0:
+      Timeout: UNIT
+    1:
+      Validated: UNIT
+    2:
+      Confirmed: UNIT
+ChainId:
+  NEWTYPESTRUCT:
+    TYPENAME: CryptoHash
+CryptoHash:
+  NEWTYPESTRUCT:
+    TUPLEARRAY:
+      CONTENT: U8
+      SIZE: 32
+Cursor:
+  STRUCT:
+    - height:
+        TYPENAME: BlockHeight
+    - index: U32
+Epoch:
+  NEWTYPESTRUCT: U32
+EpochEventData:
+  STRUCT:
+    - blob_hash:
+        TYPENAME: CryptoHash
+    - timestamp:
+        TYPENAME: Timestamp
+Event:
+  STRUCT:
+    - stream_id:
+        TYPENAME: StreamId
+    - index: U32
+    - value: BYTES
+EventId:
+  STRUCT:
+    - chain_id:
+        TYPENAME: ChainId
+    - stream_id:
+        TYPENAME: StreamId
+    - index: U32
+EvmPublicKey:
+  NEWTYPESTRUCT:
+    TUPLEARRAY:
+      CONTENT: U8
+      SIZE: 33
+EvmSignature:
+  NEWTYPESTRUCT:
+    TUPLEARRAY:
+      CONTENT: U8
+      SIZE: 65
+GenericApplicationId:
+  ENUM:
+    0:
+      System: UNIT
+    1:
+      User:
+        NEWTYPE:
+          TYPENAME: ApplicationId
+Header:
+  STRUCT:
+    - name: STR
+    - value: BYTES
+OracleResponse:
+  ENUM:
+    0:
+      Service:
+        NEWTYPE: BYTES
+    1:
+      Http:
+        NEWTYPE:
+          TYPENAME: Response
+    2:
+      Blob:
+        NEWTYPE:
+          TYPENAME: BlobId
+    3:
+      Assert: UNIT
+    4:
+      Round:
+        NEWTYPE:
+          OPTION: U32
+    5:
+      Event:
+        TUPLE:
+          - TYPENAME: EventId
+          - BYTES
+    6:
+      EventExists:
+        NEWTYPE:
+          TYPENAME: EventId
+    7:
+      Checkpoint:
+        STRUCT:
+          - execution_state_blobs:
+              SEQ:
+                TYPENAME: CryptoHash
+          - used_blobs:
+              SEQ:
+                TYPENAME: BlobId
+          - outbox_block_hashes:
+              SEQ:
+                TYPENAME: CryptoHash
+          - inbox_cursors:
+              SEQ:
+                TUPLE:
+                  - TYPENAME: ChainId
+                  - TYPENAME: Cursor
+Response:
+  STRUCT:
+    - status: U16
+    - headers:
+        SEQ:
+          TYPENAME: Header
+    - body: BYTES
+Round:
+  ENUM:
+    0:
+      Fast: UNIT
+    1:
+      MultiLeader:
+        NEWTYPE: U32
+    2:
+      SingleLeader:
+        NEWTYPE: U32
+    3:
+      Validator:
+        NEWTYPE: U32
+Secp256k1PublicKey:
+  NEWTYPESTRUCT:
+    TUPLEARRAY:
+      CONTENT: U8
+      SIZE: 65
+Secp256k1Signature:
+  NEWTYPESTRUCT:
+    TUPLEARRAY:
+      CONTENT: U8
+      SIZE: 64
+StreamId:
+  STRUCT:
+    - application_id:
+        TYPENAME: GenericApplicationId
+    - stream_name:
+        TYPENAME: StreamName
+StreamName:
+  NEWTYPESTRUCT: BYTES
+Timestamp:
+  NEWTYPESTRUCT: U64
+VoteValue:
+  TUPLESTRUCT:
+    - TYPENAME: CryptoHash
+    - TYPENAME: Round
+    - TYPENAME: CertificateKind
+    - OPTION:
+        TYPENAME: Round
+    - BOOL
+    - OPTION:
+        TYPENAME: CryptoHash

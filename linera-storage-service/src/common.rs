@@ -16,6 +16,7 @@ use tonic::Status;
 // both for incoming and outgoing messages.
 // We decrease the 4194304 to 4000000 to leave space for the rest of the message
 // (that includes length prefixes)
+/// The maximum size of a gRPC payload, in bytes.
 pub const MAX_PAYLOAD_SIZE: usize = 4000000;
 
 /// Key tags to create the sub keys used for storing data on storage.
@@ -29,6 +30,7 @@ pub enum KeyPrefix {
     RootKey,
 }
 
+/// The errors returned by the storage service store.
 #[derive(Debug, Error)]
 pub enum StorageServiceStoreError {
     /// Store already exists during a create operation
@@ -74,24 +76,25 @@ impl KeyValueStoreError for StorageServiceStoreError {
     const BACKEND: &'static str = "service";
 }
 
+/// Returns the storage service endpoint used for testing, read from the environment.
 pub fn storage_service_test_endpoint() -> Result<String, StorageServiceStoreError> {
     Ok(std::env::var("LINERA_STORAGE_SERVICE")?)
 }
 
+/// The configuration for connecting to a storage service.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct StorageServiceStoreInternalConfig {
     /// The endpoint used by the shared store
     pub endpoint: String,
     /// Maximum number of concurrent database queries allowed for this client.
     pub max_concurrent_queries: Option<usize>,
-    /// Preferred buffer size for async streams.
-    pub max_stream_queries: usize,
 }
 
 /// The config type
 pub type StorageServiceStoreConfig = LruCachingConfig<StorageServiceStoreInternalConfig>;
 
 impl StorageServiceStoreInternalConfig {
+    /// Returns the HTTP address of the endpoint.
     pub fn http_address(&self) -> String {
         format!("http://{}", self.endpoint)
     }

@@ -3,18 +3,15 @@
 
 #![cfg_attr(target_arch = "wasm32", no_main)]
 
-mod state;
-
 use fungible::{
-    FungibleOperation, FungibleResponse, FungibleTokenAbi, InitialState, Message, Parameters,
+    state::FungibleTokenState, FungibleOperation, FungibleResponse, FungibleTokenAbi, InitialState,
+    Message, Parameters,
 };
 use linera_sdk::{
     linera_base_types::{Account, AccountOwner, Amount, WithContractAbi},
     views::{RootView, View},
     Contract, ContractRuntime,
 };
-
-use self::state::FungibleTokenState;
 
 pub struct FungibleTokenContract {
     state: FungibleTokenState,
@@ -42,7 +39,7 @@ impl Contract for FungibleTokenContract {
 
     async fn instantiate(&mut self, state: Self::InstantiationArgument) {
         // Validate that the application parameters were configured correctly.
-        let _ = self.runtime.application_parameters();
+        self.runtime.application_parameters();
 
         let mut total_supply = Amount::ZERO;
         for value in state.accounts.values() {
@@ -152,8 +149,11 @@ impl Contract for FungibleTokenContract {
         }
     }
 
-    async fn store(mut self) {
-        self.state.save().await.expect("Failed to save state");
+    async fn store(self) {
+        self.state
+            .save_and_drop()
+            .await
+            .expect("Failed to save state");
     }
 }
 

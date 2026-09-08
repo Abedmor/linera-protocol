@@ -3,33 +3,38 @@
 
 //! This module defines the storage abstractions for individual chains and certificates.
 
+#![deny(missing_docs)]
+
 mod db_storage;
 
-use std::sync::Arc;
+use std::sync::Arc as StdArc;
 
 use async_trait::async_trait;
 use itertools::Itertools;
 use linera_base::{
     crypto::CryptoHash,
     data_types::{
-        ApplicationDescription, Blob, ChainDescription, CompressedBytecode, NetworkDescription,
-        TimeDelta, Timestamp,
+        ApplicationDescription, Blob, BlockHeight, ChainDescription, CompressedBytecode, Epoch,
+        NetworkDescription, TimeDelta, Timestamp,
     },
-    identifiers::{ApplicationId, BlobId, ChainId, EventId, IndexAndEvent, StreamId},
+    identifiers::{ApplicationId, BlobId, BlobType, ChainId, EventId, IndexAndEvent, StreamId},
+    time::Duration,
     vm::VmRuntime,
 };
+pub use linera_cache::{Arc, DEFAULT_CLEANUP_INTERVAL_SECS};
 use linera_chain::{
     types::{ConfirmedBlock, ConfirmedBlockCertificate},
     ChainError, ChainStateView,
+};
+use linera_execution::{
+    committee::Committee, BlobState, ExecutionError, ExecutionRuntimeConfig,
+    ExecutionRuntimeContext, SharedCommittees, TransactionTracker, UserContractCode,
+    UserServiceCode, WasmRuntime,
 };
 #[cfg(with_revm)]
 use linera_execution::{
     evm::revm::{EvmContractModule, EvmServiceModule},
     EvmRuntime,
-};
-use linera_execution::{
-    BlobState, ExecutionError, ExecutionRuntimeConfig, ExecutionRuntimeContext, TransactionTracker,
-    UserContractCode, UserServiceCode, WasmRuntime,
 };
 #[cfg(with_wasm_runtime)]
 use linera_execution::{WasmContractModule, WasmServiceModule};
@@ -37,9 +42,11 @@ use linera_views::{context::Context, views::RootView, ViewError};
 
 #[cfg(with_metrics)]
 pub use crate::db_storage::metrics;
+pub use crate::db_storage::{
+    ChainStatesFirstAssignment, DbStorage, RootKey, StorageCacheConfig, StorageCaches, WallClock,
+};
 #[cfg(with_testing)]
-pub use crate::db_storage::TestClock;
-pub use crate::db_storage::{ChainStatesFirstAssignment, DbStorage, WallClock};
+pub use crate::db_storage::{TestClock, DEFAULT_STORAGE_CACHE_CONFIG};
 
 /// The default namespace to be used when none is specified
 pub const DEFAULT_NAMESPACE: &str = "default";
@@ -47,18 +54,21 @@ pub const DEFAULT_NAMESPACE: &str = "default";
 /// Communicate with a persistent storage using the "views" abstraction.
 #[cfg_attr(not(web), async_trait)]
 #[cfg_attr(web, async_trait(?Send))]
-pub trait Storage: Sized {
+pub trait Storage: linera_base::util::traits::AutoTraits + Sized {
     /// The low-level storage implementation in use by the core protocol (chain workers etc).
-    type Context: Context<Extra = ChainRuntimeContext<Self>> + Clone + Send + Sync + 'static;
+    type Context: Context<Extra = ChainRuntimeContext<Self>> + Clone + 'static;
 
     /// The clock type being used.
-    type Clock: Clock;
+    type Clock: Clock + Clone + Send + Sync;
 
     /// The low-level storage implementation in use by the block exporter.
-    type BlockExporterContext: Context<Extra = u32> + Clone + Send + Sync + 'static;
+    type BlockExporterContext: Context<Extra = u32> + Clone;
 
     /// Returns the current wall clock time.
     fn clock(&self) -> &Self::Clock;
+
+    /// Returns the thread pool used to run blocking work such as bytecode decompression.
+    fn thread_pool(&self) -> &StdArc<linera_execution::ThreadPool>;
 
     /// Loads the view of a chain state.
     ///
@@ -82,13 +92,19 @@ pub trait Storage: Sized {
     async fn read_confirmed_block(
         &self,
         hash: CryptoHash,
-    ) -> Result<Option<ConfirmedBlock>, ViewError>;
+    ) -> Result<Option<Arc<ConfirmedBlock>>, ViewError>;
+
+    /// Reads a number of confirmed blocks by their hashes.
+    async fn read_confirmed_blocks<I: IntoIterator<Item = CryptoHash> + Send>(
+        &self,
+        hashes: I,
+    ) -> Result<Vec<Option<Arc<ConfirmedBlock>>>, ViewError>;
 
     /// Reads the blob with the given blob ID.
-    async fn read_blob(&self, blob_id: BlobId) -> Result<Option<Blob>, ViewError>;
+    async fn read_blob(&self, blob_id: BlobId) -> Result<Option<Arc<Blob>>, ViewError>;
 
     /// Reads the blobs with the given blob IDs.
-    async fn read_blobs(&self, blob_ids: &[BlobId]) -> Result<Vec<Option<Blob>>, ViewError>;
+    async fn read_blobs(&self, blob_ids: &[BlobId]) -> Result<Vec<Option<Arc<Blob>>>, ViewError>;
 
     /// Reads the blob state with the given blob ID.
     async fn read_blob_state(&self, blob_id: BlobId) -> Result<Option<BlobState>, ViewError>;
@@ -126,31 +142,92 @@ pub trait Storage: Sized {
     /// Tests existence of the certificate with the given hash.
     async fn contains_certificate(&self, hash: CryptoHash) -> Result<bool, ViewError>;
 
+    /// Inserts a certificate into the in-memory dedup cache and returns the
+    /// canonical [`Arc`]. If the cache already holds an `Arc` for this hash,
+    /// the passed-in `certificate` is dropped and the existing `Arc` is
+    /// returned. This must be used (rather than `Arc::new`) for any
+    /// freshly-constructed [`ConfirmedBlockCertificate`] that should
+    /// participate in the "one allocation per content" invariant.
+    fn cache_certificate(
+        &self,
+        certificate: ConfirmedBlockCertificate,
+    ) -> Arc<ConfirmedBlockCertificate>;
+
+    /// Inserts a blob into the in-memory dedup cache and returns the canonical
+    /// [`Arc`]. If the cache already holds an `Arc` for this blob ID, the
+    /// passed-in `blob` is dropped and the existing `Arc` is returned. This
+    /// must be used (rather than `Arc::new`) for any freshly-constructed
+    /// [`Blob`] that should participate in the "one allocation per content"
+    /// invariant.
+    fn cache_blob(&self, blob: Blob) -> Arc<Blob>;
+
+    /// Inserts a confirmed block into the in-memory dedup cache and returns
+    /// the canonical [`Arc`]. If the cache already holds an `Arc` for this
+    /// hash, the passed-in `block` is dropped and the existing `Arc` is
+    /// returned. This must be used (rather than `Arc::new`) for any
+    /// freshly-constructed [`ConfirmedBlock`] that should participate in the
+    /// "one allocation per content" invariant.
+    fn cache_confirmed_block(&self, block: ConfirmedBlock) -> Arc<ConfirmedBlock>;
+
     /// Reads the certificate with the given hash.
     async fn read_certificate(
         &self,
         hash: CryptoHash,
-    ) -> Result<Option<ConfirmedBlockCertificate>, ViewError>;
+    ) -> Result<Option<Arc<ConfirmedBlockCertificate>>, ViewError>;
 
     /// Reads a number of certificates
-    async fn read_certificates<I: IntoIterator<Item = CryptoHash> + Send>(
+    async fn read_certificates(
         &self,
-        hashes: I,
-    ) -> Result<Vec<Option<ConfirmedBlockCertificate>>, ViewError>;
+        hashes: &[CryptoHash],
+    ) -> Result<Vec<Option<Arc<ConfirmedBlockCertificate>>>, ViewError>;
 
-    /// Reads certificates by hashes.
+    /// Reads raw certificate bytes by hashes.
     ///
-    /// Returns a vector of tuples where the first element is a lite certificate
-    /// and the second element is confirmed block.
-    ///
-    /// It does not check if all hashes all returned.
-    async fn read_certificates_raw<I: IntoIterator<Item = CryptoHash> + Send>(
+    /// Returns a vector where each element corresponds to the input hash.
+    /// Elements are `None` if no certificate exists for that hash.
+    /// Each found certificate is returned as `Some((lite_certificate_bytes, confirmed_block_bytes))`.
+    async fn read_certificates_raw(
         &self,
-        hashes: I,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, ViewError>;
+        hashes: &[CryptoHash],
+    ) -> Result<Vec<Option<Arc<(Vec<u8>, Vec<u8>)>>>, ViewError>;
+
+    /// Reads certificates by heights for a given chain.
+    /// Returns a vector where each element corresponds to the input height.
+    /// Elements are `None` if no certificate exists at that height.
+    async fn read_certificates_by_heights(
+        &self,
+        chain_id: ChainId,
+        heights: &[BlockHeight],
+    ) -> Result<Vec<Option<Arc<ConfirmedBlockCertificate>>>, ViewError>;
+
+    /// Reads raw certificates by heights for a given chain.
+    /// Returns a vector where each element corresponds to the input height.
+    /// Elements are `None` if no certificate exists at that height.
+    /// Each found certificate is returned as a tuple of (lite_certificate_bytes, confirmed_block_bytes).
+    async fn read_certificates_by_heights_raw(
+        &self,
+        chain_id: ChainId,
+        heights: &[BlockHeight],
+    ) -> Result<Vec<Option<Arc<(Vec<u8>, Vec<u8>)>>>, ViewError>;
+
+    /// Returns a vector of certificate hashes for the requested chain and heights.
+    /// The resulting vector maintains the order of the input `heights` argument.
+    /// Elements are `None` if no certificate exists at that height.
+    async fn read_certificate_hashes_by_heights(
+        &self,
+        chain_id: ChainId,
+        heights: &[BlockHeight],
+    ) -> Result<Vec<Option<CryptoHash>>, ViewError>;
+
+    /// Looks up the block heights where the given events were published.
+    /// Returns `None` for events that are not in the index.
+    async fn read_event_block_heights(
+        &self,
+        event_ids: &[EventId],
+    ) -> Result<Vec<Option<BlockHeight>>, ViewError>;
 
     /// Reads the event with the given ID.
-    async fn read_event(&self, id: EventId) -> Result<Option<Vec<u8>>, ViewError>;
+    async fn read_event(&self, id: EventId) -> Result<Option<Arc<Vec<u8>>>, ViewError>;
 
     /// Tests existence of the event with the given ID.
     async fn contains_event(&self, id: EventId) -> Result<bool, ViewError>;
@@ -190,11 +267,19 @@ pub trait Storage: Sized {
         ChainRuntimeContext<Self>: ExecutionRuntimeContext,
     {
         let id = description.id();
-        // Store the description blob.
-        self.write_blob(&Blob::new_chain_description(&description))
+        // Store the description blob and a `Genesis` blob state for it. The blob
+        // is not published by any block, so its provenance is the genesis config
+        // rather than a particular `(chain_id, block_height)`.
+        let description_blob = Blob::new_chain_description(&description);
+        let description_blob_id = description_blob.id();
+        self.write_blob(&description_blob).await?;
+        self.maybe_write_blob_states(&[description_blob_id], BlobState::GENESIS)
             .await?;
         let mut chain = self.load_chain(id).await?;
-        assert!(!chain.is_active(), "Attempting to create a chain twice");
+        assert!(
+            !chain.is_active().await?,
+            "Attempting to create a chain twice"
+        );
         let current_time = self.clock().current_time();
         chain.initialize_if_needed(current_time).await?;
         chain.save().await?;
@@ -220,16 +305,19 @@ pub trait Storage: Sized {
                 .ok_or(ExecutionError::BlobsNotFound(vec![
                     contract_bytecode_blob_id,
                 ]))?
-                .into_content(),
+                .content()
+                .clone(),
         };
         let compressed_contract_bytecode = CompressedBytecode {
             compressed_bytes: content.into_arc_bytes(),
         };
         #[cfg_attr(not(any(with_wasm_runtime, with_revm)), allow(unused_variables))]
-        let contract_bytecode = web_thread::Thread::new()
+        let contract_bytecode = self
+            .thread_pool()
             .run_send((), move |()| async move {
                 compressed_contract_bytecode.decompress()
             })
+            .await
             .await??;
         match application_description.module_id.vm_runtime {
             VmRuntime::Wasm => {
@@ -268,7 +356,7 @@ pub trait Storage: Sized {
         }
     }
 
-    /// Creates a [`linera-sdk::UserContract`] instance using the bytecode in storage referenced
+    /// Creates a [`UserServiceCode`] instance using the bytecode in storage referenced
     /// by the `application_description`.
     async fn load_service(
         &self,
@@ -284,16 +372,19 @@ pub trait Storage: Sized {
                 .ok_or(ExecutionError::BlobsNotFound(vec![
                     service_bytecode_blob_id,
                 ]))?
-                .into_content(),
+                .content()
+                .clone(),
         };
         let compressed_service_bytecode = CompressedBytecode {
             compressed_bytes: content.into_arc_bytes(),
         };
         #[cfg_attr(not(any(with_wasm_runtime, with_revm)), allow(unused_variables))]
-        let service_bytecode = web_thread::Thread::new()
+        let service_bytecode = self
+            .thread_pool()
             .run_send((), move |()| async move {
                 compressed_service_bytecode.decompress()
             })
+            .await
             .await??;
         match application_description.module_id.vm_runtime {
             VmRuntime::Wasm => {
@@ -332,10 +423,81 @@ pub trait Storage: Sized {
         }
     }
 
+    /// Returns the storage context used by the block exporter with the given ID.
     async fn block_exporter_context(
         &self,
         block_exporter_id: u32,
     ) -> Result<Self::BlockExporterContext, ViewError>;
+
+    /// Returns the process-wide committee cache shared by all chains.
+    fn shared_committees(&self) -> &SharedCommittees;
+
+    /// Returns the committee whose serialized form hashes to `hash`, loading it
+    /// from the blob store on cache miss.
+    async fn get_or_load_committee_by_hash(
+        &self,
+        hash: CryptoHash,
+    ) -> Result<StdArc<Committee>, ExecutionError> {
+        if let Some(committee) = self.shared_committees().get(hash) {
+            return Ok(committee);
+        }
+        let blob_id = BlobId::new(hash, BlobType::Committee);
+        let blob = self
+            .read_blob(blob_id)
+            .await?
+            .ok_or(ExecutionError::BlobsNotFound(vec![blob_id]))?;
+        let committee = bcs::from_bytes(blob.bytes())?;
+        Ok(self
+            .shared_committees()
+            .insert(hash, StdArc::new(committee)))
+    }
+
+    /// Returns whether the given epoch's committee has been revoked, i.e. whether the
+    /// admin chain has written a `REMOVED_EPOCH_STREAM` event for it.
+    async fn is_epoch_revoked(&self, epoch: Epoch) -> Result<bool, ExecutionError> {
+        let net_desc = self
+            .read_network_description()
+            .await?
+            .ok_or(ExecutionError::NoNetworkDescriptionFound)?;
+        let event_id = EventId {
+            chain_id: net_desc.admin_chain_id,
+            stream_id: StreamId::system(linera_execution::system::REMOVED_EPOCH_STREAM_NAME),
+            index: epoch.0,
+        };
+        Ok(self.contains_event(event_id).await?)
+    }
+
+    /// Returns the committee that signs blocks in the given epoch, looking up its blob
+    /// hash via the admin chain's epoch event stream (or the genesis committee for
+    /// epoch 0). Returns `Ok(None)` if the corresponding event has not been written
+    /// to local storage yet.
+    async fn committee_for_epoch(
+        &self,
+        epoch: Epoch,
+    ) -> Result<Option<StdArc<Committee>>, ExecutionError> {
+        let blob_hash = if epoch == Epoch::ZERO {
+            self.read_network_description()
+                .await?
+                .ok_or(ExecutionError::NoNetworkDescriptionFound)?
+                .genesis_committee_blob_hash
+        } else {
+            let net_desc = self
+                .read_network_description()
+                .await?
+                .ok_or(ExecutionError::NoNetworkDescriptionFound)?;
+            let event_id = EventId {
+                chain_id: net_desc.admin_chain_id,
+                stream_id: StreamId::system(linera_execution::system::EPOCH_STREAM_NAME),
+                index: epoch.0,
+            };
+            let Some(bytes) = self.read_event(event_id).await? else {
+                return Ok(None);
+            };
+            let event_data: linera_execution::system::EpochEventData = bcs::from_bytes(&bytes)?;
+            event_data.blob_hash
+        };
+        Ok(Some(self.get_or_load_committee_by_hash(blob_hash).await?))
+    }
 
     /// Lists the blob IDs in storage.
     async fn list_blob_ids(&self) -> Result<Vec<BlobId>, ViewError>;
@@ -349,21 +511,23 @@ pub trait Storage: Sized {
 
 /// The result of processing the obtained read certificates.
 pub enum ResultReadCertificates {
+    /// All requested certificates were found.
     Certificates(Vec<ConfirmedBlockCertificate>),
+    /// Some hashes did not correspond to a stored certificate.
     InvalidHashes(Vec<CryptoHash>),
 }
 
 impl ResultReadCertificates {
     /// Creating the processed read certificates.
     pub fn new(
-        certificates: Vec<Option<ConfirmedBlockCertificate>>,
+        certificates: Vec<Option<Arc<ConfirmedBlockCertificate>>>,
         hashes: Vec<CryptoHash>,
     ) -> Self {
         let (certificates, invalid_hashes) = certificates
             .into_iter()
             .zip(hashes)
             .partition_map::<Vec<_>, Vec<_>, _, _, _>(|(certificate, hash)| match certificate {
-                Some(cert) => itertools::Either::Left(cert),
+                Some(cert) => itertools::Either::Left(Arc::unwrap_or_clone(cert)),
                 None => itertools::Either::Right(hash),
             });
         if invalid_hashes.is_empty() {
@@ -379,30 +543,32 @@ impl ResultReadCertificates {
 pub struct ChainRuntimeContext<S> {
     storage: S,
     chain_id: ChainId,
+    thread_pool: StdArc<linera_execution::ThreadPool>,
     execution_runtime_config: ExecutionRuntimeConfig,
-    user_contracts: Arc<papaya::HashMap<ApplicationId, UserContractCode>>,
-    user_services: Arc<papaya::HashMap<ApplicationId, UserServiceCode>>,
+    user_contracts: StdArc<papaya::HashMap<ApplicationId, UserContractCode>>,
+    user_services: StdArc<papaya::HashMap<ApplicationId, UserServiceCode>>,
 }
 
 #[cfg_attr(not(web), async_trait)]
 #[cfg_attr(web, async_trait(?Send))]
-impl<S> ExecutionRuntimeContext for ChainRuntimeContext<S>
-where
-    S: Storage + Send + Sync,
-{
+impl<S: Storage> ExecutionRuntimeContext for ChainRuntimeContext<S> {
     fn chain_id(&self) -> ChainId {
         self.chain_id
+    }
+
+    fn thread_pool(&self) -> &StdArc<linera_execution::ThreadPool> {
+        &self.thread_pool
     }
 
     fn execution_runtime_config(&self) -> linera_execution::ExecutionRuntimeConfig {
         self.execution_runtime_config
     }
 
-    fn user_contracts(&self) -> &Arc<papaya::HashMap<ApplicationId, UserContractCode>> {
+    fn user_contracts(&self) -> &StdArc<papaya::HashMap<ApplicationId, UserContractCode>> {
         &self.user_contracts
     }
 
-    fn user_services(&self) -> &Arc<papaya::HashMap<ApplicationId, UserServiceCode>> {
+    fn user_services(&self) -> &StdArc<papaya::HashMap<ApplicationId, UserServiceCode>> {
         &self.user_services
     }
 
@@ -436,16 +602,23 @@ where
         Ok(service)
     }
 
-    async fn get_blob(&self, blob_id: BlobId) -> Result<Option<Blob>, ViewError> {
-        self.storage.read_blob(blob_id).await
+    async fn get_blob(&self, blob_id: BlobId) -> Result<Option<StdArc<Blob>>, ViewError> {
+        Ok(self.storage.read_blob(blob_id).await?.map(Arc::into_std))
     }
 
-    async fn get_event(&self, event_id: EventId) -> Result<Option<Vec<u8>>, ViewError> {
-        self.storage.read_event(event_id).await
+    async fn get_event(&self, event_id: EventId) -> Result<Option<StdArc<Vec<u8>>>, ViewError> {
+        Ok(self.storage.read_event(event_id).await?.map(Arc::into_std))
     }
 
     async fn get_network_description(&self) -> Result<Option<NetworkDescription>, ViewError> {
         self.storage.read_network_description().await
+    }
+
+    async fn get_or_load_committee_by_hash(
+        &self,
+        hash: CryptoHash,
+    ) -> Result<StdArc<Committee>, ExecutionError> {
+        self.storage.get_or_load_committee_by_hash(hash).await
     }
 
     async fn contains_blob(&self, blob_id: BlobId) -> Result<bool, ViewError> {
@@ -478,11 +651,38 @@ where
 #[cfg_attr(not(web), async_trait)]
 #[cfg_attr(web, async_trait(?Send))]
 pub trait Clock {
+    /// Returns the current time.
     fn current_time(&self) -> Timestamp;
 
-    async fn sleep(&self, delta: TimeDelta);
-
+    /// Waits until the given timestamp is reached.
     async fn sleep_until(&self, timestamp: Timestamp);
+
+    /// Waits for the given duration, measured against this clock.
+    ///
+    /// Unlike [`linera_base::time::timer::sleep`], this honors a simulated clock (e.g. a test
+    /// clock), so callers that sleep through it can be driven deterministically in virtual time.
+    async fn sleep_for(&self, duration: Duration) {
+        self.sleep_until(
+            self.current_time()
+                .saturating_add(TimeDelta::from_duration(duration)),
+        )
+        .await
+    }
+}
+
+/// Registers every metric this crate declares.
+///
+/// Without this, a metric is only exported after the code path that observes it has run, so a
+/// rarely-taken path leaves its panels blank and makes a routine restart look like the metric
+/// was removed.
+#[cfg(with_metrics)]
+pub fn init_metrics() {
+    linera_base::init_metrics();
+    linera_cache::init_metrics();
+    linera_chain::init_metrics();
+    linera_execution::init_metrics();
+    linera_views::init_metrics();
+    db_storage::metrics::init_metrics();
 }
 
 #[cfg(test)]
@@ -495,16 +695,14 @@ mod tests {
             Amount, ApplicationPermissions, Blob, BlockHeight, ChainDescription, ChainOrigin,
             Epoch, InitialChainConfig, NetworkDescription, Round, Timestamp,
         },
-        identifiers::{BlobId, BlobType, ChainId, EventId, StreamId},
+        identifiers::{AccountOwner, BlobId, BlobType, ChainId, EventId, StreamId},
         ownership::ChainOwnership,
     };
     use linera_chain::{
         block::{Block, ConfirmedBlock},
         data_types::{BlockExecutionOutcome, ProposedBlock},
     };
-    use linera_execution::BlobState;
-    #[cfg(feature = "dynamodb")]
-    use linera_views::dynamo_db::DynamoDbDatabase;
+    use linera_execution::{BlobOrigin, BlobState};
     #[cfg(feature = "scylladb")]
     use linera_views::scylla_db::ScyllaDbDatabase;
     use linera_views::{memory::MemoryDatabase, ViewError};
@@ -540,8 +738,7 @@ mod tests {
             InitialChainConfig {
                 ownership: ChainOwnership::single(AccountPublicKey::test_key(0).into()),
                 epoch: Epoch::ZERO,
-                min_active_epoch: Epoch::ZERO,
-                max_active_epoch: Epoch::ZERO,
+                account: AccountOwner::CHAIN,
                 balance: Amount::ZERO,
                 application_permissions: ApplicationPermissions::default(),
             },
@@ -575,7 +772,7 @@ mod tests {
 
         // Test single blob read
         let read_blob = storage.read_blob(blob_id1).await?;
-        assert_eq!(read_blob, Some(test_blob1.clone()));
+        assert_eq!(read_blob.as_deref(), Some(&test_blob1));
 
         // Test multiple blob read (read_blobs)
         let blob_ids = vec![blob_id1, blob_id2, blob_id3];
@@ -583,9 +780,9 @@ mod tests {
         assert_eq!(read_blobs.len(), 3);
 
         // Verify each blob was read correctly
-        assert_eq!(read_blobs[0], Some(test_blob1.clone()));
-        assert_eq!(read_blobs[1], Some(test_blob2));
-        assert_eq!(read_blobs[2], Some(test_blob3));
+        assert_eq!(read_blobs[0].as_deref(), Some(&test_blob1));
+        assert_eq!(read_blobs[1].as_deref(), Some(&test_blob2));
+        assert_eq!(read_blobs[2].as_deref(), Some(&test_blob3));
 
         // Test missing blobs detection
         let missing_blob_id = BlobId::new(CryptoHash::test_hash("missing"), BlobType::Data);
@@ -593,20 +790,26 @@ mod tests {
         assert_eq!(missing_blobs, vec![missing_blob_id]);
 
         // Test maybe_write_blobs (should return false as blobs don't have blob states yet)
-        let write_results = storage.maybe_write_blobs(&[test_blob1.clone()]).await?;
+        let write_results = storage
+            .maybe_write_blobs(std::slice::from_ref(&test_blob1))
+            .await?;
         assert_eq!(write_results, vec![false]);
 
         // Test blob state operations
         let blob_state1 = BlobState {
+            origin: BlobOrigin::Published {
+                chain_id: ChainId(CryptoHash::test_hash("chain1")),
+                block_height: BlockHeight(0),
+            },
             last_used_by: None,
-            chain_id: ChainId(CryptoHash::test_hash("chain1")),
-            block_height: BlockHeight(0),
             epoch: Some(Epoch::ZERO),
         };
         let blob_state2 = BlobState {
+            origin: BlobOrigin::Published {
+                chain_id: ChainId(CryptoHash::test_hash("chain2")),
+                block_height: BlockHeight(1),
+            },
             last_used_by: Some(CryptoHash::test_hash("cert")),
-            chain_id: ChainId(CryptoHash::test_hash("chain2")),
-            block_height: BlockHeight(1),
             epoch: Some(Epoch::from(1)),
         };
 
@@ -639,7 +842,9 @@ mod tests {
         assert_eq!(read_blob_states[1], Some(blob_state2));
 
         // Test maybe_write_blobs now that blob states exist (should return true)
-        let write_results = storage.maybe_write_blobs(&[test_blob1.clone()]).await?;
+        let write_results = storage
+            .maybe_write_blobs(std::slice::from_ref(&test_blob1))
+            .await?;
         assert_eq!(write_results, vec![true]);
 
         Ok(())
@@ -659,14 +864,14 @@ mod tests {
 
         // Test reading multiple certificates
         let cert_hashes = vec![cert_hash, CryptoHash::test_hash("cert2")];
-        let certs_result = storage.read_certificates(cert_hashes.clone()).await?;
+        let certs_result = storage.read_certificates(&cert_hashes).await?;
         assert_eq!(certs_result.len(), 2);
         assert!(certs_result[0].is_none());
         assert!(certs_result[1].is_none());
 
         // Test raw certificate reading
-        let raw_certs_result = storage.read_certificates_raw(cert_hashes).await?;
-        assert!(raw_certs_result.is_empty()); // No certificates exist
+        let raw_certs_result = storage.read_certificates_raw(&cert_hashes).await?;
+        assert!(raw_certs_result.iter().all(|cert| cert.is_none())); // No certificates exist
 
         // Test confirmed block reading
         let block_hash = CryptoHash::test_hash("block");
@@ -779,10 +984,10 @@ mod tests {
 
         // Test individual event reading
         let read_event1 = storage.read_event(event_id1).await?;
-        assert_eq!(read_event1, Some(event_data1));
+        assert_eq!(read_event1.as_deref(), Some(&event_data1));
 
         let read_event2 = storage.read_event(event_id2).await?;
-        assert_eq!(read_event2, Some(event_data2));
+        assert_eq!(read_event2.as_deref(), Some(&event_data2));
 
         // Test reading events from index
         let events_from_index = storage
@@ -823,7 +1028,6 @@ mod tests {
 
     /// Generic test function to test Storage trait features
     #[test_case(DbStorage::<MemoryDatabase, _>::make_test_storage(None).await; "memory")]
-    #[cfg_attr(feature = "dynamodb", test_case(DbStorage::<DynamoDbDatabase, _>::make_test_storage(None).await; "dynamo_db"))]
     #[cfg_attr(feature = "scylladb", test_case(DbStorage::<ScyllaDbDatabase, _>::make_test_storage(None).await; "scylla_db"))]
     #[test_log::test(tokio::test)]
     async fn test_storage_features<S: Storage + Sync>(storage: S) -> Result<(), ViewError>

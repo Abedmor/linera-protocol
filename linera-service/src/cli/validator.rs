@@ -9,12 +9,19 @@ use anyhow::Context as _;
 use futures::stream::TryStreamExt as _;
 use linera_base::{
     crypto::{AccountPublicKey, ValidatorPublicKey},
+    data_types::BlockHeight,
     identifiers::ChainId,
 };
 use linera_client::{chain_listener::ClientContext as _, client_context::ClientContext};
-use linera_core::{data_types::ClientOutcome, node::ValidatorNodeProvider, Wallet as _};
+use linera_core::{
+    data_types::ClientOutcome,
+    node::{ValidatorNode, ValidatorNodeProvider},
+    Wallet as _,
+};
 use linera_execution::committee::{Committee, ValidatorState};
 use serde::{Deserialize, Serialize};
+
+use crate::cli::validator_benchmark::Benchmark;
 
 /// Type alias for the complex ClientContext type used throughout validator operations.
 /// This alias helps avoid clippy's type_complexity warnings while maintaining type safety.
@@ -39,9 +46,13 @@ impl FromStr for Votes {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Spec {
+    /// Public key identifying the validator.
     pub public_key: ValidatorPublicKey,
+    /// Account public key for receiving payments and rewards.
     pub account_key: AccountPublicKey,
+    /// Network address where the validator can be reached.
     pub network_address: url::Url,
+    /// Voting weight for consensus.
     #[serde(default)]
     pub votes: Votes,
 }
@@ -50,8 +61,11 @@ pub struct Spec {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Change {
+    /// Account public key for receiving payments and rewards.
     pub account_key: AccountPublicKey,
+    /// Network address where the validator can be reached.
     pub address: url::Url,
+    /// Voting weight for consensus.
     #[serde(default)]
     pub votes: Votes,
 }
@@ -66,17 +80,24 @@ pub type BatchFile = HashMap<ValidatorPublicKey, Option<Change>>;
 /// Structure for batch validator queries from JSON file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryBatch {
+    /// The validator specifications to query.
     pub validators: Vec<Spec>,
 }
 
 /// Validator subcommands.
+// Each variant delegates to a documented args struct; giving the variant its own
+// doc comment would shadow that struct's richer `--help` text, so `missing_docs`
+// is allowed here rather than duplicating those docs.
 #[derive(Debug, Clone, clap::Subcommand)]
+#[allow(missing_docs)]
 pub enum Command {
     Add(Add),
     BatchQuery(BatchQuery),
+    Benchmark(Benchmark),
     Update(Update),
     List(List),
     Query(Query),
+    QueryBlock(QueryBlock),
     Remove(Remove),
     Sync(Sync),
 }
@@ -93,7 +114,7 @@ pub struct Add {
     /// Account public key for receiving payments and rewards
     #[arg(long)]
     account_key: AccountPublicKey,
-    /// Network address where the validator can be reached (e.g., grpcs://host:port)
+    /// Network address where the validator can be reached (e.g., grpcs:host:port)
     #[arg(long)]
     address: url::Url,
     /// Voting weight for consensus (default: 1)
@@ -161,7 +182,7 @@ pub struct List {
 /// view of the blockchain state, including block height and committee information.
 #[derive(Debug, Clone, clap::Parser)]
 pub struct Query {
-    /// Network address of the validator (e.g., grpcs://host:port)
+    /// Network address of the validator (e.g., grpcs:host:port)
     address: String,
     /// Chain ID to query about (defaults to default chain)
     #[arg(long)]
@@ -169,6 +190,25 @@ pub struct Query {
     /// Expected public key of the validator (for verification)
     #[arg(long)]
     public_key: Option<ValidatorPublicKey>,
+}
+
+/// Query a single validator for a block at a particular chain and height.
+///
+/// Connects to a validator at the specified network address and queries its
+/// view of the blockchain.
+#[derive(Debug, Clone, clap::Parser)]
+pub struct QueryBlock {
+    /// Network address of the validator (e.g., grpcs:host:port)
+    address: String,
+    /// Chain ID to query about (defaults to default chain)
+    #[arg(long)]
+    chain_id: Option<ChainId>,
+    /// Expected public key of the validator (for verification)
+    #[arg(long)]
+    public_key: Option<ValidatorPublicKey>,
+    /// Block height to query about
+    #[arg(long)]
+    height: BlockHeight,
 }
 
 /// Remove a validator from the committee.
@@ -188,7 +228,7 @@ pub struct Remove {
 /// ensuring the validator has up-to-date information about specified chains.
 #[derive(Debug, Clone, clap::Parser)]
 pub struct Sync {
-    /// Network address of the validator to sync (e.g., grpcs://host:port)
+    /// Network address of the validator to sync (e.g., grpcs:host:port)
     address: String,
     /// Chain IDs to synchronize (defaults to all chains in wallet)
     #[arg(long)]
@@ -196,6 +236,11 @@ pub struct Sync {
     /// Verify validator is online before syncing
     #[arg(long)]
     check_online: bool,
+    /// Public key of the validator, used to verify its responses. Defaults to the key
+    /// registered for this network address in the current committee; required if the
+    /// validator is not (yet) a committee member.
+    #[arg(long)]
+    public_key: Option<ValidatorPublicKey>,
 }
 
 /// Parse a batch operations file or stdin.
@@ -221,10 +266,12 @@ impl Command {
 
         match self {
             Add(command) => command.run(context).await,
-            BatchQuery(command) => command.run(context).await,
+            BatchQuery(command) => Box::pin(command.run(context)).await,
+            Benchmark(command) => Box::pin(command.run(context)).await,
             Update(command) => command.run(context).await,
             List(command) => command.run(context).await,
             Query(command) => command.run(context).await,
+            QueryBlock(command) => command.run(context).await,
             Remove(command) => command.run(context).await,
             Sync(command) => Box::pin(command.run(context)).await,
         }
@@ -252,11 +299,11 @@ impl Add {
                 .await?;
         }
 
-        let admin_id = context.admin_chain();
-        let chain_client = context.make_chain_client(admin_id).await?;
+        let admin_chain_id = context.admin_chain_id();
+        let chain_client = context.make_chain_client(admin_chain_id).await?;
 
         // Synchronize the chain state
-        chain_client.synchronize_chain_state(admin_id).await?;
+        chain_client.synchronize_chain_state(admin_chain_id).await?;
 
         let maybe_certificate = context
             .apply_client_command(&chain_client, |chain_client| {
@@ -264,7 +311,7 @@ impl Add {
                 let chain_client = chain_client.clone();
                 async move {
                     // Create the new committee.
-                    let mut committee = chain_client.local_committee().await?;
+                    let committee = chain_client.local_committee().await?;
                     let policy = committee.policy().clone();
                     let mut validators = committee.validators().clone();
 
@@ -277,9 +324,9 @@ impl Add {
                         },
                     );
 
-                    committee = Committee::new(validators, policy);
+                    let new_committee = Committee::new(validators, policy)?;
                     chain_client
-                        .stage_new_committee(committee)
+                        .stage_new_committee(new_committee)
                         .await
                         .map(|outcome| outcome.map(Some))
                 }
@@ -302,7 +349,7 @@ impl Add {
 impl BatchQuery {
     async fn run(
         &self,
-        context: &mut ClientContext<impl linera_core::Environment>,
+        context: &ClientContext<impl linera_core::Environment>,
     ) -> anyhow::Result<()> {
         let batch = parse_query_batch_file(self.file.clone())
             .context("parsing query batch file `{file}`")?;
@@ -372,8 +419,8 @@ impl Update {
         let mut removes = Vec::new();
 
         // Get current committee to determine if operation is add or modify
-        let admin_id = context.client().admin_chain();
-        let chain_client = context.make_chain_client(admin_id).await?;
+        let admin_chain_id = context.client().admin_chain_id();
+        let chain_client = context.make_chain_client(admin_chain_id).await?;
         let current_committee = chain_client.local_committee().await?;
         let current_validators = current_committee.validators();
 
@@ -413,7 +460,7 @@ impl Update {
         if !adds.is_empty() {
             println!("Validators to ADD:");
             for (pk, spec) in &adds {
-                println!("  + {}", pk);
+                println!("  + {pk}");
                 println!("    Address:     {}", spec.address);
                 println!("    Account Key: {}", spec.account_key);
                 println!("    Votes:       {}", spec.votes.0.get());
@@ -424,7 +471,7 @@ impl Update {
         if !modifies.is_empty() {
             println!("Validators to MODIFY:");
             for (pk, spec) in &modifies {
-                println!("  * {}", pk);
+                println!("  * {pk}");
                 println!("    New Address:     {}", spec.address);
                 println!("    New Account Key: {}", spec.account_key);
                 println!("    New Votes:       {}", spec.votes.0.get());
@@ -435,7 +482,7 @@ impl Update {
         if !removes.is_empty() {
             println!("Validators to REMOVE:");
             for pk in &removes {
-                println!("  - {}", pk);
+                println!("  - {pk}");
             }
             println!();
         }
@@ -473,7 +520,7 @@ impl Update {
 
             let input = input.trim();
             if input != "YES" {
-                println!("\nOperation cancelled. (Expected 'YES', got '{}')", input);
+                println!("\nOperation cancelled. (Expected 'YES', got '{input}')");
                 return Ok(());
             }
             println!("\nConfirmed. Proceeding with batch update...\n");
@@ -496,11 +543,11 @@ impl Update {
             }
         }
 
-        let admin_id = context.admin_chain();
-        let chain_client = context.make_chain_client(admin_id).await?;
+        let admin_chain_id = context.admin_chain_id();
+        let chain_client = context.make_chain_client(admin_chain_id).await?;
 
         // Synchronize the chain state
-        chain_client.synchronize_chain_state(admin_id).await?;
+        chain_client.synchronize_chain_state(admin_chain_id).await?;
 
         let batch_clone = batch.clone();
         let maybe_certificate = context
@@ -509,7 +556,7 @@ impl Update {
                 let batch = batch_clone.clone();
                 async move {
                     // Get current committee
-                    let mut committee = chain_client.local_committee().await?;
+                    let committee = chain_client.local_committee().await?;
                     let policy = committee.policy().clone();
                     let mut validators = committee.validators().clone();
 
@@ -560,9 +607,9 @@ impl Update {
                     }
 
                     // Create new committee
-                    committee = Committee::new(validators, policy);
+                    let new_committee = Committee::new(validators, policy)?;
                     chain_client
-                        .stage_new_committee(committee)
+                        .stage_new_committee(new_committee)
                         .await
                         .map(|outcome| outcome.map(Some))
                 }
@@ -586,7 +633,7 @@ impl Update {
 impl List {
     async fn run(
         &self,
-        context: &mut ClientContext<impl linera_core::Environment>,
+        context: &ClientContext<impl linera_core::Environment>,
     ) -> anyhow::Result<()> {
         let chain_id = self.chain_id.unwrap_or_else(|| context.default_chain());
         println!("Querying validators about chain {chain_id}.\n");
@@ -632,7 +679,6 @@ impl List {
         // Print local node results first (everything)
         println!("Local Node:");
         local_results.print(None, None, None, None);
-        println!();
 
         // Print validator results (only differences from local node)
         for (name, address, votes, results) in &validator_results {
@@ -659,7 +705,7 @@ impl List {
 impl Query {
     async fn run(
         &self,
-        context: &mut ClientContext<impl linera_core::Environment>,
+        context: &ClientContext<impl linera_core::Environment>,
     ) -> anyhow::Result<()> {
         let node = context.make_node_provider().make_node(&self.address)?;
         let chain_id = self.chain_id.unwrap_or_else(|| context.default_chain());
@@ -686,6 +732,37 @@ impl Query {
     }
 }
 
+impl QueryBlock {
+    async fn run(
+        &self,
+        context: &ClientContext<impl linera_core::Environment>,
+    ) -> anyhow::Result<()> {
+        let node = context.make_node_provider().make_node(&self.address)?;
+        let chain_id = self.chain_id.unwrap_or_else(|| context.default_chain());
+        let height = self.height;
+        println!(
+            "Querying validator about the certificate for height {height} on the chain \
+            {chain_id}.\n"
+        );
+
+        let result = node
+            .download_certificates_by_heights(chain_id, vec![height])
+            .await;
+
+        match result {
+            Ok(certificates) => {
+                let confirmed_block = certificates[0].inner();
+                println!("{confirmed_block:#?}");
+            }
+            Err(error) => {
+                tracing::error!("{}", error);
+            }
+        }
+
+        Ok(())
+    }
+}
+
 impl Remove {
     async fn run(
         &self,
@@ -694,18 +771,18 @@ impl Remove {
         tracing::info!("Starting operation to remove validator");
         let time_start = std::time::Instant::now();
 
-        let admin_id = context.admin_chain();
-        let chain_client = context.make_chain_client(admin_id).await?;
+        let admin_chain_id = context.admin_chain_id();
+        let chain_client = context.make_chain_client(admin_chain_id).await?;
 
         // Synchronize the chain state
-        chain_client.synchronize_chain_state(admin_id).await?;
+        chain_client.synchronize_chain_state(admin_chain_id).await?;
 
         let maybe_certificate = context
             .apply_client_command(&chain_client, |chain_client| {
                 let chain_client = chain_client.clone();
                 async move {
                     // Create the new committee.
-                    let mut committee = chain_client.local_committee().await?;
+                    let committee = chain_client.local_committee().await?;
                     let policy = committee.policy().clone();
                     let mut validators = committee.validators().clone();
 
@@ -714,9 +791,9 @@ impl Remove {
                         return Ok(ClientOutcome::Committed(None));
                     }
 
-                    committee = Committee::new(validators, policy);
+                    let new_committee = Committee::new(validators, policy)?;
                     chain_client
-                        .stage_new_committee(committee)
+                        .stage_new_committee(new_committee)
                         .await
                         .map(|outcome| outcome.map(Some))
                 }
@@ -739,9 +816,7 @@ impl Remove {
 impl Sync {
     async fn run(
         &self,
-        context: &mut ClientContext<
-            impl linera_core::Environment<ValidatorNode = linera_rpc::Client>,
-        >,
+        context: &ClientContext<impl linera_core::Environment<ValidatorNode = linera_rpc::Client>>,
     ) -> anyhow::Result<()> {
         tracing::info!("Starting sync operation for validator at {}", self.address);
 
@@ -774,12 +849,33 @@ impl Sync {
         let node_provider = context.make_node_provider();
         let validator = node_provider.make_node(&self.address)?;
 
+        // The validator's public key, to verify its responses: either given explicitly
+        // or looked up in the current committee by network address.
+        let public_key = match self.public_key {
+            Some(public_key) => public_key,
+            None => {
+                let admin_chain = context.make_chain_client(context.admin_chain_id()).await?;
+                let (_, committee) = admin_chain.admin_committee().await?;
+                let public_key = committee
+                    .validator_addresses()
+                    .find(|(_, address)| *address == self.address)
+                    .map(|(public_key, _)| public_key);
+                public_key.with_context(|| {
+                    format!(
+                        "validator {} is not in the current committee; \
+                         use --public-key to sync it",
+                        self.address
+                    )
+                })?
+            }
+        };
+
         // Sync each chain
         for chain_id in chains_to_sync {
             tracing::info!("Syncing chain {} to {}", chain_id, self.address);
             let chain = context.make_chain_client(chain_id).await?;
 
-            Box::pin(chain.sync_validator(validator.clone())).await?;
+            Box::pin(chain.sync_validator(public_key, validator.clone())).await?;
             tracing::info!("Chain {} synced successfully", chain_id);
         }
 

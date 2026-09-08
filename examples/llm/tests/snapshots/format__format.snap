@@ -1,0 +1,9 @@
+---
+source: llm/tests/format.rs
+expression: "LlmApplication::pruned_formats().unwrap()"
+---
+REGISTRY: {}
+OPERATION: UNIT
+RESPONSE: UNIT
+MESSAGE: UNIT
+EVENT_VALUE: UNIT

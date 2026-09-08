@@ -11,10 +11,11 @@ use linera_base::{
     ensure,
     identifiers::{BlobId, ChainId},
 };
+use linera_cache::Arc as CacheArc;
 use linera_chain::{
     data_types::BlockProposal,
     types::{
-        CertificateValue, ConfirmedBlockCertificate, GenericCertificate, LiteCertificate,
+        CertificateValue, Certified, ConfirmedBlockCertificate, LiteCertificate,
         TimeoutCertificate, ValidatedBlockCertificate,
     },
 };
@@ -28,7 +29,9 @@ use crate::{
 /// A validator node together with the validator's name.
 #[derive(Clone, Debug)]
 pub struct RemoteNode<N> {
+    /// The validator's public key, used to attribute responses and votes to it.
     pub public_key: ValidatorPublicKey,
+    /// The client used to send requests to this validator.
     #[debug(skip)]
     pub node: N,
 }
@@ -64,7 +67,7 @@ impl<N: ValidatorNode> RemoteNode<N> {
 
     pub(crate) async fn handle_confirmed_certificate(
         &self,
-        certificate: ConfirmedBlockCertificate,
+        certificate: CacheArc<ConfirmedBlockCertificate>,
         delivery: CrossChainMessageDelivery,
     ) -> Result<Box<ChainInfo>, NodeError> {
         let chain_id = certificate.inner().chain_id();
@@ -99,50 +102,56 @@ impl<N: ValidatorNode> RemoteNode<N> {
     }
 
     pub(crate) async fn handle_optimized_validated_certificate(
-        &mut self,
+        &self,
         certificate: &ValidatedBlockCertificate,
         delivery: CrossChainMessageDelivery,
     ) -> Result<Box<ChainInfo>, NodeError> {
-        if certificate.is_signed_by(&self.public_key) {
-            let result = self
-                .handle_lite_certificate(certificate.lite_certificate(), delivery)
-                .await;
-            match result {
-                Err(NodeError::MissingCertificateValue) => {
-                    debug!(
-                        address = self.address(),
-                        certificate_hash = %certificate.hash(),
-                        "validator forgot a validated block value that they signed before",
-                    );
-                }
-                _ => return result,
-            }
+        if let Some(result) = self.try_lite_certificate(certificate, delivery).await {
+            return result;
         }
         self.handle_validated_certificate(certificate.clone()).await
     }
 
-    pub(crate) async fn handle_optimized_confirmed_certificate(
-        &mut self,
-        certificate: &ConfirmedBlockCertificate,
+    /// Sends a confirmed certificate, preferring its compact lite form when this validator
+    /// signed it, and falling back to the full certificate otherwise.
+    pub async fn handle_optimized_confirmed_certificate(
+        &self,
+        certificate: &CacheArc<ConfirmedBlockCertificate>,
         delivery: CrossChainMessageDelivery,
     ) -> Result<Box<ChainInfo>, NodeError> {
-        if certificate.is_signed_by(&self.public_key) {
-            let result = self
-                .handle_lite_certificate(certificate.lite_certificate(), delivery)
-                .await;
-            match result {
-                Err(NodeError::MissingCertificateValue) => {
-                    debug!(
-                        address = self.address(),
-                        certificate_hash = %certificate.hash(),
-                        "validator forgot a confirmed block value that they signed before",
-                    );
-                }
-                _ => return result,
-            }
+        let cert: &ConfirmedBlockCertificate = certificate;
+        if let Some(result) = self.try_lite_certificate(cert, delivery).await {
+            return result;
         }
         self.handle_confirmed_certificate(certificate.clone(), delivery)
             .await
+    }
+
+    /// Tries to send a lite certificate if this validator signed it. Returns `Some` on
+    /// success or non-recoverable error, `None` if the full certificate should be sent.
+    async fn try_lite_certificate<C: Certified>(
+        &self,
+        certificate: &C,
+        delivery: CrossChainMessageDelivery,
+    ) -> Option<Result<Box<ChainInfo>, NodeError>> {
+        if !certificate.is_signed_by(&self.public_key) {
+            return None;
+        }
+        let result = self
+            .handle_lite_certificate(certificate.lite_certificate(), delivery)
+            .await;
+        match result {
+            Err(NodeError::MissingCertificateValue) => {
+                debug!(
+                    address = self.address(),
+                    certificate_hash = %certificate.hash(),
+                    kind = ?C::Value::KIND,
+                    "validator forgot a certificate value that they signed before",
+                );
+                None
+            }
+            other => Some(other),
+        }
     }
 
     fn check_and_return_info(
@@ -193,6 +202,9 @@ impl<N: ValidatorNode> RemoteNode<N> {
         Ok(())
     }
 
+    /// Downloads a blob from this validator, returning `None` if it does not have it.
+    ///
+    /// The response is rejected if its hash does not match the requested ID.
     #[instrument(level = "trace")]
     pub async fn download_blob(&self, blob_id: BlobId) -> Result<Option<Blob>, NodeError> {
         match self.node.download_blob(blob_id).await {
@@ -219,6 +231,17 @@ impl<N: ValidatorNode> RemoteNode<N> {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Streams a batch of blobs from the validator. Each yielded item is
+    /// a `Result<Blob, NodeError>` — the caller can drive the stream incrementally
+    /// and, on error, track which blob IDs still need to be fetched.
+    #[instrument(level = "trace")]
+    pub async fn download_blobs(
+        &self,
+        blob_ids: Vec<BlobId>,
+    ) -> Result<crate::node::BlobStream, NodeError> {
+        self.node.download_blobs(blob_ids).await
     }
 
     /// Downloads a list of certificates from the given chain.
@@ -268,13 +291,13 @@ impl<N: ValidatorNode> RemoteNode<N> {
 
     /// Checks that requesting these blobs when trying to handle this certificate is legitimate,
     /// i.e. that there are no duplicates and the blobs are actually required.
-    pub fn check_blobs_not_found<T: CertificateValue>(
+    pub fn check_blobs_not_found<C: Certified>(
         &self,
-        certificate: &GenericCertificate<T>,
+        certificate: &C,
         blob_ids: &[BlobId],
     ) -> Result<(), NodeError> {
         ensure!(!blob_ids.is_empty(), NodeError::EmptyBlobsNotFound);
-        let required = certificate.inner().required_blob_ids();
+        let required = certificate.value().required_blob_ids();
         for blob_id in blob_ids {
             if !required.contains(blob_id) {
                 info!(

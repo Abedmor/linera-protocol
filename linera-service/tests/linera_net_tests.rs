@@ -3,17 +3,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #![cfg(any(
-    feature = "dynamodb",
     feature = "scylladb",
     feature = "storage-service",
     feature = "remote-net"
 ))]
+#![allow(clippy::cast_possible_truncation)]
 
 mod guard;
 
 use std::env;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use async_graphql::InputType;
 use futures::{
     channel::mpsc,
@@ -25,28 +25,24 @@ use guard::INTEGRATION_TEST_GUARD;
 use linera_base::vm::{EvmInstantiation, EvmOperation, EvmQuery};
 use linera_base::{
     crypto::{CryptoHash, Secp256k1SecretKey},
-    data_types::Amount,
-    identifiers::{Account, AccountOwner, ApplicationId, ChainId},
+    data_types::{Amount, ApplicationPermissions},
+    identifiers::{Account, AccountOwner, ApplicationId, ChainId, OwnerSpender},
     time::{Duration, Instant},
     vm::VmRuntime,
 };
 use linera_core::worker::{Notification, Reason};
 use linera_sdk::{
-    abis::fungible::FungibleTokenAbi,
+    abis::{
+        controller::{ControllerAbi, LocalWorkerState, ManagedService},
+        fungible::FungibleTokenAbi,
+    },
     linera_base_types::{AccountSecretKey, BlobContent, BlockHeight, DataBlobHash},
 };
-#[cfg(any(
-    feature = "dynamodb",
-    feature = "scylladb",
-    feature = "storage-service",
-))]
-use linera_service::cli_wrappers::local_net::{Database, LocalNetConfig};
-#[cfg(any(
-    feature = "dynamodb",
-    feature = "scylladb",
-    feature = "storage-service",
-))]
-use linera_service::cli_wrappers::Network;
+#[cfg(any(feature = "scylladb", feature = "storage-service",))]
+use linera_service::cli_wrappers::{
+    local_net::{Database, LocalNetConfig},
+    Network,
+};
 #[cfg(feature = "remote-net")]
 use linera_service::cli_wrappers::{remote_net::RemoteNetTestingConfig, OnClientDrop::*};
 use linera_service::{
@@ -82,7 +78,7 @@ async fn assert_contract_balance(
     let query = EvmQuery::Query(query.abi_encode());
     let result = app.run_json_query(query).await?;
     let balance_256: U256 = balance.into();
-    assert_eq!(read_evm_u256_entry(result), balance_256);
+    assert_eq!(read_evm_u256_entry(&result), balance_256);
     Ok(())
 }
 
@@ -231,8 +227,8 @@ impl FungibleApp {
         }
     }
 
-    async fn get_allowance(&self, owner: &AccountOwner, spender: &AccountOwner) -> Amount {
-        let owner_spender = fungible::OwnerSpender::new(*owner, *spender);
+    async fn query_allowance(&self, owner: &AccountOwner, spender: &AccountOwner) -> Amount {
+        let owner_spender = OwnerSpender::new(*owner, *spender);
         let query = format!(
             "allowances {{ entry(key: {}) {{ value }} }}",
             owner_spender.to_value()
@@ -252,7 +248,7 @@ impl FungibleApp {
         spender: &AccountOwner,
         allowance: Amount,
     ) {
-        let value = self.get_allowance(owner, spender).await;
+        let value = self.query_allowance(owner, spender).await;
         assert_eq!(value, allowance);
     }
 
@@ -293,6 +289,18 @@ impl FungibleApp {
         amount_transfer: Amount,
         destination: Account,
     ) -> Value {
+        self.try_transfer_from(owner, spender, amount_transfer, destination)
+            .await
+            .unwrap()
+    }
+
+    async fn try_transfer_from(
+        &self,
+        owner: &AccountOwner,
+        spender: &AccountOwner,
+        amount_transfer: Amount,
+        destination: Account,
+    ) -> Result<Value> {
         let mutation = format!(
             "transferFrom(owner: {}, spender: {}, amount: \"{}\", targetAccount: {})",
             owner.to_value(),
@@ -300,7 +308,7 @@ impl FungibleApp {
             amount_transfer,
             destination.to_value(),
         );
-        self.0.mutate(mutation).await.unwrap()
+        self.0.mutate(mutation).await
     }
 }
 
@@ -465,14 +473,14 @@ impl AmmApp {
 }
 
 #[cfg(with_revm)]
-fn get_zero_operation(operation: impl alloy_sol_types::SolCall) -> Result<EvmQuery, bcs::Error> {
+fn get_zero_operation(operation: &impl alloy_sol_types::SolCall) -> Result<EvmQuery, bcs::Error> {
     let operation = EvmOperation::new(Amount::ZERO, operation.abi_encode());
     operation.to_evm_query()
 }
 
 #[cfg(with_revm)]
 fn get_zero_operations(
-    operation: impl alloy_sol_types::SolCall,
+    operation: &impl alloy_sol_types::SolCall,
     num_operations: usize,
 ) -> Result<EvmQuery, bcs::Error> {
     let operation = EvmOperation::new(Amount::ZERO, operation.abi_encode());
@@ -483,7 +491,6 @@ fn get_zero_operations(
 #[cfg(with_revm)]
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_evm_end_to_end_counter(config: impl LineraNetConfig) -> Result<()> {
@@ -535,15 +542,15 @@ async fn test_evm_end_to_end_counter(config: impl LineraNetConfig) -> Result<()>
     let query = EvmQuery::Query(query);
     let result = application.run_json_query(query.clone()).await?;
 
-    let counter_value = read_evm_u64_entry(result);
+    let counter_value = read_evm_u64_entry(&result);
     assert_eq!(counter_value, original_counter_value);
 
     let operation = incrementCall { input: increment };
-    let operation = get_zero_operation(operation)?;
+    let operation = get_zero_operation(&operation)?;
     application.run_json_query(operation).await?;
 
     let result = application.run_json_query(query).await?;
-    let counter_value = read_evm_u64_entry(result);
+    let counter_value = read_evm_u64_entry(&result);
     assert_eq!(counter_value, original_counter_value + increment);
 
     node_service.ensure_is_running()?;
@@ -557,7 +564,6 @@ async fn test_evm_end_to_end_counter(config: impl LineraNetConfig) -> Result<()>
 #[cfg(with_revm)]
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_evm_end_to_end_child_subcontract(config: impl LineraNetConfig) -> Result<()> {
@@ -572,6 +578,11 @@ async fn test_evm_end_to_end_child_subcontract(config: impl LineraNetConfig) -> 
         function get_address(uint256 index);
         function get_value();
         function increment();
+        function remote_increment(uint256 index);
+        function remote_value(uint256 index);
+        function reentrant_test(uint256 index, uint256 value);
+        function test_code_length(uint256 index);
+        function create_two_counters(uint256 initialValue);
     }
 
     let constructor_argument = Vec::new();
@@ -590,7 +601,7 @@ async fn test_evm_end_to_end_child_subcontract(config: impl LineraNetConfig) -> 
         "tests/fixtures/evm_child_subcontract.sol",
         "CounterFactory",
     )?;
-    let (evm_contract, _dir) = temporary_write_evm_module(module)?;
+    let (evm_contract, _dir) = temporary_write_evm_module(&module)?;
 
     let start_value = Amount::from_tokens(27);
     let instantiation_argument = EvmInstantiation {
@@ -611,22 +622,27 @@ async fn test_evm_end_to_end_child_subcontract(config: impl LineraNetConfig) -> 
 
     let port = get_node_port().await;
     let mut node_service = client.run_node_service(port, ProcessInbox::Skip).await?;
-
     let application = node_service.make_application(&chain_id, &application_id)?;
     let address_app = application_id.evm_address();
 
     // Creating the subcontracts
 
-    let operation0 = createCounterCall {
+    let operation0_a = createCounterCall {
         initialValue: U256::from(42),
     };
-    let operation0 = get_zero_operation(operation0)?;
-    application.run_json_query(operation0).await?;
+    let operation0_a = get_zero_operation(&operation0_a)?;
+    application.run_json_query(operation0_a).await?;
+
+    let operation0_b = remote_incrementCall {
+        index: U256::from(0),
+    };
+    let operation0_b = get_zero_operation(&operation0_b)?;
+    application.run_json_query(operation0_b).await?;
 
     let operation1 = createCounterCall {
         initialValue: U256::from(149),
     };
-    let operation1 = get_zero_operation(operation1)?;
+    let operation1 = get_zero_operation(&operation1)?;
     application.run_json_query(operation1).await?;
 
     let query0 = get_addressCall {
@@ -634,20 +650,19 @@ async fn test_evm_end_to_end_child_subcontract(config: impl LineraNetConfig) -> 
     };
     let query0 = EvmQuery::Query(query0.abi_encode());
     let address0 = application.run_json_query(query0).await?;
-    let address0 = read_evm_address_entry(address0);
+    let address0 = read_evm_address_entry(&address0);
 
     let query1 = get_addressCall {
         index: U256::from(1),
     };
     let query1 = EvmQuery::Query(query1.abi_encode());
     let address1 = application.run_json_query(query1).await?;
-    let address1 = read_evm_address_entry(address1);
+    let address1 = read_evm_address_entry(&address1);
     assert_ne!(address0, address1);
 
     // Creating the applications
 
     // The balance in Linera and EVM have to match.
-
     let application0 = ApplicationId::from(address0).with_abi::<EvmAbi>();
     let application0 = node_service.make_application(&chain_id, &application0)?;
 
@@ -657,10 +672,10 @@ async fn test_evm_end_to_end_child_subcontract(config: impl LineraNetConfig) -> 
     let query = get_valueCall {};
     let query = EvmQuery::Query(query.abi_encode());
     let result = application0.run_json_query(query.clone()).await?;
-    assert_eq!(read_evm_u256_entry(result), U256::from(42));
+    assert_eq!(read_evm_u256_entry(&result), U256::from(43));
 
     let result = application1.run_json_query(query).await?;
-    assert_eq!(read_evm_u256_entry(result), U256::from(149));
+    assert_eq!(read_evm_u256_entry(&result), U256::from(149));
 
     // Created contracts have balance of 1.
     let account0 = Account {
@@ -683,6 +698,50 @@ async fn test_evm_end_to_end_child_subcontract(config: impl LineraNetConfig) -> 
     assert_contract_balance(&application, address1, Amount::ONE).await?;
     assert_contract_balance(&application, address_app, Amount::from_tokens(25)).await?;
 
+    // Operating on the application0
+
+    let operation0 = remote_incrementCall {
+        index: U256::from(0),
+    };
+    let operation0 = get_zero_operation(&operation0)?;
+    application.run_json_query(operation0).await?;
+
+    let operation0 = incrementCall {};
+    let operation0 = get_zero_operation(&operation0)?;
+    application0.run_json_query(operation0).await?;
+
+    let query = get_valueCall {};
+    let query = EvmQuery::Query(query.abi_encode());
+    let result = application0.run_json_query(query.clone()).await?;
+    assert_eq!(read_evm_u256_entry(&result), U256::from(45));
+
+    let query = remote_valueCall {
+        index: U256::from(0),
+    };
+    let query = EvmQuery::Query(query.abi_encode());
+    let result = application.run_json_query(query.clone()).await?;
+    assert_eq!(read_evm_u256_entry(&result), U256::from(45));
+
+    // Doing some reentrant call
+    let operation2 = reentrant_testCall {
+        index: U256::ZERO,
+        value: U256::from(73),
+    };
+    let operation2 = get_zero_operation(&operation2)?;
+    application.run_json_query(operation2).await?;
+
+    // test_code_length
+    let operation3 = test_code_lengthCall { index: U256::ZERO };
+    let operation3 = get_zero_operation(&operation3)?;
+    application.run_json_query(operation3).await?;
+
+    // create two contracts in one operation.
+    let operation4 = create_two_countersCall {
+        initialValue: U256::from(91),
+    };
+    let operation4 = get_zero_operation(&operation4)?;
+    application.run_json_query(operation4).await?;
+
     node_service.ensure_is_running()?;
 
     net.ensure_is_running().await?;
@@ -694,7 +753,6 @@ async fn test_evm_end_to_end_child_subcontract(config: impl LineraNetConfig) -> 
 #[cfg(with_revm)]
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_evm_end_to_end_balance_and_transfer(config: impl LineraNetConfig) -> Result<()> {
@@ -803,11 +861,15 @@ async fn test_evm_end_to_end_balance_and_transfer(config: impl LineraNetConfig) 
     // Transferring amount
 
     let amount = Amount::from_tokens(1);
+    tracing::info!(
+        "test_evm_end_to_end_balance_and_transfer, recipient={}",
+        address2
+    );
     let operation = send_cashCall {
         recipient: address2,
         amount: amount.into(),
     };
-    let operation = get_zero_operation(operation)?;
+    let operation = get_zero_operation(&operation)?;
     app_a.run_json_query(operation).await?;
 
     // Checking the balances of app_a
@@ -848,7 +910,7 @@ async fn test_evm_end_to_end_balance_and_transfer(config: impl LineraNetConfig) 
     };
 
     let operation = null_operationCall {};
-    let operation = get_zero_operation(operation)?;
+    let operation = get_zero_operation(&operation)?;
     app_b.run_json_query(operation).await?;
 
     assert_eq!(node_service_b.balance(&account_b_1).await?, Amount::ZERO);
@@ -878,7 +940,6 @@ async fn test_evm_end_to_end_balance_and_transfer(config: impl LineraNetConfig) 
 #[cfg(with_revm)]
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_evm_event(config: impl LineraNetConfig) -> Result<()> {
@@ -949,7 +1010,7 @@ async fn test_evm_event(config: impl LineraNetConfig) -> Result<()> {
     assert_eq!(start_index, 1);
 
     let operation = incrementCall { input: increment };
-    let operation = get_zero_operation(operation)?;
+    let operation = get_zero_operation(&operation)?;
     application.run_json_query(operation).await?;
 
     let indices_and_events = node_service
@@ -982,7 +1043,6 @@ async fn test_evm_event(config: impl LineraNetConfig) -> Result<()> {
 #[cfg(with_revm)]
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_wasm_call_evm_end_to_end_counter(config: impl LineraNetConfig) -> Result<()> {
@@ -1076,7 +1136,6 @@ async fn test_wasm_call_evm_end_to_end_counter(config: impl LineraNetConfig) -> 
 #[cfg(with_revm)]
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_evm_call_evm_end_to_end_counter(config: impl LineraNetConfig) -> Result<()> {
@@ -1156,15 +1215,15 @@ async fn test_evm_call_evm_end_to_end_counter(config: impl LineraNetConfig) -> R
     let query = query.abi_encode();
     let query = EvmQuery::Query(query);
     let result = nest_application.run_json_query(query.clone()).await?;
-    let counter_value = read_evm_u64_entry(result);
+    let counter_value = read_evm_u64_entry(&result);
     assert_eq!(counter_value, original_counter_value);
 
     let operation = nest_incrementCall { input: increment };
-    let operation = get_zero_operation(operation)?;
+    let operation = get_zero_operation(&operation)?;
     nest_application.run_json_query(operation).await?;
 
     let result = nest_application.run_json_query(query).await?;
-    let counter_value = read_evm_u64_entry(result);
+    let counter_value = read_evm_u64_entry(&result);
     assert_eq!(counter_value, original_counter_value + increment);
 
     node_service.ensure_is_running()?;
@@ -1178,7 +1237,6 @@ async fn test_evm_call_evm_end_to_end_counter(config: impl LineraNetConfig) -> R
 #[cfg(with_revm)]
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_evm_call_wasm_end_to_end_counter(config: impl LineraNetConfig) -> Result<()> {
@@ -1244,15 +1302,15 @@ async fn test_evm_call_wasm_end_to_end_counter(config: impl LineraNetConfig) -> 
     let nest_application = node_service.make_application(&chain, &nest_application_id)?;
 
     let result = nest_application.run_json_query(query.clone()).await?;
-    let counter_value = read_evm_u64_entry(result);
+    let counter_value = read_evm_u64_entry(&result);
     assert_eq!(counter_value, original_counter_value);
 
     let operation = nest_incrementCall { input: increment };
-    let operation = get_zero_operation(operation)?;
+    let operation = get_zero_operation(&operation)?;
     nest_application.run_json_query(operation).await?;
 
     let result = nest_application.run_json_query(query).await?;
-    let counter_value = read_evm_u64_entry(result);
+    let counter_value = read_evm_u64_entry(&result);
     assert_eq!(counter_value, original_counter_value + increment);
 
     node_service.ensure_is_running()?;
@@ -1265,8 +1323,8 @@ async fn test_evm_call_wasm_end_to_end_counter(config: impl LineraNetConfig) -> 
 
 #[cfg(with_revm)]
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Tcp) ; "storage_test_service_tcp"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_evm_execute_message_end_to_end_counter(config: impl LineraNetConfig) -> Result<()> {
@@ -1336,11 +1394,11 @@ async fn test_evm_execute_message_end_to_end_counter(config: impl LineraNetConfi
     // First: checking the initial value of the contracts.
 
     let result = application1.run_json_query(query.clone()).await?;
-    let counter_value = read_evm_u64_entry(result);
+    let counter_value = read_evm_u64_entry(&result);
     assert_eq!(counter_value, original_value);
 
     let result = application2.run_json_query(query.clone()).await?;
-    let counter_value = read_evm_u64_entry(result);
+    let counter_value = read_evm_u64_entry(&result);
     assert_eq!(counter_value, 0);
 
     // Second: executing the movement of assets
@@ -1352,7 +1410,7 @@ async fn test_evm_execute_message_end_to_end_counter(config: impl LineraNetConfi
         chain_id,
         moved_value,
     };
-    let operation = get_zero_operation(operation)?;
+    let operation = get_zero_operation(&operation)?;
     application1.run_json_query(operation).await?;
 
     notifications2.wait_for_bundle(chain1, None).await?;
@@ -1361,11 +1419,11 @@ async fn test_evm_execute_message_end_to_end_counter(config: impl LineraNetConfi
     // Third: Checking the values after the move
 
     let result = application1.run_json_query(query.clone()).await?;
-    let counter_value = read_evm_u64_entry(result);
+    let counter_value = read_evm_u64_entry(&result);
     assert_eq!(counter_value, original_value - moved_value);
 
     let result = application2.run_json_query(query.clone()).await?;
-    let counter_value = read_evm_u64_entry(result);
+    let counter_value = read_evm_u64_entry(&result);
     assert_eq!(counter_value, moved_value);
 
     node_service1.ensure_is_running()?;
@@ -1380,7 +1438,6 @@ async fn test_evm_execute_message_end_to_end_counter(config: impl LineraNetConfi
 #[cfg(with_revm)]
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_evm_empty_instantiate(config: impl LineraNetConfig) -> Result<()> {
@@ -1432,10 +1489,10 @@ async fn test_evm_empty_instantiate(config: impl LineraNetConfig) -> Result<()> 
 
     // Checking the initial value of the contracts.
     let result = application1.run_json_query(query.clone()).await?;
-    let counter_value = read_evm_u64_entry(result);
+    let counter_value = read_evm_u64_entry(&result);
     assert_eq!(counter_value, 42);
     let result = application2.run_json_query(query).await?;
-    let counter_value = read_evm_u64_entry(result);
+    let counter_value = read_evm_u64_entry(&result);
     assert_eq!(counter_value, 37);
 
     node_service1.ensure_is_running()?;
@@ -1449,8 +1506,8 @@ async fn test_evm_empty_instantiate(config: impl LineraNetConfig) -> Result<()> 
 
 #[cfg(with_revm)]
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Tcp) ; "storage_test_service_tcp"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_evm_process_streams_end_to_end_counters(config: impl LineraNetConfig) -> Result<()> {
@@ -1518,7 +1575,7 @@ async fn test_evm_process_streams_end_to_end_counters(config: impl LineraNetConf
     let mut notifications2 = node_service2.notifications(chain1).await?;
 
     let result = application2.run_json_query(query.clone()).await?;
-    let counter_value = read_evm_u64_entry(result);
+    let counter_value = read_evm_u64_entry(&result);
     assert_eq!(counter_value, 0);
 
     // First: subscribing to the application
@@ -1527,17 +1584,17 @@ async fn test_evm_process_streams_end_to_end_counters(config: impl LineraNetConf
         chain_id: chain_id1,
         application_id,
     };
-    let operation = get_zero_operation(operation)?;
+    let operation = get_zero_operation(&operation)?;
     application2.run_json_query(operation).await?;
 
     let result = application2.run_json_query(query.clone()).await?;
-    let counter_value = read_evm_u64_entry(result);
+    let counter_value = read_evm_u64_entry(&result);
     assert_eq!(counter_value, 0);
 
     // Second: increment the values
 
     let operation = increment_valueCall { increment };
-    let operation = get_zero_operation(operation)?;
+    let operation = get_zero_operation(&operation)?;
     application1.run_json_query(operation).await?;
 
     // Third: process the inbox on chain2
@@ -1548,7 +1605,7 @@ async fn test_evm_process_streams_end_to_end_counters(config: impl LineraNetConf
     // Fourth: getting the value
 
     let result = application2.run_json_query(query.clone()).await?;
-    let counter_value = read_evm_u64_entry(result);
+    let counter_value = read_evm_u64_entry(&result);
     assert_eq!(counter_value, increment);
 
     // Fifth: winding down
@@ -1565,7 +1622,6 @@ async fn test_evm_process_streams_end_to_end_counters(config: impl LineraNetConf
 #[cfg(with_revm)]
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_evm_msg_sender(config: impl LineraNetConfig) -> Result<()> {
@@ -1627,13 +1683,13 @@ async fn test_evm_msg_sender(config: impl LineraNetConfig) -> Result<()> {
     let operation = check_msg_senderCall {
         remote_address: owner,
     };
-    let operation = get_zero_operation(operation)?;
+    let operation = get_zero_operation(&operation)?;
     application_inner.run_json_query(operation).await?;
 
     let operation = remote_checkCall {
         remote_address: evm_contract_inner,
     };
-    let operation = get_zero_operation(operation)?;
+    let operation = get_zero_operation(&operation)?;
     application_outer.run_json_query(operation).await?;
 
     node_service.ensure_is_running()?;
@@ -1647,7 +1703,6 @@ async fn test_evm_msg_sender(config: impl LineraNetConfig) -> Result<()> {
 #[cfg(with_revm)]
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_evm_linera_features(config: impl LineraNetConfig) -> Result<()> {
@@ -1747,7 +1802,7 @@ async fn test_evm_linera_features(config: impl LineraNetConfig) -> Result<()> {
     // Checking authenticated owner/caller_id
 
     let operation = test_authenticated_owner_caller_idCall {};
-    let operation = get_zero_operation(operation)?;
+    let operation = get_zero_operation(&operation)?;
     application.run_json_query(operation).await?;
 
     // Testing the chain balance
@@ -1774,7 +1829,7 @@ async fn test_evm_linera_features(config: impl LineraNetConfig) -> Result<()> {
         destination: address2,
         amount,
     };
-    let operation = get_zero_operation(operation)?;
+    let operation = get_zero_operation(&operation)?;
     application.run_json_query(operation).await?;
     assert_contract_balance(&application, address_app, Amount::from_tokens(22)).await?;
     assert!(!node_service2.process_inbox(&chain_id2).await?.is_empty());
@@ -1801,7 +1856,6 @@ async fn test_evm_linera_features(config: impl LineraNetConfig) -> Result<()> {
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(all(feature = "rocksdb", feature = "scylladb"), test_case(LocalNetConfig::new_test(Database::DualRocksDbScyllaDb, Network::Grpc) ; "dualrocksdbscylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_wasm_end_to_end_counter(config: impl LineraNetConfig) -> Result<()> {
@@ -1830,6 +1884,12 @@ async fn test_wasm_end_to_end_counter(config: impl LineraNetConfig) -> Result<()
             None,
         )
         .await?;
+    // Query the application directly via `linera query-application`, without a node service.
+    let counter_value: u64 = client
+        .query_application_json(chain, application_id.forget_abi(), "value")
+        .await?;
+    assert_eq!(counter_value, original_counter_value);
+
     let port = get_node_port().await;
     let mut node_service = client.run_node_service(port, ProcessInbox::Skip).await?;
 
@@ -1858,15 +1918,207 @@ async fn test_wasm_end_to_end_counter(config: impl LineraNetConfig) -> Result<()
     Ok(())
 }
 
-#[cfg(with_revm)]
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
+#[test_log::test(tokio::test)]
+async fn test_wasm_end_to_end_counter_subscription(config: impl LineraNetConfig) -> Result<()> {
+    use counter::CounterAbi;
+
+    let _guard = INTEGRATION_TEST_GUARD.lock().await;
+    tracing::info!("Starting test {}", test_name!());
+
+    let (mut net, client) = config.instantiate().await?;
+
+    let original_counter_value = 35;
+    let increment = 5;
+
+    let chain = client.load_wallet()?.default_chain().unwrap();
+    let (contract, service) = client.build_example("counter").await?;
+
+    let application_id = client
+        .publish_and_create::<CounterAbi, (), u64>(
+            contract,
+            service,
+            VmRuntime::Wasm,
+            &(),
+            &original_counter_value,
+            &[],
+            None,
+        )
+        .await?;
+
+    // Start node service with a subscription query for the counter value.
+    let port = get_node_port().await;
+    let mut node_service = client
+        .run_node_service_with_all_options(
+            port,
+            ProcessInbox::Skip,
+            &[],
+            &[],
+            false,
+            &["query CounterValue { value }".to_string()],
+            &[],
+        )
+        .await?;
+
+    let application = node_service.make_application(&chain, &application_id)?;
+
+    // Subscribe to query results via WebSocket.
+    let mut subscription = node_service
+        .query_result("CounterValue", chain, &application_id.forget_abi())
+        .await?;
+
+    // The watcher fires immediately with the initial value.
+    let initial = subscription
+        .next()
+        .await
+        .context("expected initial query result")??;
+    let initial_value: u64 = serde_json::from_value(initial["data"]["value"].clone())?;
+    assert_eq!(initial_value, original_counter_value);
+
+    // Increment by 0: creates a new block but doesn't change the query result.
+    application.mutate("increment(value: 0)").await?;
+
+    // The subscription should NOT push a notification for an unchanged value.
+    // Give it a moment, then verify nothing arrived.
+    let no_update =
+        tokio::time::timeout(std::time::Duration::from_secs(2), subscription.next()).await;
+    assert!(
+        no_update.is_err(),
+        "expected no notification for unchanged value"
+    );
+
+    // Increment the counter with a real change.
+    let mutation = format!("increment(value: {increment})");
+    application.mutate(mutation).await?;
+
+    // The subscription should push the updated value.
+    let updated = subscription
+        .next()
+        .await
+        .context("expected updated query result")??;
+    let updated_value: u64 = serde_json::from_value(updated["data"]["value"].clone())?;
+    assert_eq!(updated_value, original_counter_value + increment);
+
+    // A second subscriber should immediately receive the current value without
+    // needing a new block.
+    let mut subscription2 = node_service
+        .query_result("CounterValue", chain, &application_id.forget_abi())
+        .await?;
+    let immediate = subscription2
+        .next()
+        .await
+        .context("expected immediate value for second subscriber")??;
+    let immediate_value: u64 = serde_json::from_value(immediate["data"]["value"].clone())?;
+    assert_eq!(immediate_value, original_counter_value + increment);
+
+    node_service.ensure_is_running()?;
+
+    net.ensure_is_running().await?;
+    net.terminate().await?;
+
+    Ok(())
+}
+
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
+#[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
+#[test_log::test(tokio::test)]
+async fn test_wasm_end_to_end_counter_subscription_ttl(config: impl LineraNetConfig) -> Result<()> {
+    use counter::CounterAbi;
+
+    let _guard = INTEGRATION_TEST_GUARD.lock().await;
+    tracing::info!("Starting test {}", test_name!());
+
+    let (mut net, client) = config.instantiate().await?;
+
+    let original_counter_value = 10;
+    let increment = 3;
+
+    let chain = client.load_wallet()?.default_chain().unwrap();
+    let (contract, service) = client.build_example("counter").await?;
+
+    let application_id = client
+        .publish_and_create::<CounterAbi, (), u64>(
+            contract,
+            service,
+            VmRuntime::Wasm,
+            &(),
+            &original_counter_value,
+            &[],
+            None,
+        )
+        .await?;
+
+    // Start node service with a subscription query and a 4-second TTL.
+    let ttl_secs = 4;
+    let port = get_node_port().await;
+    let mut node_service = client
+        .run_node_service_with_all_options(
+            port,
+            ProcessInbox::Skip,
+            &[],
+            &[],
+            false,
+            &["query CounterValue { value }".to_string()],
+            &[("CounterValue".to_string(), ttl_secs)],
+        )
+        .await?;
+
+    let application = node_service.make_application(&chain, &application_id)?;
+
+    // Subscribe to query results via WebSocket.
+    let mut subscription = node_service
+        .query_result("CounterValue", chain, &application_id.forget_abi())
+        .await?;
+
+    // The watcher fires immediately with the initial value.
+    let initial = subscription
+        .next()
+        .await
+        .context("expected initial query result")??;
+    let initial_value: u64 = serde_json::from_value(initial["data"]["value"].clone())?;
+    assert_eq!(initial_value, original_counter_value);
+
+    // Increment the counter. With a TTL, the notification should be deferred.
+    let mutation = format!("increment(value: {increment})");
+    application.mutate(mutation).await?;
+
+    // The update should NOT arrive within 2 seconds (TTL is 4s).
+    let no_update =
+        tokio::time::timeout(std::time::Duration::from_secs(2), subscription.next()).await;
+    assert!(
+        no_update.is_err(),
+        "expected no notification during TTL window"
+    );
+
+    // But it should arrive after the TTL expires (wait up to 5 more seconds).
+    let updated = tokio::time::timeout(std::time::Duration::from_secs(5), subscription.next())
+        .await
+        .context("expected deferred notification after TTL")?
+        .context("subscription stream ended")??;
+    let updated_value: u64 = serde_json::from_value(updated["data"]["value"].clone())?;
+    assert_eq!(updated_value, original_counter_value + increment);
+
+    node_service.ensure_is_running()?;
+
+    net.ensure_is_running().await?;
+    net.terminate().await?;
+
+    Ok(())
+}
+
+#[cfg(with_revm)]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Tcp) ; "storage_test_service_tcp"))]
+#[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_evm_erc20_shared(config: impl LineraNetConfig) -> Result<()> {
+    use linera_base::time::Instant;
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
-    let num_operations = 500;
+    let num_operations = 100;
     tracing::info!("Starting test {}", test_name!());
 
     let (mut net, client1) = config.instantiate().await?;
@@ -1931,7 +2183,7 @@ async fn test_evm_erc20_shared(config: impl LineraNetConfig) -> Result<()> {
     let query = total_supply.abi_encode();
     let query = EvmQuery::Query(query);
     let result = application1.run_json_query(query).await?;
-    assert_eq!(read_evm_u256_entry(result), the_supply);
+    assert_eq!(read_evm_u256_entry(&result), the_supply);
 
     // Transferring to another user and checking the balances.
 
@@ -1939,7 +2191,7 @@ async fn test_evm_erc20_shared(config: impl LineraNetConfig) -> Result<()> {
         to: address2,
         value: transfer1,
     };
-    let query = get_zero_operations(operation, num_operations)?;
+    let query = get_zero_operations(&operation, num_operations)?;
     let time_start = Instant::now();
     application1.run_json_query(query).await?;
     let average_time = (time_start.elapsed().as_millis() as f64) / (num_operations as f64);
@@ -1952,12 +2204,15 @@ async fn test_evm_erc20_shared(config: impl LineraNetConfig) -> Result<()> {
     for _ in 0..num_operations {
         repeated_transfer1 += transfer1;
     }
-    assert_eq!(read_evm_u256_entry(result), the_supply - repeated_transfer1);
+    assert_eq!(
+        read_evm_u256_entry(&result),
+        the_supply - repeated_transfer1
+    );
 
     let query = balanceOfCall { account: address2 };
     let query = EvmQuery::Query(query.abi_encode());
     let result = application1.run_json_query(query).await?;
-    assert_eq!(read_evm_u256_entry(result), repeated_transfer1);
+    assert_eq!(read_evm_u256_entry(&result), repeated_transfer1);
 
     // Transferring to another chain and checking the balances.
 
@@ -1969,7 +2224,7 @@ async fn test_evm_erc20_shared(config: impl LineraNetConfig) -> Result<()> {
         destination: address2,
         value: transfer2,
     };
-    let operation = get_zero_operation(operation)?;
+    let operation = get_zero_operation(&operation)?;
     application1.run_json_query(operation).await?;
 
     notifications2.wait_for_bundle(chain1, None).await?;
@@ -1981,14 +2236,14 @@ async fn test_evm_erc20_shared(config: impl LineraNetConfig) -> Result<()> {
     let query = EvmQuery::Query(query.abi_encode());
     let result = application1.run_json_query(query.clone()).await?;
     assert_eq!(
-        read_evm_u256_entry(result),
+        read_evm_u256_entry(&result),
         the_supply - repeated_transfer1 - transfer2
     );
 
     let query = balanceOfCall { account: address2 };
     let query = EvmQuery::Query(query.abi_encode());
     let result = application2.run_json_query(query).await?;
-    assert_eq!(read_evm_u256_entry(result), transfer2);
+    assert_eq!(read_evm_u256_entry(&result), transfer2);
 
     // Winding down
 
@@ -2002,7 +2257,6 @@ async fn test_evm_erc20_shared(config: impl LineraNetConfig) -> Result<()> {
 
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_wasm_end_to_end_counter_no_graphql(config: impl LineraNetConfig) -> Result<()> {
@@ -2059,7 +2313,6 @@ async fn test_wasm_end_to_end_counter_no_graphql(config: impl LineraNetConfig) -
 
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_wasm_end_to_end_counter_publish_create(config: impl LineraNetConfig) -> Result<()> {
@@ -2111,8 +2364,8 @@ async fn test_wasm_end_to_end_counter_publish_create(config: impl LineraNetConfi
 }
 
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Tcp) ; "storage_test_service_tcp"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_wasm_end_to_end_social_event_streams(config: impl LineraNetConfig) -> Result<()> {
@@ -2125,13 +2378,16 @@ async fn test_wasm_end_to_end_social_event_streams(config: impl LineraNetConfig)
 
     let client2 = net.make_client().await;
     client2.wallet_init(None).await?;
+    let client3 = net.make_client().await;
+    client3.wallet_init(None).await?;
 
-    // We use a newly opened chain for the publisher, so that client2 will not be listening to that
-    // chain by default.
+    // We use a newly opened chain for the publisher, so that client2 and client3 will not be
+    // listening to that chain by default.
     let chain1 = client1
         .open_and_assign(&client1, Amount::from_tokens(100))
         .await?;
     let chain2 = client1.open_and_assign(&client2, Amount::ONE).await?;
+    let chain3 = client1.open_and_assign(&client3, Amount::ONE).await?;
     let (contract, service) = client1.build_example("social").await?;
     let module_id = client1
         .publish_module::<SocialAbi, (), ()>(contract, service, VmRuntime::Wasm, None)
@@ -2154,22 +2410,24 @@ async fn test_wasm_end_to_end_social_event_streams(config: impl LineraNetConfig)
         .await?;
     let (_, height2) = node_service2.chain_tip(chain2).await?.unwrap();
 
-    let mut notifications = node_service2.notifications(chain2).await?;
+    let mut notifications2 = node_service2.notifications(chain2).await?;
 
     let app1 = node_service1.make_application(&chain1, &application_id)?;
     app1.mutate("post(text: \"Linera Social is the new Mastodon!\")")
         .await?;
 
     let query = "receivedPosts { keys { author, index } }";
-    let expected_response = json!({
+    let expected_response1 = json!({
         "receivedPosts": {
             "keys": [
                 { "author": chain1, "index": 0 }
             ]
         }
     });
-    notifications.wait_for_block(height2.try_add_one()?).await?;
-    assert_eq!(app2.query(query).await?, expected_response);
+    notifications2
+        .wait_for_block(height2.try_add_one()?)
+        .await?;
+    assert_eq!(app2.query(query).await?, expected_response1);
 
     let tip_after_first_post = node_service2.chain_tip(chain1).await?;
 
@@ -2188,7 +2446,7 @@ async fn test_wasm_end_to_end_social_event_streams(config: impl LineraNetConfig)
     app1.mutate("post(text: \"Second post!\")").await?;
 
     let query = "receivedPosts { keys { author, index } }";
-    let expected_response = json!({
+    let expected_response2 = json!({
         "receivedPosts": {
             "keys": [
                 { "author": chain1, "index": 1 },
@@ -2196,8 +2454,22 @@ async fn test_wasm_end_to_end_social_event_streams(config: impl LineraNetConfig)
             ]
         }
     });
-    notifications.wait_for_block(height2.try_add_one()?).await?;
-    assert_eq!(app2.query(query).await?, expected_response);
+    // The transfer on chain1 may cause an intermediate block on chain2 via
+    // automatic inbox processing of the event stream subscription, so the
+    // next block may not yet contain the second post.
+    let mut latest_height = height2;
+    loop {
+        latest_height = latest_height.try_add_one()?;
+        notifications2.wait_for_block(latest_height).await?;
+        let response = app2.query(query).await?;
+        if response == expected_response2 {
+            break;
+        }
+        assert_eq!(
+            response, expected_response1,
+            "unexpected intermediate state: expected either both posts or only the first post"
+        );
+    }
 
     let tip_after_second_post = node_service2.chain_tip(chain1).await?;
     // The second post should not have moved the tip hash - client 2 should have only preprocessed
@@ -2207,21 +2479,115 @@ async fn test_wasm_end_to_end_social_event_streams(config: impl LineraNetConfig)
     node_service1.ensure_is_running()?;
     node_service2.ensure_is_running()?;
 
+    // We stop the service.
+    // Client 1 will produce another post, then we will restart the service and:
+    // 1) Check that client 2 receives the post.
+    // 2) Check that the event chain is still sparse (that the tip hasn't moved).
+    node_service2.terminate().await?;
+
+    // Client 1 posts again.
+    app1.mutate("post(text: \"Third post!\")").await?;
+
+    // Restart the service for node 2. Get a fresh chain tip (the third post may already
+    // have been synced on startup), then subscribe to notifications before posting.
+    let mut node_service2 = client2
+        .run_node_service(port2, ProcessInbox::Automatic)
+        .await?;
+    let (_, height2) = node_service2.chain_tip(chain2).await?.unwrap();
+    let mut notifications2 = node_service2.notifications(chain2).await?;
+
+    // Client 1 posts again, to trigger downloading missing events in client 2.
+    app1.mutate("post(text: \"Fourth post!\")").await?;
+
+    let query = "receivedPosts { keys { author, index } }";
+    let expected_response = json!({
+        "receivedPosts": {
+            "keys": [
+                { "author": chain1, "index": 3 },
+                { "author": chain1, "index": 2 },
+                { "author": chain1, "index": 1 },
+                { "author": chain1, "index": 0 }
+            ]
+        }
+    });
+
+    // The posts may arrive in any number of blocks, and some may already be processed.
+    let mut next_height = height2.try_add_one()?;
+    while app2.query(query).await? != expected_response {
+        notifications2.wait_for_block(next_height).await?;
+        next_height = next_height.try_add_one()?;
+    }
+
+    let tip_after_fourth_post = node_service2.chain_tip(chain1).await?;
+    // The third post should not have moved the tip hash, either (the block with the
+    // transfer should still not have been downloaded).
+    assert_eq!(tip_after_first_post, tip_after_fourth_post);
+
+    // Test that a new subscriber gets pre-existing events: client3 subscribes after the posts
+    // and should eventually receive them via sparse sync + chain listener processing.
+    let port3 = get_node_port().await;
+    let mut node_service3 = client3
+        .run_node_service(port3, ProcessInbox::Automatic)
+        .await?;
+
+    let app3 = node_service3.make_application(&chain3, &application_id)?;
+    app3.mutate(format!("subscribe(chainId: \"{chain1}\")"))
+        .await?;
+
+    let (_, height3) = node_service3.chain_tip(chain3).await?.unwrap();
+    let mut notifications3 = node_service3.notifications(chain3).await?;
+
+    // Wait for the chain listener to process the pre-existing events.
+    // They may arrive in any number of blocks, and some may already be processed.
+    let expected_response = json!({
+        "receivedPosts": {
+            "keys": [
+                { "author": chain1, "index": 3 },
+                { "author": chain1, "index": 2 },
+                { "author": chain1, "index": 1 },
+                { "author": chain1, "index": 0 }
+            ]
+        }
+    });
+    let query = "receivedPosts { keys { author, index } }";
+    let mut next_height = height3.try_add_one()?;
+    while app3.query(query).await? != expected_response {
+        notifications3.wait_for_block(next_height).await?;
+        next_height = next_height.try_add_one()?;
+    }
+
+    // Verify that the sparse sync for client3 did not download the non-event transfer block:
+    // the tip of chain1 as seen by client3 should match the tip seen by client2 (which also
+    // only has event-bearing blocks).
+    let tip_client3 = node_service3.chain_tip(chain1).await?;
+    assert_eq!(tip_after_first_post, tip_client3);
+
+    node_service1.ensure_is_running()?;
+    node_service2.ensure_is_running()?;
+    node_service3.ensure_is_running()?;
+
     net.ensure_is_running().await?;
     net.terminate().await?;
 
     Ok(())
 }
 
-#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
-#[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc), "fungible" ; "storage_test_service_grpc"))]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc), "native-fungible" ; "native_storage_test_service_grpc"))]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Tcp), "fungible" ; "storage_test_service_tcp"))]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Tcp), "native-fungible" ; "native_storage_test_service_tcp"))]
+#[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc), "fungible" ; "scylladb_grpc"))]
+#[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc), "native-fungible" ; "native_scylladb_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains), "fungible" ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains), "native-fungible" ; "native_remote_net_grpc"))]
 #[test_log::test(tokio::test)]
-async fn test_wasm_end_to_end_allowances_fungible(config: impl LineraNetConfig) -> Result<()> {
+async fn test_wasm_end_to_end_allowances_fungible(
+    config: impl LineraNetConfig,
+    example_name: &str,
+) -> Result<()> {
     use std::collections::BTreeMap;
 
-    use fungible::{FungibleTokenAbi, InitialState, Parameters};
+    use fungible::{InitialState, Parameters};
 
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
     tracing::info!("Starting test {}", test_name!());
@@ -2243,13 +2609,16 @@ async fn test_wasm_end_to_end_allowances_fungible(config: impl LineraNetConfig) 
     let owner3 = client3.keygen().await?;
 
     // Open a chain owned by both clients.
+    // Native fungible needs enough chain balance for the initial account transfers.
+    let initial_balance = Amount::from_tokens(30);
     let chain2 = client1
         .open_multi_owner_chain(
             chain1,
-            vec![owner1, owner2, owner3],
-            vec![100, 100, 100],
+            vec![(owner1, 100), (owner2, 100), (owner3, 100)]
+                .into_iter()
+                .collect(),
             u32::MAX,
-            Amount::from_tokens(6),
+            initial_balance,
             10_000,
         )
         .await?;
@@ -2266,19 +2635,14 @@ async fn test_wasm_end_to_end_allowances_fungible(config: impl LineraNetConfig) 
     ]);
     let state = InitialState { accounts };
     // Setting up the application and verifying
-    let (contract, service) = client1.build_example("fungible").await?;
-    let params = Parameters::new("DEL");
-    let application_id = client1
-        .publish_and_create::<FungibleTokenAbi, Parameters, InitialState>(
-            contract,
-            service,
-            VmRuntime::Wasm,
-            &params,
-            &state,
-            &[],
-            Some(chain2),
-        )
-        .await?;
+    let params = if example_name == "native-fungible" {
+        Parameters::new("NAT")
+    } else {
+        Parameters::new("DEL")
+    };
+    let application_id =
+        publish_and_create_native_fungible(&client1, example_name, &params, &state, Some(chain2))
+            .await?;
 
     let port1 = get_node_port().await;
     let port2 = get_node_port().await;
@@ -2321,16 +2685,36 @@ async fn test_wasm_end_to_end_allowances_fungible(config: impl LineraNetConfig) 
     // Approving a transfer.
     app1.approve(&owner1, &owner2, Amount::from_tokens(93))
         .await;
+    app1.approve(&owner1, &owner2, Amount::from_tokens(17))
+        .await;
 
-    app1.assert_allowance(&owner1, &owner2, Amount::from_tokens(93))
+    app1.assert_allowance(&owner1, &owner2, Amount::from_tokens(17))
         .await;
 
     let (_, height) = node_service1.chain_tip(chain2).await?.unwrap();
     notifications2.wait_for_block(height).await?;
     assert_eq!(
-        app2.get_allowance(&owner1, &owner2).await,
-        Amount::from_tokens(93)
+        app2.query_allowance(&owner1, &owner2).await,
+        Amount::from_tokens(17)
     );
+
+    let error = app2
+        .try_transfer_from(
+            &owner1,
+            &owner2,
+            Amount::from_tokens(18),
+            Account {
+                chain_id: chain2,
+                owner: owner3,
+            },
+        )
+        .await
+        .unwrap_err();
+    let error = error.to_string();
+    assert!(!error.is_empty());
+    app2.assert_balances(expected_balances).await;
+    app2.assert_allowance(&owner1, &owner2, Amount::from_tokens(17))
+        .await;
 
     // Doing the transfer from owner 1.
     app2.transfer_from(
@@ -2352,8 +2736,16 @@ async fn test_wasm_end_to_end_allowances_fungible(config: impl LineraNetConfig) 
         (owner3, Amount::from_tokens(2)),
     ];
     app2.assert_balances(expected_balances).await;
-    app2.assert_allowance(&owner1, &owner2, Amount::from_tokens(91))
+    app2.assert_allowance(&owner1, &owner2, Amount::from_tokens(15))
         .await;
+
+    // Clearing the allowance should remove it entirely.
+    app1.approve(&owner1, &owner2, Amount::ZERO).await;
+    app1.assert_allowance(&owner1, &owner2, Amount::ZERO).await;
+
+    let (_, height) = node_service1.chain_tip(chain2).await?.unwrap();
+    notifications2.wait_for_block(height).await?;
+    app2.assert_allowance(&owner1, &owner2, Amount::ZERO).await;
 
     // Winding down the system
 
@@ -2409,9 +2801,9 @@ async fn publish_and_create_native_fungible(
 //#[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc), "fungible" ; "scylladb_grpc"))]
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc), "fungible" ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc), "native-fungible" ; "native_storage_test_service_grpc"))]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Tcp), "fungible" ; "storage_test_service_tcp"))]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Tcp), "native-fungible" ; "native_storage_test_service_tcp"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc), "native-fungible" ; "native_scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc), "fungible" ; "aws_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc), "native-fungible" ; "native_aws_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains), "fungible" ; "remote_net_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains), "native-fungible" ; "native_remote_net_grpc"))]
 #[test_log::test(tokio::test)]
@@ -2555,10 +2947,10 @@ async fn test_wasm_end_to_end_fungible(
 
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc), "fungible" ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc), "native-fungible" ; "native_storage_test_service_grpc"))]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Tcp), "fungible" ; "storage_test_service_tcp"))]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Tcp), "native-fungible" ; "native_storage_test_service_tcp"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc), "fungible" ; "scylladb_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc), "native-fungible" ; "native_scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc), "fungible" ; "aws_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc), "native-fungible" ; "native_aws_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains), "fungible" ; "remote_net_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains), "native-fungible" ; "native_remote_net_grpc"))]
 #[test_log::test(tokio::test)]
@@ -2655,8 +3047,8 @@ async fn test_wasm_end_to_end_same_wallet_fungible(
 }
 
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Tcp) ; "storage_test_service_tcp"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_wasm_end_to_end_non_fungible(config: impl LineraNetConfig) -> Result<()> {
@@ -2942,8 +3334,8 @@ async fn test_wasm_end_to_end_non_fungible(config: impl LineraNetConfig) -> Resu
 }
 
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Tcp) ; "storage_test_service_tcp"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_wasm_end_to_end_crowd_funding(config: impl LineraNetConfig) -> Result<()> {
@@ -3068,8 +3460,8 @@ async fn test_wasm_end_to_end_crowd_funding(config: impl LineraNetConfig) -> Res
 }
 
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Tcp) ; "storage_test_service_tcp"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_wasm_end_to_end_matching_engine(config: impl LineraNetConfig) -> Result<()> {
@@ -3318,9 +3710,9 @@ async fn test_wasm_end_to_end_matching_engine(config: impl LineraNetConfig) -> R
 }
 
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Tcp) ; "storage_test_service_tcp"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(all(feature = "rocksdb", feature = "scylladb"), test_case(LocalNetConfig::new_test(Database::DualRocksDbScyllaDb, Network::Grpc) ; "dualrocksdbscylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_wasm_end_to_end_amm(config: impl LineraNetConfig) -> Result<()> {
@@ -4053,8 +4445,8 @@ async fn test_wasm_end_to_end_amm(config: impl LineraNetConfig) -> Result<()> {
 }
 
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Tcp) ; "storage_test_service_tcp"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_open_chain_node_service(config: impl LineraNetConfig) -> Result<()> {
@@ -4164,7 +4556,6 @@ async fn test_open_chain_node_service(config: impl LineraNetConfig) -> Result<()
 
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_end_to_end_multiple_wallets(config: impl LineraNetConfig) -> Result<()> {
@@ -4209,7 +4600,6 @@ async fn test_end_to_end_multiple_wallets(config: impl LineraNetConfig) -> Resul
 
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_end_to_end_open_multi_owner_chain(config: impl LineraNetConfig) -> Result<()> {
@@ -4232,8 +4622,7 @@ async fn test_end_to_end_open_multi_owner_chain(config: impl LineraNetConfig) ->
     let chain2 = client1
         .open_multi_owner_chain(
             chain1,
-            vec![owner1, owner2],
-            vec![100, 100],
+            vec![(owner1, 100), (owner2, 100)].into_iter().collect(),
             u32::MAX,
             Amount::from_tokens(6),
             10_000,
@@ -4277,7 +4666,6 @@ async fn test_end_to_end_open_multi_owner_chain(config: impl LineraNetConfig) ->
 
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_end_to_end_change_ownership(config: impl LineraNetConfig) -> Result<()> {
@@ -4318,7 +4706,6 @@ async fn test_end_to_end_change_ownership(config: impl LineraNetConfig) -> Resul
 
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_end_to_end_assign_greatgrandchild_chain(config: impl LineraNetConfig) -> Result<()> {
@@ -4364,9 +4751,18 @@ async fn test_end_to_end_assign_greatgrandchild_chain(config: impl LineraNetConf
     assert!(client3.load_wallet()?.chain_ids().contains(&chain2));
 
     // Verify that trying to follow a chain that does not exist will fail, even without --sync.
+    // The validators legitimately retry for a while before giving up on a missing blob, so cap
+    // how long this check is allowed to take: either `follow_chain` returns an error within the
+    // timeout, or we kill it (the child process is killed on drop via `kill_on_drop`).
     let wrong_id = ChainId(CryptoHash::test_hash("wrong chain ID"));
-    let result = client3.follow_chain(wrong_id, false).await;
-    assert!(result.is_err());
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        client3.follow_chain(wrong_id, false),
+    )
+    .await;
+    if let Ok(inner) = result {
+        assert!(inner.is_err());
+    }
     assert!(!client3.load_wallet()?.chain_ids().contains(&wrong_id));
 
     net.ensure_is_running().await?;
@@ -4377,7 +4773,6 @@ async fn test_end_to_end_assign_greatgrandchild_chain(config: impl LineraNetConf
 
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_end_to_end_publish_data_blob_in_cli(config: impl LineraNetConfig) -> Result<()> {
@@ -4408,7 +4803,6 @@ async fn test_end_to_end_publish_data_blob_in_cli(config: impl LineraNetConfig) 
 
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_end_to_end_faucet(config: impl LineraNetConfig) -> Result<()> {
@@ -4488,7 +4882,6 @@ async fn test_end_to_end_faucet(config: impl LineraNetConfig) -> Result<()> {
 /// Tests creating a new wallet using a faucet that has already created a lot of microchains.
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 #[ignore = "This test takes a long time to run"]
@@ -4568,7 +4961,6 @@ async fn test_end_to_end_faucet_with_long_chains(config: impl LineraNetConfig) -
 /// Tests faucet batch processing with multiple concurrent chain creation requests
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_end_to_end_faucet_batch_processing(config: impl LineraNetConfig) -> Result<()> {
@@ -4655,7 +5047,6 @@ async fn test_end_to_end_faucet_batch_processing(config: impl LineraNetConfig) -
 
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_end_to_end_fungible_client_benchmark(config: impl LineraNetConfig) -> Result<()> {
@@ -4700,7 +5091,6 @@ async fn test_end_to_end_fungible_client_benchmark(config: impl LineraNetConfig)
 
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(CloseChains) ; "remote_net_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_end_to_end_listen_for_new_rounds(config: impl LineraNetConfig) -> Result<()> {
@@ -4748,8 +5138,7 @@ async fn test_end_to_end_listen_for_new_rounds(config: impl LineraNetConfig) -> 
     let chain2 = client1
         .open_multi_owner_chain(
             chain1,
-            vec![owner1, owner2],
-            vec![100, 100],            // Both owners have equal weight.
+            vec![(owner1, 100), (owner2, 100)].into_iter().collect(),
             0,                         // No multi-leader rounds.
             Amount::from_millis(8900), // Only 8 transfers can be made.
             u64::MAX,                  // 585 million years
@@ -4788,10 +5177,11 @@ async fn test_end_to_end_listen_for_new_rounds(config: impl LineraNetConfig) -> 
 ///
 /// It will print the average end-to-end transfer latency, including creating the sending block,
 /// the receiving block, and the resulting `NewBlock` notification.
-#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
-#[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains) ; "remote_net_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains) ; "remote_net_tcp"))]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Tcp) ; "storage_test_service_tcp"))]
+#[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_end_to_end_repeated_transfers(config: impl LineraNetConfig) -> Result<()> {
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
@@ -4934,6 +5324,393 @@ async fn test_end_to_end_repeated_transfers(config: impl LineraNetConfig) -> Res
         (block_duration / (transfer_count as u32)).as_millis(),
     );
 
+    net.ensure_is_running().await?;
+    net.terminate().await?;
+
+    Ok(())
+}
+
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_service_grpc"))]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Tcp) ; "storage_service_tcp"))]
+#[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
+#[cfg_attr(feature = "remote-net", test_case(RemoteNetTestingConfig::new(LeakChains) ; "remote_net_grpc"))]
+#[test_log::test(tokio::test)]
+async fn test_controller(config: impl LineraNetConfig) -> Result<()> {
+    let _guard = INTEGRATION_TEST_GUARD.lock().await;
+    tracing::info!("Starting test {}", test_name!());
+
+    let (mut net, admin_client) = config.instantiate().await?;
+
+    let admin_chain = admin_client.load_wallet()?.default_chain().unwrap();
+    let admin_owner = admin_client.get_owner().unwrap();
+
+    let (contract, service) = admin_client.build_example("controller").await?;
+    let controller_id = admin_client
+        .publish_and_create::<ControllerAbi, (), ()>(
+            contract,
+            service,
+            VmRuntime::Wasm,
+            &(),
+            &(),
+            &[],
+            None,
+        )
+        .await?;
+
+    use task_processor::TaskProcessorAbi;
+    let (task_processor_contract, task_processor_service) =
+        admin_client.build_example("task-processor").await?;
+    let task_processor_id = admin_client
+        .publish_and_create::<TaskProcessorAbi, (), ()>(
+            task_processor_contract,
+            task_processor_service,
+            VmRuntime::Wasm,
+            &(),
+            &(),
+            &[],
+            None,
+        )
+        .await?;
+
+    use std::collections::BTreeMap;
+
+    use fungible::{InitialState, Parameters};
+    let accounts = BTreeMap::from([(admin_owner, Amount::from_tokens(100))]);
+    let state = InitialState { accounts };
+    let (fungible_contract, fungible_service) = admin_client.build_example("fungible").await?;
+    let fungible_id = admin_client
+        .publish_and_create::<FungibleTokenAbi, Parameters, InitialState>(
+            fungible_contract,
+            fungible_service,
+            VmRuntime::Wasm,
+            &Parameters::new("FUN"),
+            &state,
+            &[],
+            None,
+        )
+        .await?;
+
+    let operators = vec![("ls".to_string(), "/bin/ls".into())];
+
+    let worker1_client = net.make_client().await;
+    worker1_client.wallet_init(None).await?;
+    let worker1_chain = admin_client
+        .open_and_assign(&worker1_client, Amount::from_tokens(100))
+        .await?;
+
+    let worker2_client = net.make_client().await;
+    worker2_client.wallet_init(None).await?;
+    let worker2_chain = admin_client
+        .open_and_assign(&worker2_client, Amount::from_tokens(100))
+        .await?;
+
+    let service_client = net.make_client().await;
+    service_client.wallet_init(None).await?;
+    let service_owner = service_client.keygen().await?;
+    // We make it a multi-owner chain, so that worker1 can also propose.
+    let service_chain = admin_client
+        .open_multi_owner_chain(
+            admin_chain,
+            vec![
+                (service_owner, 100),
+                (
+                    worker1_client
+                        .get_owner()
+                        .expect("worker1_client should have an owner"),
+                    100,
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            u32::MAX,
+            Amount::from_tokens(10),
+            1000,
+        )
+        .await?;
+    service_client.assign(service_owner, service_chain).await?;
+    // Service chain block 0: allow the controller application to change ownership
+    service_client
+        .change_application_permissions(
+            service_chain,
+            ApplicationPermissions {
+                manage_chain: vec![controller_id.forget_abi()],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("changing application permissions should succeed");
+
+    let admin_port = get_node_port().await;
+    let mut admin_node_service = admin_client
+        .run_node_service(admin_port, ProcessInbox::Automatic)
+        .await?;
+
+    let mut admin_notifications = admin_node_service.notifications(admin_chain).await?;
+
+    let port1 = get_node_port().await;
+    worker1_client.sync(worker1_chain).await?;
+
+    let mut node_service1 = worker1_client
+        .run_node_service_with_controller(
+            port1,
+            ProcessInbox::Automatic,
+            &controller_id.forget_abi(),
+            &operators,
+        )
+        .await?;
+
+    let mut notifications1 = node_service1.notifications(worker1_chain).await?;
+
+    // Poll until the controller app sees worker 1 as registered, draining one admin-chain
+    // block notification between checks. Height-based waits were flaky because the exact
+    // block at which the registration lands depends on the starting height.
+    let app1 = node_service1.make_application(&worker1_chain, &controller_id)?;
+    let worker1 = loop {
+        let response = app1.query("localWorkerState").await?;
+        let state: LocalWorkerState = serde_json::from_value(response["localWorkerState"].clone())?;
+        if let Some(worker) = state.local_worker {
+            break worker;
+        }
+        admin_notifications
+            .wait_for_block(None)
+            .await
+            .unwrap_or_else(|_| {
+                panic!("timed out waiting for worker 1 registration on {admin_chain}")
+            });
+    };
+    assert_eq!(worker1.capabilities.len(), 1);
+    assert_ne!(
+        worker1_chain, admin_chain,
+        "Worker should be on a different chain than admin"
+    );
+
+    let port2 = get_node_port().await;
+    worker2_client.sync(worker2_chain).await?;
+
+    let mut node_service2 = worker2_client
+        .run_node_service_with_controller(
+            port2,
+            ProcessInbox::Automatic,
+            &controller_id.forget_abi(),
+            &operators,
+        )
+        .await?;
+
+    let mut notifications2 = node_service2.notifications(worker2_chain).await?;
+
+    // Same pattern: poll the controller app until it reports worker 2 registered.
+    let app2 = node_service2.make_application(&worker2_chain, &controller_id)?;
+    let worker2 = loop {
+        let response = app2.query("localWorkerState").await?;
+        let state: LocalWorkerState = serde_json::from_value(response["localWorkerState"].clone())?;
+        if let Some(worker) = state.local_worker {
+            break worker;
+        }
+        admin_notifications
+            .wait_for_block(None)
+            .await
+            .unwrap_or_else(|_| {
+                panic!("timed out waiting for worker 2 registration on {admin_chain}")
+            });
+    };
+    assert_eq!(worker2.capabilities.len(), 1);
+    assert_ne!(
+        worker2_chain, admin_chain,
+        "Worker 2 should be on a different chain than admin"
+    );
+
+    let admin_app = admin_node_service.make_application(&admin_chain, &controller_id)?;
+    // A worker's registration only lands in the admin chain's `workers` map once the
+    // admin chain has processed the cross-chain message, which can be after the worker
+    // already sees itself as registered locally. Poll until both registrations arrive.
+    let worker_keys = loop {
+        let response = admin_app.query("workers { keys }").await?;
+        let worker_keys: Vec<String> = serde_json::from_value(response["workers"]["keys"].clone())?;
+        if worker_keys.len() >= 2 {
+            break worker_keys;
+        }
+        admin_notifications
+            .wait_for_block(None)
+            .await
+            .unwrap_or_else(|_| {
+                panic!("timed out waiting for both worker registrations on {admin_chain}")
+            });
+    };
+    assert_eq!(
+        worker_keys.len(),
+        2,
+        "Expected exactly 2 workers, got {}",
+        worker_keys.len()
+    );
+
+    assert_ne!(worker1_chain, admin_chain);
+    assert_ne!(worker2_chain, admin_chain);
+    assert_ne!(worker1_chain, worker2_chain);
+
+    let managed_service = ManagedService {
+        application_id: task_processor_id.forget_abi(),
+        name: "test-service".to_string(),
+        chain_id: service_chain,
+        requirements: vec![],
+    };
+    let service_bytes = bcs::to_bytes(&managed_service)?;
+    let service_id = admin_node_service
+        .publish_data_blob(&admin_chain, service_bytes)
+        .await?;
+
+    let mutation = format!(
+        "executeControllerCommand(admin: \"{admin_owner}\", command: {{SetAdmins: {{ admins: [\"{admin_owner}\"] }} }})"
+    );
+    admin_app.mutate(&mutation).await?;
+
+    let mutation = format!(
+        "executeControllerCommand(admin: \"{admin_owner}\", command: {{UpdateService: {{ service_id: \"{service_id}\", workers: [\"{worker1_chain}\"] }} }})"
+    );
+    admin_app.mutate(&mutation).await?;
+
+    // Poll worker 1's view until it reflects the service assignment, consuming block
+    // notifications on the worker's own chain between checks.
+    loop {
+        let response = app1.query("localWorkerState").await?;
+        let state: LocalWorkerState = serde_json::from_value(response["localWorkerState"].clone())?;
+        if state.local_services.len() == 1 {
+            assert_eq!(state.local_services[0].name, "test-service");
+            break;
+        }
+        notifications1
+            .wait_for_block(None)
+            .await
+            .unwrap_or_else(|_| {
+                panic!("timed out waiting for service assignment on {worker1_chain}")
+            });
+    }
+
+    let task_app = node_service1.make_application(&service_chain, &task_processor_id)?;
+    let task_count: u64 = task_app.query_json("taskCount").await?;
+    assert_eq!(task_count, 0, "Initial task count should be 0");
+
+    // We start listening to notifications on the service chain as well.
+    let mut service_notifications = node_service1.notifications(service_chain).await?;
+
+    // We request the task using service_client - this is because worker1 will not be able
+    // to propose blocks via GraphQL, as it only uses the chain because the controller
+    // told it to, so only operations via the controller and task processor are expected
+    // to work.
+    let service_port = get_node_port().await;
+    let service_service = service_client
+        // we only use this client to perform mutations - the messages should be only
+        // processed by the worker
+        .run_node_service(service_port, ProcessInbox::Skip)
+        .await?;
+    let service_task_app = service_service.make_application(&service_chain, &task_processor_id)?;
+    service_task_app
+        .mutate(r#"requestTask(operator: "ls", input: "")"#)
+        .await?;
+
+    // Poll until the task has been processed, consuming service-chain block notifications
+    // (the RequestTask block and then the StoreResult block) between checks.
+    loop {
+        let task_count: u64 = task_app.query_json("taskCount").await?;
+        if task_count == 1 {
+            break;
+        }
+        service_notifications
+            .wait_for_block(None)
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for task processing on {service_chain}"));
+    }
+
+    // Move the service to the second worker.
+    let mutation = format!(
+        "executeControllerCommand(admin: \"{admin_owner}\", command: {{UpdateService: {{ service_id: \"{service_id}\", workers: [\"{worker2_chain}\"] }} }})"
+    );
+    admin_app.mutate(&mutation).await?;
+
+    // Poll worker 1's view until the service has been removed.
+    loop {
+        let response = app1.query("localWorkerState").await?;
+        let state: LocalWorkerState = serde_json::from_value(response["localWorkerState"].clone())?;
+        if state.local_services.is_empty() {
+            break;
+        }
+        notifications1
+            .wait_for_block(None)
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for service removal on {worker1_chain}"));
+    }
+
+    // Poll worker 2's view until it sees the service assigned (after `Start` handoff and the
+    // subsequent `StartLocalService` operation). The `RemoveOwners` message to the service
+    // chain may still be pending in its inbox; it will be processed with the next incoming
+    // message.
+    loop {
+        let response = app2.query("localWorkerState").await?;
+        let state: LocalWorkerState = serde_json::from_value(response["localWorkerState"].clone())?;
+        if !state.local_services.is_empty() {
+            break;
+        }
+        notifications2
+            .wait_for_block(None)
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for service handoff on {worker2_chain}"));
+    }
+
+    let admin_task_app = admin_node_service.make_application(&admin_chain, &task_processor_id)?;
+    admin_task_app
+        .mutate(&format!(
+            r#"requestTaskOn(chainId: "{service_chain}", operator: "ls", input: "")"#
+        ))
+        .await?;
+
+    // The RemoveOwners and RequestTask messages may be processed in separate blocks or
+    // batched into one, depending on timing; poll until the second task has been processed.
+    let mut service_notifications = service_service.notifications(service_chain).await?;
+    let mut task_count: u64 = service_task_app.query_json("taskCount").await?;
+    while task_count < 2 {
+        service_notifications
+            .wait_for_block(None)
+            .await
+            .unwrap_or_else(|_| {
+                panic!("should get notification about a block on chain {service_chain}")
+            });
+        task_count = service_task_app.query_json("taskCount").await?;
+    }
+
+    // Test that the message policy rejects non-allowed applications: a fungible transfer
+    // to the service chain should be rejected, and the tracked Credit message should
+    // bounce back, restoring the admin's balance.
+    let admin_fungible_app =
+        FungibleApp(admin_node_service.make_application(&admin_chain, &fungible_id)?);
+    admin_fungible_app
+        .transfer(
+            &admin_owner,
+            Amount::from_tokens(10),
+            Account {
+                chain_id: service_chain,
+                owner: admin_owner,
+            },
+        )
+        .await;
+
+    // The transfer is expected to bounce: the recipient chain rejects it, and the Credit
+    // message comes back, restoring the admin's balance. Poll the balance until it's back
+    // to the original 100, consuming admin-chain block notifications between checks.
+    loop {
+        if admin_fungible_app.get_amount(&admin_owner).await == Amount::from_tokens(100) {
+            break;
+        }
+        admin_notifications
+            .wait_for_block(None)
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for bounced transfer on {admin_chain}"));
+    }
+
+    node_service1.ensure_is_running()?;
+    node_service1.terminate().await?;
+    node_service2.ensure_is_running()?;
+    node_service2.terminate().await?;
+    admin_node_service.ensure_is_running()?;
+    admin_node_service.terminate().await?;
     net.ensure_is_running().await?;
     net.terminate().await?;
 

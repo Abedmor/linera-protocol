@@ -51,62 +51,64 @@
       </div>
     </div>
 
-    <script type="importmap">
-      {
-          "imports": {
-              "@linera/client": "./js/@linera/client/dist/index.js"
-          }
-      }
-    </script>
-
     <script type="module">
-      import * as linera from '@linera/client';
-      import * as linera_metamask from '@linera/metamask';
+     import * as linera from '@linera/client';
+     import * as linera_metamask from '@linera/metamask';
 
-      async function run() {
-          await linera.initialize();
-          const faucet = await new linera.Faucet(import.meta.env.LINERA_FAUCET_URL);
-          const signer = await new linera_metamask.Signer();
-          const wallet = await faucet.createWallet();
-          const owner = await signer.address();
-          document.getElementById('owner').innerText = owner;
-          document.getElementById('chain-id').innerText = await faucet.claimChain(wallet, owner);
-          const client = await new linera.Client(wallet, signer);
-          const counter = await client.application(import.meta.env.LINERA_APPLICATION_ID);
-          const logs = document.getElementById('logs');
-          const incrementButton = document.getElementById('increment-btn');
-          const blockTemplate = document.getElementById('block-template');
+     const logs = document.getElementById('logs');
+     const incrementButton = document.getElementById('increment-btn');
+     const blockTemplate = document.getElementById('block-template');
 
-          function addLogEntry(block) {
-              const entry = logs.getElementsByTagName('template')[0].content.cloneNode(true);
-              entry.querySelector('.height').textContent = block.height;
-              entry.querySelector('.hash').textContent = block.hash;
-              logs.insertBefore(entry, logs.firstChild);
-          }
+     // Initialize the Linera client and set up the MetaMask signer.
+     await linera.initialize();
+     const faucet = await new linera.Faucet(import.meta.env.LINERA_FAUCET_URL);
+     const signer = await new linera_metamask.Signer();
+     const wallet = await faucet.createWallet();
+     const owner = await signer.address();
+     const chainId = await faucet.claimChain(wallet, owner);
+     document.getElementById('owner').innerText = owner;
+     document.getElementById('chain-id').innerText = chainId;
 
-          async function updateCount() {
-              const response = await counter.query('{ "query": "query { value }" }');
-              document.getElementById('count').innerText
-                  = JSON.parse(response).data.value;
-          }
+     // For autosigning: first we set up a local (in-memory) signer, and provide it to the
+     // client along with the MetaMask signer.
+     // We set it as the default owner of the chain in the wallet.
+     const autosigner = linera.signer.PrivateKey.createRandom();
+     wallet.setOwner(chainId, autosigner.address());
 
-          updateCount();
-          client.onNotification(notification => {
-              let newBlock = notification.reason.NewBlock;
-              if (!newBlock) return;
-              addLogEntry(newBlock);
-              updateCount();
-          });
+     const client = await new linera.Client(wallet, new linera.signer.Composite(autosigner, signer));
+     const chain = await client.chain(chainId, { owner });
 
-          incrementButton.addEventListener('click', () => {
-              counter.query('{ "query": "mutation { increment(value: 1) }" }');
-          });
-      }
+     // For autosigning: we then add the in-memory signer as an owner of the chain to allow it to sign transactions.
+     await chain.addOwner(autosigner.address());
 
-      if (document.readyState === 'loading')
-          document.addEventListener('DOMContentLoaded', run);
-      else
-          run();
+     // Connect to the counter application on the chain.
+     const counter = await chain.application(import.meta.env.LINERA_APPLICATION_ID);
+
+     // When we get a new block, show it in the UI and update the counter from the chain state.
+     chain.onNotification(notification => {
+         let newBlock = notification.reason.NewBlock;
+         if (!newBlock) return;
+         addLogEntry(newBlock);
+         updateCount(newBlock.hash);
+     });
+
+     function addLogEntry(block) {
+         const entry = logs.getElementsByTagName('template')[0].content.cloneNode(true);
+         entry.querySelector('.height').textContent = block.height;
+         entry.querySelector('.hash').textContent = block.hash;
+         logs.insertBefore(entry, logs.firstChild);
+     }
+
+     async function updateCount(blockHash) {
+         const response = await counter.query('{ "query": "query { value }" }', { blockHash });
+         document.getElementById('count').innerText = JSON.parse(response).data.value;
+     }
+
+     updateCount();
+
+     incrementButton.addEventListener('click', () => {
+         counter.query('{ "query": "mutation { increment(value: 1) }" }');
+     });
     </script>
   </body>
 </html>

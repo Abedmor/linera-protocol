@@ -4,16 +4,20 @@ interface contract-runtime-api {
     authenticated-owner: func() -> option<account-owner>;
     message-is-bouncing: func() -> option<bool>;
     message-origin-chain-id: func() -> option<chain-id>;
+    message-origin-timestamp: func() -> option<timestamp>;
     authenticated-caller-id: func() -> option<application-id>;
     send-message: func(message: send-message-request);
     transfer: func(source: account-owner, destination: account, amount: amount);
     claim: func(source: account, destination: account, amount: amount);
-    open-chain: func(chain-ownership: chain-ownership, application-permissions: application-permissions, balance: amount) -> chain-id;
-    close-chain: func() -> result<tuple<>, close-chain-error>;
-    change-application-permissions: func(application-permissions: application-permissions) -> result<tuple<>, change-application-permissions-error>;
+    approve: func(owner: account-owner, spender: account-owner, amount: amount);
+    transfer-from: func(owner: account-owner, spender: account-owner, destination: account, amount: amount);
+    open-chain: func(chain-ownership: chain-ownership, application-permissions: application-permissions, account: account-owner, balance: amount) -> chain-id;
+    close-chain: func() -> result<tuple<>, manage-chain-error>;
+    change-ownership: func(ownership: chain-ownership) -> result<tuple<>, manage-chain-error>;
+    change-application-permissions: func(application-permissions: application-permissions) -> result<tuple<>, manage-chain-error>;
     create-application: func(module-id: module-id, parameters: list<u8>, argument: list<u8>, required-application-ids: list<application-id>) -> application-id;
     create-data-blob: func(bytes: list<u8>) -> data-blob-hash;
-    publish-module: func(contract: bytecode, service: bytecode, vm-runtime: vm-runtime) -> module-id;
+    publish-module: func(contract: bytecode, service: bytecode, vm-runtime: vm-runtime, formats: option<list<u8>>) -> module-id;
     try-call-application: func(authenticated: bool, callee-id: application-id, argument: list<u8>) -> list<u8>;
     emit: func(name: stream-name, value: list<u8>) -> u32;
     read-event: func(chain-id: chain-id, name: stream-name, index: u32) -> list<u8>;
@@ -21,6 +25,7 @@ interface contract-runtime-api {
     unsubscribe-from-events: func(chain-id: chain-id, application-id: application-id, name: stream-name);
     query-service: func(application-id: application-id, query: list<u8>) -> list<u8>;
     consume-fuel: func(fuel: u64);
+    remaining-fuel: func() -> u64;
     validation-round: func() -> option<u32>;
     write-batch: func(operations: list<write-operation>);
     has-empty-storage: func(application: application-id) -> bool;
@@ -47,8 +52,7 @@ interface contract-runtime-api {
     record application-permissions {
         execute-operations: option<list<application-id>>,
         mandatory-applications: list<application-id>,
-        close-chain: list<application-id>,
-        change-application-permissions: list<application-id>,
+        manage-chain: list<application-id>,
         call-service-as-oracle: option<list<application-id>>,
         make-http-requests: option<list<application-id>>,
     }
@@ -76,14 +80,6 @@ interface contract-runtime-api {
         timeout-config: timeout-config,
     }
 
-    enum change-application-permissions-error {
-        not-permitted,
-    }
-
-    enum close-chain-error {
-        not-permitted,
-    }
-
     record crypto-hash {
         part1: u64,
         part2: u64,
@@ -95,10 +91,15 @@ interface contract-runtime-api {
         inner0: crypto-hash,
     }
 
+    enum manage-chain-error {
+        not-permitted,
+    }
+
     record module-id {
         contract-blob-hash: crypto-hash,
         service-blob-hash: crypto-hash,
         vm-runtime: vm-runtime,
+        formats-blob-hash: option<crypto-hash>,
     }
 
     record resources {
@@ -115,7 +116,6 @@ interface contract-runtime-api {
         blob-bytes-to-publish: u32,
         messages: u32,
         message-size: u32,
-        storage-size-delta: u32,
         service-as-oracle-queries: u32,
         http-requests: u32,
     }
@@ -141,6 +141,10 @@ interface contract-runtime-api {
         base-timeout: time-delta,
         timeout-increment: time-delta,
         fallback-duration: time-delta,
+    }
+
+    record timestamp {
+        inner0: u64,
     }
 
     type u128 = tuple<u64, u64>;

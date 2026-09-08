@@ -3,11 +3,11 @@
 
 //! This module tracks the resources used during the execution of a transaction.
 
-use std::{sync::Arc, time::Duration};
+use std::{fmt, sync::Arc, time::Duration};
 
 use custom_debug_derive::Debug;
 use linera_base::{
-    data_types::{Amount, ArithmeticError, Blob},
+    data_types::{Amount, ApplicationDescription, ArithmeticError, Blob},
     ensure,
     identifiers::AccountOwner,
     ownership::ChainOwnership,
@@ -18,6 +18,7 @@ use serde::Serialize;
 
 use crate::{ExecutionError, Message, Operation, ResourceControlPolicy, SystemExecutionStateView};
 
+/// Tracks and controls the resources used during execution, charging fees against an account.
 #[derive(Clone, Debug, Default)]
 pub struct ResourceController<Account = Amount, Tracker = ResourceTracker> {
     /// The (fixed) policy used to charge fees and control resource usage.
@@ -26,6 +27,8 @@ pub struct ResourceController<Account = Amount, Tracker = ResourceTracker> {
     pub tracker: Tracker,
     /// The account paying for the resource usage.
     pub account: Account,
+    /// When true, balance deductions are skipped (fees waived for free apps).
+    pub is_free: bool,
 }
 
 impl<Account, Tracker> ResourceController<Account, Tracker> {
@@ -35,6 +38,7 @@ impl<Account, Tracker> ResourceController<Account, Tracker> {
             policy,
             tracker,
             account,
+            is_free: false,
         }
     }
 
@@ -73,18 +77,38 @@ pub const RUNTIME_OWNER_WEIGHT_SIZE: u32 = 8;
 /// TODO(#4164): Implement a procedure for computing naive sizes.
 pub const RUNTIME_CONSTANT_CHAIN_OWNERSHIP_SIZE: u32 = 4 + 4 * 8;
 
+/// The runtime size of a `CryptoHash`.
+pub const RUNTIME_CRYPTO_HASH_SIZE: u32 = 32;
+
+/// The runtime size of a `VmRuntime` enum.
+pub const RUNTIME_VM_RUNTIME_SIZE: u32 = 1;
+
+/// The runtime constant part size of an `ApplicationDescription`.
+///
+/// This includes: `ModuleId` (2 hashes + VmRuntime + Option<CryptoHash> discriminator)
+/// + `ChainId` + `BlockHeight` + `u32`. Variable parts (`parameters`,
+///   `required_application_ids`, and the optional formats blob hash payload) are
+///   calculated separately.
+pub const RUNTIME_CONSTANT_APPLICATION_DESCRIPTION_SIZE: u32 = 2 * RUNTIME_CRYPTO_HASH_SIZE + RUNTIME_VM_RUNTIME_SIZE  // ModuleId core
+    + RUNTIME_CRYPTO_HASH_SIZE + 1                           // formats_blob_hash discriminator
+    + RUNTIME_CHAIN_ID_SIZE                                  // creator_chain_id
+    + RUNTIME_BLOCK_HEIGHT_SIZE                              // block_height
+    + 4; // application_index (u32)
+
 #[cfg(test)]
 mod tests {
     use std::mem::size_of;
 
     use linera_base::{
-        data_types::{Amount, BlockHeight, Timestamp},
-        identifiers::{ApplicationId, ChainId},
+        crypto::CryptoHash,
+        data_types::{Amount, ApplicationDescription, BlockHeight, Timestamp},
+        identifiers::{ApplicationId, ChainId, ModuleId},
     };
 
     use crate::resources::{
         RUNTIME_AMOUNT_SIZE, RUNTIME_APPLICATION_ID_SIZE, RUNTIME_BLOCK_HEIGHT_SIZE,
-        RUNTIME_CHAIN_ID_SIZE, RUNTIME_OWNER_WEIGHT_SIZE, RUNTIME_TIMESTAMP_SIZE,
+        RUNTIME_CHAIN_ID_SIZE, RUNTIME_CONSTANT_APPLICATION_DESCRIPTION_SIZE,
+        RUNTIME_OWNER_WEIGHT_SIZE, RUNTIME_TIMESTAMP_SIZE,
     };
 
     #[test]
@@ -98,6 +122,31 @@ mod tests {
         assert_eq!(RUNTIME_CHAIN_ID_SIZE as usize, size_of::<ChainId>());
         assert_eq!(RUNTIME_TIMESTAMP_SIZE as usize, size_of::<Timestamp>());
         assert_eq!(RUNTIME_OWNER_WEIGHT_SIZE as usize, size_of::<u64>());
+    }
+
+    /// Verifies that `RUNTIME_CONSTANT_APPLICATION_DESCRIPTION_SIZE` matches the actual
+    /// structure of `ApplicationDescription`. This test will fail if a new fixed-size
+    /// field is added to the struct.
+    #[test]
+    fn test_application_description_size() {
+        // Verify using BCS serialization, which is architecture-independent.
+        // BCS encodes Vec length as ULEB128, so empty vectors add 1 byte each.
+        let mut module_id = ModuleId::default();
+        module_id.formats_blob_hash = Some(CryptoHash::default());
+        let description = ApplicationDescription {
+            module_id,
+            creator_chain_id: ChainId::default(),
+            block_height: BlockHeight::default(),
+            application_index: 0,
+            parameters: vec![],
+            required_application_ids: vec![],
+        };
+        let serialized = bcs::to_bytes(&description).expect("serialization should succeed");
+        // Serialized size = fixed fields + 2 bytes for empty vectors (1 byte each for ULEB128 length).
+        assert_eq!(
+            serialized.len(),
+            RUNTIME_CONSTANT_APPLICATION_DESCRIPTION_SIZE as usize + 2
+        );
     }
 }
 
@@ -140,8 +189,6 @@ pub struct ResourceTracker {
     pub event_bytes_read: u64,
     /// The number of event bytes published.
     pub event_bytes_published: u64,
-    /// The change in the number of bytes being stored by user applications.
-    pub bytes_stored: i32,
     /// The number of operations executed.
     pub operations: u32,
     /// The total size of the arguments of user operations.
@@ -169,12 +216,141 @@ impl ResourceTracker {
     }
 }
 
+impl fmt::Display for ResourceTracker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut lines = Vec::new();
+
+        let mut block_parts = Vec::new();
+        if self.block_size != 0 {
+            block_parts.push(format!("size={}", self.block_size));
+        }
+        if self.operations != 0 {
+            block_parts.push(format!("operations={}", self.operations));
+        }
+        if self.operation_bytes != 0 {
+            block_parts.push(format!("operation_bytes={}", self.operation_bytes));
+        }
+        if !block_parts.is_empty() {
+            lines.push(format!("block: {}", block_parts.join(", ")));
+        }
+
+        let mut fuel_parts = Vec::new();
+        if self.wasm_fuel != 0 {
+            fuel_parts.push(format!("wasm={}", self.wasm_fuel));
+        }
+        if self.evm_fuel != 0 {
+            fuel_parts.push(format!("evm={}", self.evm_fuel));
+        }
+        if !fuel_parts.is_empty() {
+            lines.push(format!("fuel: {}", fuel_parts.join(", ")));
+        }
+
+        let mut storage_parts = Vec::new();
+        if self.read_operations != 0 {
+            storage_parts.push(format!("reads={}", self.read_operations));
+        }
+        if self.write_operations != 0 {
+            storage_parts.push(format!("writes={}", self.write_operations));
+        }
+        if self.bytes_runtime != 0 {
+            storage_parts.push(format!("runtime_bytes={}", self.bytes_runtime));
+        }
+        if self.bytes_read != 0 {
+            storage_parts.push(format!("bytes_read={}", self.bytes_read));
+        }
+        if self.bytes_written != 0 {
+            storage_parts.push(format!("bytes_written={}", self.bytes_written));
+        }
+        if !storage_parts.is_empty() {
+            lines.push(format!("storage: {}", storage_parts.join(", ")));
+        }
+
+        let mut blob_parts = Vec::new();
+        if self.blobs_read != 0 {
+            blob_parts.push(format!("read={}", self.blobs_read));
+        }
+        if self.blobs_published != 0 {
+            blob_parts.push(format!("published={}", self.blobs_published));
+        }
+        if self.blob_bytes_read != 0 {
+            blob_parts.push(format!("bytes_read={}", self.blob_bytes_read));
+        }
+        if self.blob_bytes_published != 0 {
+            blob_parts.push(format!("bytes_published={}", self.blob_bytes_published));
+        }
+        if !blob_parts.is_empty() {
+            lines.push(format!("blobs: {}", blob_parts.join(", ")));
+        }
+
+        let mut event_parts = Vec::new();
+        if self.events_read != 0 {
+            event_parts.push(format!("read={}", self.events_read));
+        }
+        if self.events_published != 0 {
+            event_parts.push(format!("published={}", self.events_published));
+        }
+        if self.event_bytes_read != 0 {
+            event_parts.push(format!("bytes_read={}", self.event_bytes_read));
+        }
+        if self.event_bytes_published != 0 {
+            event_parts.push(format!("bytes_published={}", self.event_bytes_published));
+        }
+        if !event_parts.is_empty() {
+            lines.push(format!("events: {}", event_parts.join(", ")));
+        }
+
+        let mut message_parts = Vec::new();
+        if self.messages != 0 {
+            message_parts.push(format!("count={}", self.messages));
+        }
+        if self.message_bytes != 0 {
+            message_parts.push(format!("bytes={}", self.message_bytes));
+        }
+        if self.grants != Amount::ZERO {
+            message_parts.push(format!("grants={}", self.grants));
+        }
+        if !message_parts.is_empty() {
+            lines.push(format!("messages: {}", message_parts.join(", ")));
+        }
+
+        let mut http_service_parts = Vec::new();
+        if self.http_requests != 0 {
+            http_service_parts.push(format!("http_requests={}", self.http_requests));
+        }
+        if self.service_oracle_queries != 0 {
+            http_service_parts.push(format!("service_queries={}", self.service_oracle_queries));
+        }
+        if self.service_oracle_execution != Duration::ZERO {
+            http_service_parts.push(format!(
+                "service_execution={:?}",
+                self.service_oracle_execution
+            ));
+        }
+        if !http_service_parts.is_empty() {
+            lines.push(format!("http/service: {}", http_service_parts.join(", ")));
+        }
+
+        let mut lines_iter = lines.into_iter();
+        if let Some(first) = lines_iter.next() {
+            write!(f, "{first}")?;
+            for line in lines_iter {
+                write!(f, "\n  {line}")?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
 /// How to access the balance of an account.
 pub trait BalanceHolder {
+    /// Returns the balance of the account.
     fn balance(&self) -> Result<Amount, ArithmeticError>;
 
+    /// Adds the given amount to the balance.
     fn try_add_assign(&mut self, other: Amount) -> Result<(), ArithmeticError>;
 
+    /// Subtracts the given amount from the balance.
     fn try_sub_assign(&mut self, other: Amount) -> Result<(), ArithmeticError>;
 }
 
@@ -209,7 +385,11 @@ where
     }
 
     /// Subtracts an amount from a balance and reports an error if that is impossible.
+    /// When `is_free` is set, balance deductions are skipped (fees waived).
     fn update_balance(&mut self, fees: Amount) -> Result<(), ExecutionError> {
+        if self.is_free {
+            return Ok(());
+        }
         self.account
             .try_sub_assign(fees)
             .map_err(|_| ExecutionError::FeesExceedFunding {
@@ -221,9 +401,12 @@ where
 
     /// Obtains the amount of fuel that could be spent by consuming the entire balance.
     pub(crate) fn remaining_fuel(&self, vm_runtime: VmRuntime) -> u64 {
-        let balance = self.balance().unwrap_or(Amount::MAX);
         let fuel = self.tracker.as_ref().fuel(vm_runtime);
         let maximum_fuel_per_block = self.policy.maximum_fuel_per_block(vm_runtime);
+        if self.is_free {
+            return maximum_fuel_per_block.saturating_sub(fuel);
+        }
+        let balance = self.balance().unwrap_or(Amount::MAX);
         self.policy
             .remaining_fuel(balance, vm_runtime)
             .min(maximum_fuel_per_block.saturating_sub(fuel))
@@ -351,7 +534,8 @@ where
         &mut self,
         parameters: &[u8],
     ) -> Result<(), ExecutionError> {
-        let parameters_len = parameters.len() as u32;
+        let parameters_len =
+            u32::try_from(parameters.len()).map_err(|_| ArithmeticError::Overflow)?;
         self.track_size_runtime_operations(parameters_len)
     }
 
@@ -370,9 +554,12 @@ where
         &mut self,
         owner_balances: &[(AccountOwner, Amount)],
     ) -> Result<(), ExecutionError> {
-        let mut size = 0;
+        let mut size: u32 = 0;
         for (account_owner, _) in owner_balances {
-            size += account_owner.size() + RUNTIME_AMOUNT_SIZE;
+            size = size
+                .checked_add(account_owner.size())
+                .and_then(|s| s.checked_add(RUNTIME_AMOUNT_SIZE))
+                .ok_or(ArithmeticError::Overflow)?;
         }
         self.track_size_runtime_operations(size)
     }
@@ -382,9 +569,11 @@ where
         &mut self,
         owners: &[AccountOwner],
     ) -> Result<(), ExecutionError> {
-        let mut size = 0;
+        let mut size: u32 = 0;
         for owner in owners {
-            size += owner.size();
+            size = size
+                .checked_add(owner.size())
+                .ok_or(ArithmeticError::Overflow)?;
         }
         self.track_size_runtime_operations(size)
     }
@@ -394,14 +583,40 @@ where
         &mut self,
         chain_ownership: &ChainOwnership,
     ) -> Result<(), ExecutionError> {
-        let mut size = 0;
+        let mut size: u32 = 0;
         for account_owner in &chain_ownership.super_owners {
-            size += account_owner.size();
+            size = size
+                .checked_add(account_owner.size())
+                .ok_or(ArithmeticError::Overflow)?;
         }
         for account_owner in chain_ownership.owners.keys() {
-            size += account_owner.size() + RUNTIME_OWNER_WEIGHT_SIZE;
+            size = size
+                .checked_add(account_owner.size())
+                .and_then(|s| s.checked_add(RUNTIME_OWNER_WEIGHT_SIZE))
+                .ok_or(ArithmeticError::Overflow)?;
         }
-        size += RUNTIME_CONSTANT_CHAIN_OWNERSHIP_SIZE;
+        size = size
+            .checked_add(RUNTIME_CONSTANT_CHAIN_OWNERSHIP_SIZE)
+            .ok_or(ArithmeticError::Overflow)?;
+        self.track_size_runtime_operations(size)
+    }
+
+    /// Tracks runtime reading of an application description.
+    pub(crate) fn track_runtime_application_description(
+        &mut self,
+        description: &ApplicationDescription,
+    ) -> Result<(), ExecutionError> {
+        let parameters_size =
+            u32::try_from(description.parameters.len()).map_err(|_| ArithmeticError::Overflow)?;
+        let required_apps_count = u32::try_from(description.required_application_ids.len())
+            .map_err(|_| ArithmeticError::Overflow)?;
+        let required_apps_size = required_apps_count
+            .checked_mul(RUNTIME_APPLICATION_ID_SIZE)
+            .ok_or(ArithmeticError::Overflow)?;
+        let size = RUNTIME_CONSTANT_APPLICATION_DESCRIPTION_SIZE
+            .checked_add(parameters_size)
+            .and_then(|s| s.checked_add(required_apps_size))
+            .ok_or(ArithmeticError::Overflow)?;
         self.track_size_runtime_operations(size)
     }
 
@@ -489,7 +704,11 @@ where
     pub fn track_blob_published(&mut self, blob: &Blob) -> Result<(), ExecutionError> {
         self.policy.check_blob_size(blob.content())?;
         let size = blob.content().bytes().len() as u64;
-        if blob.is_committee_blob() {
+        // Committee and checkpoint-execution-state blobs are exempt from fees and the
+        // per-block published-blob limit. Committee blobs are produced by network-level
+        // governance; checkpoint blobs are produced by `SystemOperation::Checkpoint`
+        // and their size is bounded by the policy's `maximum_blob_size` per chunk.
+        if blob.is_committee_blob() || blob.is_checkpoint_blob() {
             return Ok(());
         }
         {
@@ -545,19 +764,6 @@ where
         Ok(())
     }
 
-    /// Tracks a change in the number of bytes stored.
-    // TODO(#1536): This is not fully implemented.
-    #[allow(dead_code)]
-    pub(crate) fn track_stored_bytes(&mut self, delta: i32) -> Result<(), ExecutionError> {
-        self.tracker.as_mut().bytes_stored = self
-            .tracker
-            .as_mut()
-            .bytes_stored
-            .checked_add(delta)
-            .ok_or(ArithmeticError::Overflow)?;
-        Ok(())
-    }
-
     /// Returns the remaining time services can spend executing as oracles.
     pub(crate) fn remaining_service_oracle_execution_time(
         &self,
@@ -603,7 +809,7 @@ where
 
     /// Tracks the size of a response produced by an oracle.
     pub(crate) fn track_service_oracle_response(
-        &mut self,
+        &self,
         response_bytes: usize,
     ) -> Result<(), ExecutionError> {
         ensure!(
@@ -647,7 +853,7 @@ impl ResourceController<Option<AccountOwner>, ResourceTracker> {
         view: &'a mut SystemExecutionStateView<C>,
     ) -> Result<ResourceController<Sources<'a>, &mut ResourceTracker>, ViewError>
     where
-        C: Context + Clone + Send + Sync + 'static,
+        C: Context + Clone + 'static,
     {
         self.with_state_and_grant(view, None).await
     }
@@ -661,7 +867,7 @@ impl ResourceController<Option<AccountOwner>, ResourceTracker> {
         grant: Option<&'a mut Amount>,
     ) -> Result<ResourceController<Sources<'a>, &mut ResourceTracker>, ViewError>
     where
-        C: Context + Clone + Send + Sync + 'static,
+        C: Context + Clone + 'static,
     {
         let mut sources = Vec::new();
         // First, use the grant (e.g. for messages) and otherwise use the chain account
@@ -683,6 +889,7 @@ impl ResourceController<Option<AccountOwner>, ResourceTracker> {
             policy: self.policy.clone(),
             tracker: &mut self.tracker,
             account: Sources { sources },
+            is_free: self.is_free,
         })
     }
 }

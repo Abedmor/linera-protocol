@@ -25,6 +25,7 @@ sed -i -e '/linera-core\/src\/unit_tests\/worker_tests\.rs/d' "$USAGES_FILE"
 sed -i -e '/linera-core\/src\/unit_tests\/test_utils\.rs/d' "$USAGES_FILE"
 
 # Client tests load chains to verify certain conditions
+sed -i -e '/linera-core\/src\/unit_tests\/client_tests\.rs/d' "$USAGES_FILE"
 sed -i -e '/linera-core\/src\/unit_tests\/wasm_client_tests\.rs/d' "$USAGES_FILE"
 
 # The SDK integration test framework uses `create_chain` to create a dummy admin chain before the
@@ -38,10 +39,16 @@ if [ "$(grep 'linera-service/src/cli/main.rs' "$USAGES_FILE" | wc -l)" -eq 1 ]; 
     sed -i -e '/linera-service\/src\/cli\/main\.rs/d' "$USAGES_FILE"
 fi
 
-# The linera-client uses `create_chain` to initialize the storage from the genesis configuration,
-# and this is only called by the `database_tool`
-if [ "$(grep 'linera-client/src/config.rs' "$USAGES_FILE" | wc -l)" -eq 1 ]; then
-    sed -i -e '/linera-client\/src\/config\.rs/d' "$USAGES_FILE"
+# GenesisConfig uses `create_chain` to initialize storage from the genesis configuration,
+# and this is only called during initial setup
+if [ "$(grep 'linera-core/src/genesis_config.rs' "$USAGES_FILE" | wc -l)" -eq 1 ]; then
+    sed -i -e '/linera-core\/src\/genesis_config\.rs/d' "$USAGES_FILE"
+fi
+
+# Client::extend_with_chain uses it to add a new chain to the tracked wallet.
+# This should happen in isolation from the workers.
+if [ "$(grep 'linera-client/src/client_context.rs' "$USAGES_FILE" | wc -l)" -eq 1 ]; then
+    sed -i -e '/linera-client\/src\/client_context\.rs/d' "$USAGES_FILE"
 fi
 
 cat "$USAGES_FILE"

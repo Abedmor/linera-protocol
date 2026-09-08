@@ -1,6 +1,8 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+#![allow(clippy::cast_possible_truncation)]
+
 pub mod test_views;
 
 /// Functions for computing the performance of stores.
@@ -73,7 +75,7 @@ pub fn get_random_kset<R: Rng>(rng: &mut R, n: usize, k: usize) -> Vec<usize> {
 /// We return n such `(key, value)` pairs which are all distinct.
 pub fn get_random_key_values_prefix<R: Rng>(
     rng: &mut R,
-    key_prefix: Vec<u8>,
+    key_prefix: &[u8],
     len_key: usize,
     len_value: usize,
     num_entries: usize,
@@ -85,7 +87,7 @@ pub fn get_random_key_values_prefix<R: Rng>(
         let key = loop {
             let key = get_random_byte_vector_with_byte_upper_limit(
                 rng,
-                &key_prefix,
+                key_prefix,
                 len_key,
                 key_byte_upper_limit,
             );
@@ -94,7 +96,7 @@ pub fn get_random_key_values_prefix<R: Rng>(
                 break key;
             }
         };
-        let value = get_random_byte_vector(rng, &Vec::new(), len_value);
+        let value = get_random_byte_vector(rng, &[], len_value);
         key_value_pairs.push((key, value));
     }
 
@@ -104,7 +106,7 @@ pub fn get_random_key_values_prefix<R: Rng>(
 /// Takes a random number generator `rng`, a number n and returns n random `(key, value)`
 /// which are all distinct with key and value being of length 8.
 pub fn get_random_key_values<R: Rng>(rng: &mut R, num_entries: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
-    get_random_key_values_prefix(rng, Vec::new(), 8, 8, num_entries, u8::MAX)
+    get_random_key_values_prefix(rng, &[], 8, 8, num_entries, u8::MAX)
 }
 
 type VectorPutDelete = (Vec<(Vec<u8>, Vec<u8>)>, usize);
@@ -122,7 +124,7 @@ pub fn get_random_key_value_operations<R: Rng>(
 /// For something like `MapView` it should get us the same result whatever way we are calling.
 pub fn span_random_reordering_put_delete<R: Rng>(
     rng: &mut R,
-    info_op: VectorPutDelete,
+    info_op: &VectorPutDelete,
 ) -> Vec<WriteOperation> {
     let n = info_op.0.len();
     let k = info_op.1;
@@ -164,7 +166,7 @@ pub fn span_random_reordering_put_delete<R: Rng>(
 /// * `find_keys_by_prefix` / `find_key_values_by_prefix`
 /// * The ordering of keys returned by `find_keys_by_prefix` and `find_key_values_by_prefix`
 pub async fn run_reads<S: KeyValueStore>(store: S, key_values: Vec<(Vec<u8>, Vec<u8>)>) {
-    // We need a nontrivial key_prefix because dynamo requires a non-trivial prefix
+    // We need a nontrivial key_prefix because some stores require a non-trivial prefix
     let mut batch = Batch::new();
     let mut keys = Vec::new();
     let mut set_keys = HashSet::new();
@@ -253,7 +255,7 @@ pub fn get_random_key_values_with_sizes(
     let mut rng = make_deterministic_rng();
     get_random_key_values_prefix(
         &mut rng,
-        key_prefix,
+        &key_prefix,
         len_key,
         len_value,
         num_entries,
@@ -270,7 +272,7 @@ fn get_random_key_values_with_small_keys(
     let mut rng = make_deterministic_rng();
     get_random_key_values_prefix(
         &mut rng,
-        key_prefix,
+        &key_prefix,
         len_key,
         len_value,
         num_entries,
@@ -542,7 +544,7 @@ pub async fn tombstone_triggering_test<C: KeyValueStore>(key_value_store: C) {
     }
 }
 
-/// DynamoDB has limits at 1 MB (for pagination), 4 MB (for write)
+/// Some key-value stores impose limits (e.g. 1 MB for pagination, 4 MB for write).
 /// Let us go right past them at 20 MB of data with writing and then
 /// reading it. And 20 MB is not huge by any mean. All `KeyValueStore`
 /// must handle that.
@@ -716,7 +718,7 @@ pub async fn namespace_admin_test<D: TestKeyValueDatabase>() {
     // Creating the initial list of namespaces
     let mut working_namespaces = BTreeSet::new();
     for i in 0..size {
-        let namespace = format!("{}_{}", prefix, i);
+        let namespace = format!("{prefix}_{i}");
         assert!(!D::exists(&config, &namespace).await.expect("test"));
         working_namespaces.insert(namespace);
     }

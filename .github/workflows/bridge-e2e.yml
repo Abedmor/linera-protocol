@@ -1,0 +1,161 @@
+name: Bridge E2E
+
+on:
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+  push:
+    branches: [ main, 'testnet_*' ]
+
+concurrency:
+  group: '${{ github.workflow }} @ ${{ github.event.pull_request.head.label || github.head_ref || github.run_id }}'
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  RUST_BACKTRACE: short
+  RUSTFLAGS: -D warnings
+  RUSTUP_MAX_RETRIES: 10
+  RUST_LOG: warn
+  GCP_REGISTRY: us-docker.pkg.dev/linera-io-dev/linera-public-registry
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  bridge-e2e:
+    if: ${{ github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || github.event_name == 'push' }}
+    runs-on: linera-io-self-hosted-ci
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 0
+          submodules: recursive
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-workspaces: |
+            . -> target
+            linera-bridge/contracts/evm-bridge -> target
+            linera-bridge/tests/e2e -> target
+            examples -> target
+
+      - name: Install Protoc
+        uses: ./.github/actions/install-protoc
+
+      # Self-hosted runners occasionally expose an unhealthy
+      # docker socket at job start despite
+      # RUNNER_WAIT_FOR_DOCKER_IN_SECONDS. Probe + retry so
+      # we do not fail the whole run on a startup race.
+      - name: Wait for docker daemon
+        run: |
+          for i in $(seq 1 60); do
+            if docker info >/dev/null 2>&1; then
+              echo "Docker ready after ${i} attempt(s)"
+              exit 0
+            fi
+            echo "Waiting for docker daemon ($i/60)..."
+            sleep 2
+          done
+          echo "Docker daemon did not become ready in 120s"
+          exit 1
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # GCP auth is only needed to push the bridge image on release branches.
+      - if: github.event_name == 'push'
+        uses: ./.github/actions/gcp-auth
+        with:
+          service_account: actions-runner@linera-io-dev.iam.gserviceaccount.com
+          configure_docker_for: us-docker.pkg.dev
+
+      - name: Build linera image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./docker/Dockerfile
+          target: tests
+          tags: linera-test
+          load: true
+          build-args: |
+            build_flag=
+            build_folder=debug
+
+      - name: Build foundry-jq image
+        run: docker build -t foundry-jq -f ./docker/Dockerfile.foundry ./docker
+
+      - name: Build bridge image
+        id: build-bridge
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./docker/Dockerfile.bridge
+          load: true
+          tags: |
+            linera-bridge:latest
+            ${{ github.event_name == 'push' && format('{0}/linera-bridge:{1}', env.GCP_REGISTRY, github.ref_name) || '' }}
+
+      - name: Build evm-bridge Wasm module
+        run: cargo build --locked --release --target wasm32-unknown-unknown
+        working-directory: linera-bridge/contracts/evm-bridge
+
+      - name: Build wrapped-fungible Wasm module
+        run: cargo build --locked --release --target wasm32-unknown-unknown -p wrapped-fungible
+        working-directory: examples
+
+      - name: Run evm-bridge contract integration tests
+        working-directory: linera-bridge/contracts/evm-bridge
+        env:
+          RUSTFLAGS: ""
+        run: cargo test --locked
+
+      - name: Build linera-bridge binary for local relay tests
+        run: cargo build --locked -p linera-bridge --features linera-bridge/relay
+
+      - name: Run bridge E2E test
+        working-directory: linera-bridge/tests/e2e
+        env:
+          RUSTFLAGS: ""
+        run: cargo test --locked -- --ignored --nocapture
+
+      - name: Install Foundry (provides `anvil`)
+        uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: v1.7.0
+
+      - name: Ensure Solc Directory Exists
+        run: mkdir -p /home/runner/.solc
+      - name: Cache Solc
+        id: cache-solc
+        uses: actions/cache@v4
+        with:
+          path: /home/runner/.solc
+          key: solc-v0.8.33
+          restore-keys: solc-
+      - name: Get Solc
+        if: steps.cache-solc.outputs.cache-hit != 'true'
+        uses: ./.github/actions/get-solc
+        with:
+          version: v0.8.33
+      - name: Add Solc to PATH
+        run: echo "/home/runner/.solc" >> $GITHUB_PATH
+      - name: Create a Solc symbolic link
+        run: ln -sf /home/runner/.solc/v0.8.33/solc-static-linux /home/runner/.solc/solc
+
+      - name: Run anvil deposit-proof test
+        working-directory: linera-bridge
+        env:
+          RUSTFLAGS: ""
+        run: cargo test --locked -p linera-bridge --test anvil_deposit_proof -- --ignored --nocapture
+
+      - name: Run evm-bridge contract integration tests (anvil)
+        working-directory: linera-bridge/contracts/evm-bridge
+        env:
+          RUSTFLAGS: ""
+        run: cargo test --locked -- --ignored --nocapture

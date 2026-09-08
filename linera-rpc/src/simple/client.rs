@@ -2,13 +2,11 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::future::Future;
-
 use futures::{sink::SinkExt, stream::StreamExt};
 use linera_base::{
     crypto::CryptoHash,
     data_types::{BlobContent, BlockHeight, NetworkDescription},
-    identifiers::{BlobId, ChainId},
+    identifiers::{BlobId, ChainId, EventId},
     time::{timer, Duration},
 };
 use linera_chain::{
@@ -19,8 +17,9 @@ use linera_chain::{
 };
 use linera_core::{
     data_types::{ChainInfoQuery, ChainInfoResponse},
-    node::{CrossChainMessageDelivery, NodeError, NotificationStream, ValidatorNode},
+    node::{BlobStream, CrossChainMessageDelivery, NodeError, NotificationStream, ValidatorNode},
 };
+use linera_storage::Arc as CacheArc;
 use linera_version::VersionInfo;
 
 use super::{codec, transport::TransportProtocol};
@@ -30,6 +29,7 @@ use crate::{
     RpcMessage,
 };
 
+/// A client communicating with validators over a simple (UDP or TCP) transport.
 #[derive(Clone)]
 pub struct SimpleClient {
     network: ValidatorPublicNetworkPreConfig<TransportProtocol>,
@@ -120,12 +120,12 @@ impl ValidatorNode for SimpleClient {
     /// Processes a confirmed certificate.
     async fn handle_confirmed_certificate(
         &self,
-        certificate: ConfirmedBlockCertificate,
+        certificate: CacheArc<ConfirmedBlockCertificate>,
         delivery: CrossChainMessageDelivery,
     ) -> Result<ChainInfoResponse, NodeError> {
         let wait_for_outgoing_messages = delivery.wait_for_outgoing_messages();
         let request = HandleConfirmedCertificateRequest {
-            certificate,
+            certificate: CacheArc::unwrap_or_clone(certificate),
             wait_for_outgoing_messages,
         };
         let request = RpcMessage::ConfirmedCertificate(Box::new(request));
@@ -151,12 +151,35 @@ impl ValidatorNode for SimpleClient {
         self.query(request).await
     }
 
-    fn subscribe(
-        &self,
-        _chains: Vec<ChainId>,
-    ) -> impl Future<Output = Result<NotificationStream, NodeError>> + Send {
-        let transport = self.network.protocol.to_string();
-        async { Err(NodeError::SubscriptionError { transport }) }
+    async fn subscribe(&self, chains: Vec<ChainId>) -> Result<NotificationStream, NodeError> {
+        let mut stream = self
+            .network
+            .protocol
+            .connect((self.network.host.clone(), self.network.port))
+            .await
+            .map_err(|e| NodeError::ClientIoError {
+                error: e.to_string(),
+            })?;
+        // Send subscription request
+        timer::timeout(
+            self.send_timeout,
+            stream.send(RpcMessage::SubscribeNotifications(chains)),
+        )
+        .await
+        .map_err(|timeout| NodeError::ClientIoError {
+            error: timeout.to_string(),
+        })?
+        .map_err(|e| NodeError::ClientIoError {
+            error: e.to_string(),
+        })?;
+        // Return a stream that reads notifications from the connection
+        let notification_stream = stream.filter_map(|result| async {
+            match result {
+                Ok(RpcMessage::Notification(notification)) => Some(*notification),
+                _ => None,
+            }
+        });
+        Ok(Box::pin(notification_stream) as NotificationStream)
     }
 
     async fn get_version_info(&self) -> Result<VersionInfo, NodeError> {
@@ -174,6 +197,39 @@ impl ValidatorNode for SimpleClient {
     async fn download_blob(&self, blob_id: BlobId) -> Result<BlobContent, NodeError> {
         self.query(RpcMessage::DownloadBlob(Box::new(blob_id)))
             .await
+    }
+
+    async fn download_blobs(&self, blob_ids: Vec<BlobId>) -> Result<BlobStream, NodeError> {
+        let mut stream = self
+            .network
+            .protocol
+            .connect((self.network.host.clone(), self.network.port))
+            .await
+            .map_err(|e| NodeError::ClientIoError {
+                error: e.to_string(),
+            })?;
+        timer::timeout(
+            self.send_timeout,
+            stream.send(RpcMessage::DownloadBlobs(blob_ids)),
+        )
+        .await
+        .map_err(|timeout| NodeError::ClientIoError {
+            error: timeout.to_string(),
+        })?
+        .map_err(|e| NodeError::ClientIoError {
+            error: e.to_string(),
+        })?;
+        let blob_stream = stream.filter_map(|result| async {
+            match result {
+                Ok(RpcMessage::DownloadBlobResponse(blob)) => Some(Ok(*blob)),
+                Ok(RpcMessage::Error(err)) => Some(Err(*err)),
+                Ok(_) => Some(Err(NodeError::UnexpectedMessage)),
+                Err(e) => Some(Err(NodeError::ClientIoError {
+                    error: e.to_string(),
+                })),
+            }
+        });
+        Ok(Box::pin(blob_stream))
     }
 
     async fn download_pending_blob(
@@ -265,6 +321,13 @@ impl ValidatorNode for SimpleClient {
 
     async fn missing_blob_ids(&self, blob_ids: Vec<BlobId>) -> Result<Vec<BlobId>, NodeError> {
         self.query(RpcMessage::MissingBlobIds(blob_ids)).await
+    }
+
+    async fn event_block_heights(
+        &self,
+        event_ids: Vec<EventId>,
+    ) -> Result<Vec<Option<BlockHeight>>, NodeError> {
+        self.query(RpcMessage::EventBlockHeights(event_ids)).await
     }
 
     async fn get_shard_info(

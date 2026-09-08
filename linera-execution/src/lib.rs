@@ -4,6 +4,9 @@
 //! This module manages the execution of the system application and the user applications in a
 //! Linera chain.
 
+#![deny(missing_docs)]
+
+/// The committee of validators and their voting weights for an epoch.
 pub mod committee;
 pub mod evm;
 mod execution;
@@ -13,7 +16,9 @@ mod graphql;
 mod policy;
 mod resources;
 mod runtime;
+/// The system application implementing core chain functionality.
 pub mod system;
+/// Helpers for writing tests that exercise the execution layer.
 #[cfg(with_testing)]
 pub mod test_utils;
 mod transaction_tracker;
@@ -49,10 +54,12 @@ use linera_views::{batch::Batch, ViewError};
 use serde::{Deserialize, Serialize};
 use system::AdminOperation;
 use thiserror::Error;
+pub use web_thread_pool::Pool as ThreadPool;
+use web_thread_select as web_thread;
 
 #[cfg(with_revm)]
 use crate::evm::EvmExecutionError;
-use crate::system::EPOCH_STREAM_NAME;
+use crate::system::{EpochEventData, EPOCH_STREAM_NAME};
 #[cfg(with_testing)]
 use crate::test_utils::dummy_chain_description;
 #[cfg(all(with_testing, with_wasm_runtime))]
@@ -63,24 +70,27 @@ pub use crate::wasm::{
     ServiceRuntimeApi, WasmContractModule, WasmExecutionError, WasmServiceModule,
 };
 pub use crate::{
-    committee::Committee,
+    committee::{Committee, SharedCommittees},
     execution::{ExecutionStateView, ServiceRuntimeEndpoint},
     execution_state_actor::{ExecutionRequest, ExecutionStateActor},
-    policy::ResourceControlPolicy,
+    policy::{ProtocolFlag, ResourceControlPolicy},
     resources::{BalanceHolder, ResourceController, ResourceTracker},
     runtime::{
         ContractSyncRuntimeHandle, ServiceRuntimeRequest, ServiceSyncRuntime,
         ServiceSyncRuntimeHandle,
     },
     system::{
-        SystemExecutionStateView, SystemMessage, SystemOperation, SystemQuery, SystemResponse,
+        ChainProgress, SystemExecutionStateView, SystemMessage, SystemOperation, SystemQuery,
+        SystemResponse,
     },
-    transaction_tracker::{TransactionOutcome, TransactionTracker},
+    transaction_tracker::{PreparedCheckpoint, TransactionOutcome, TransactionTracker},
 };
 
 /// The `Linera.sol` library code to be included in solidity smart
 /// contracts using Linera features.
 pub const LINERA_SOL: &str = include_str!("../solidity/Linera.sol");
+/// The `LineraTypes.sol` library code defining the Solidity types used to
+/// interface with Linera features.
 pub const LINERA_TYPES_SOL: &str = include_str!("../solidity/LineraTypes.sol");
 
 /// The maximum length of a stream name.
@@ -102,6 +112,7 @@ pub type UserServiceInstance = Box<dyn UserService>;
 
 /// A factory trait to obtain a [`UserContract`] from a [`UserContractModule`]
 pub trait UserContractModule: dyn_clone::DynClone + Any + web_thread::Post + Send + Sync {
+    /// Instantiates the contract with the given runtime handle.
     fn instantiate(
         &self,
         runtime: ContractSyncRuntimeHandle,
@@ -118,6 +129,7 @@ dyn_clone::clone_trait_object!(UserContractModule);
 
 /// A factory trait to obtain a [`UserService`] from a [`UserServiceModule`]
 pub trait UserServiceModule: dyn_clone::DynClone + Any + web_thread::Post + Send + Sync {
+    /// Instantiates the service with the given runtime handle.
     fn instantiate(
         &self,
         runtime: ServiceSyncRuntimeHandle,
@@ -150,6 +162,7 @@ impl UserContractCode {
     }
 }
 
+/// A wrapper around a `Vec` that can be converted to and from a JavaScript array.
 pub struct JsVec<T>(pub Vec<T>);
 
 #[cfg(web)]
@@ -227,7 +240,8 @@ const _: () = {
 };
 
 /// A type for errors happening during execution.
-#[derive(Error, Debug)]
+#[derive(Error, Debug, strum::IntoStaticStr)]
+#[allow(missing_docs)]
 pub enum ExecutionError {
     #[error(transparent)]
     ViewError(#[from] ViewError),
@@ -312,8 +326,6 @@ pub enum ExecutionError {
     InvalidUrlForHttpRequest(#[from] url::ParseError),
     #[error("Worker thread failure: {0:?}")]
     Thread(#[from] web_thread::Error),
-    #[error("The chain being queried is not active {0}")]
-    InactiveChain(ChainId),
     #[error("Blobs not found: {0:?}")]
     BlobsNotFound(Vec<BlobId>),
     #[error("Events not found: {0:?}")]
@@ -343,6 +355,12 @@ pub enum ExecutionError {
     IncorrectClaimAmount,
     #[error("Claim must be authenticated by the right owner")]
     UnauthenticatedClaimOwner,
+    #[error("The transferred amount must not exceed the allowance for spender {spender} from owner {owner}: {allowance}")]
+    InsufficientAllowance {
+        allowance: Amount,
+        owner: AccountOwner,
+        spender: AccountOwner,
+    },
     #[error("Admin operations are only allowed on the admin chain.")]
     AdminOperationOnNonAdminChain,
     #[error("Failed to create new committee: expected {expected}, but got {provided}")]
@@ -355,8 +373,12 @@ pub enum ExecutionError {
     UnprocessedStreams,
     #[error("Internal error: {0}")]
     InternalError(&'static str),
-    #[error("UpdateStreams is outdated")]
-    OutdatedUpdateStreams,
+    #[error("UpdateStream is outdated")]
+    OutdatedUpdateStream,
+    #[error("UpdateStream references an application that is not subscribed")]
+    UnsubscribedUpdateStream,
+    #[error("Checkpoint precondition failed: {0}")]
+    CheckpointPreconditionFailed(&'static str),
 }
 
 impl ExecutionError {
@@ -392,7 +414,6 @@ impl ExecutionError {
             | ExecutionError::BytecodeTooLarge
             | ExecutionError::UnauthorizedHttpRequest(_)
             | ExecutionError::InvalidUrlForHttpRequest(_)
-            | ExecutionError::InactiveChain(_)
             | ExecutionError::BlobsNotFound(_)
             | ExecutionError::EventsNotFound(_)
             | ExecutionError::InvalidHeaderName(_)
@@ -404,12 +425,15 @@ impl ExecutionError {
             | ExecutionError::FeesExceedFunding { .. }
             | ExecutionError::IncorrectClaimAmount
             | ExecutionError::UnauthenticatedClaimOwner
+            | ExecutionError::InsufficientAllowance { .. }
             | ExecutionError::AdminOperationOnNonAdminChain
             | ExecutionError::InvalidCommitteeEpoch { .. }
             | ExecutionError::InvalidCommitteeRemoval
             | ExecutionError::MissingOracleResponse
             | ExecutionError::UnprocessedStreams
-            | ExecutionError::OutdatedUpdateStreams
+            | ExecutionError::OutdatedUpdateStream
+            | ExecutionError::UnsubscribedUpdateStream
+            | ExecutionError::CheckpointPreconditionFailed(_)
             | ExecutionError::ViewError(ViewError::NotFound(_)) => false,
             #[cfg(with_wasm_runtime)]
             ExecutionError::WasmError(_) => false,
@@ -423,6 +447,40 @@ impl ExecutionError {
             | ExecutionError::InternalError(_)
             | ExecutionError::IoError(_) => true,
         }
+    }
+
+    /// Returns the qualified error variant name for the `error_type` metric label,
+    /// e.g. `"ExecutionError::BlobsNotFound"`.
+    pub fn error_type(&self) -> String {
+        let variant: &'static str = self.into();
+        format!("ExecutionError::{variant}")
+    }
+
+    /// Returns whether this error is caused by a per-block limit being exceeded.
+    ///
+    /// These are errors that might succeed in a later block if the limit was only exceeded
+    /// due to accumulated transactions. Per-transaction or per-call limits are not included.
+    pub fn is_limit_error(&self) -> bool {
+        matches!(
+            self,
+            ExecutionError::ExcessiveRead
+                | ExecutionError::ExcessiveWrite
+                | ExecutionError::MaximumFuelExceeded(_)
+                | ExecutionError::MaximumServiceOracleExecutionTimeExceeded
+                | ExecutionError::BlockTooLarge
+        )
+    }
+
+    /// Returns whether this is a transient error that may resolve after syncing.
+    ///
+    /// Transient errors like missing blobs or events might succeed after the node syncs
+    /// with the network. These errors should fail the block entirely (not reject the message)
+    /// so the block can be retried later.
+    pub fn is_transient_error(&self) -> bool {
+        matches!(
+            self,
+            ExecutionError::BlobsNotFound(_) | ExecutionError::EventsNotFound(_)
+        )
     }
 }
 
@@ -440,6 +498,10 @@ pub trait UserContract {
     /// Reacts to new events on streams this application subscribes to.
     fn process_streams(&mut self, updates: Vec<StreamUpdate>) -> Result<(), ExecutionError>;
 
+    /// Gives the application a chance to emit a summary event for each of its own streams
+    /// that published events since the previous checkpoint.
+    fn summarize_events(&mut self, updates: Vec<StreamUpdate>) -> Result<(), ExecutionError>;
+
     /// Finishes execution of the current transaction.
     fn finalize(&mut self) -> Result<(), ExecutionError>;
 }
@@ -451,45 +513,81 @@ pub trait UserService {
 }
 
 /// Configuration options for the execution runtime available to applications.
-#[derive(Clone, Copy, Default)]
-pub struct ExecutionRuntimeConfig {}
+#[derive(Clone, Copy)]
+pub struct ExecutionRuntimeConfig {
+    /// Whether contract log messages should be output.
+    /// This is typically enabled for clients but disabled for validators.
+    pub allow_application_logs: bool,
+}
+
+impl Default for ExecutionRuntimeConfig {
+    fn default() -> Self {
+        Self {
+            allow_application_logs: true,
+        }
+    }
+}
 
 /// Requirements for the `extra` field in our state views (and notably the
 /// [`ExecutionStateView`]).
 #[cfg_attr(not(web), async_trait)]
 #[cfg_attr(web, async_trait(?Send))]
 pub trait ExecutionRuntimeContext {
+    /// Returns the ID of the chain this context belongs to.
     fn chain_id(&self) -> ChainId;
 
+    /// Returns the thread pool used to run blocking work.
+    fn thread_pool(&self) -> &Arc<ThreadPool>;
+
+    /// Returns the configuration options for the execution runtime.
     fn execution_runtime_config(&self) -> ExecutionRuntimeConfig;
 
+    /// Returns the cache of loaded user contracts.
     fn user_contracts(&self) -> &Arc<papaya::HashMap<ApplicationId, UserContractCode>>;
 
+    /// Returns the cache of loaded user services.
     fn user_services(&self) -> &Arc<papaya::HashMap<ApplicationId, UserServiceCode>>;
 
+    /// Loads the contract for the given application, instantiating it if necessary.
     async fn get_user_contract(
         &self,
         description: &ApplicationDescription,
         txn_tracker: &TransactionTracker,
     ) -> Result<UserContractCode, ExecutionError>;
 
+    /// Loads the service for the given application, instantiating it if necessary.
     async fn get_user_service(
         &self,
         description: &ApplicationDescription,
         txn_tracker: &TransactionTracker,
     ) -> Result<UserServiceCode, ExecutionError>;
 
-    async fn get_blob(&self, blob_id: BlobId) -> Result<Option<Blob>, ViewError>;
+    /// Returns the blob with the given ID, if it is available.
+    async fn get_blob(&self, blob_id: BlobId) -> Result<Option<Arc<Blob>>, ViewError>;
 
-    async fn get_event(&self, event_id: EventId) -> Result<Option<Vec<u8>>, ViewError>;
+    /// Returns the event with the given ID, if it is available.
+    async fn get_event(&self, event_id: EventId) -> Result<Option<Arc<Vec<u8>>>, ViewError>;
 
+    /// Returns the network description, if it is available.
     async fn get_network_description(&self) -> Result<Option<NetworkDescription>, ViewError>;
 
-    /// Returns the committees for the epochs in the given range.
-    async fn get_committees(
+    /// Returns the committee whose serialized form hashes to `hash`. Returns
+    /// `ExecutionError::BlobsNotFound` if the committee blob is missing from
+    /// storage.
+    ///
+    /// Implementations should cache results in a process-wide
+    /// [`SharedCommittees`] map so that repeated lookups are cheap across
+    /// chains.
+    async fn get_or_load_committee_by_hash(
+        &self,
+        hash: CryptoHash,
+    ) -> Result<Arc<Committee>, ExecutionError>;
+
+    /// Returns the committee blob hashes for the epochs in the given range.
+    async fn get_committee_hashes(
         &self,
         epoch_range: RangeInclusive<Epoch>,
-    ) -> Result<BTreeMap<Epoch, Committee>, ExecutionError> {
+    ) -> Result<BTreeMap<Epoch, CryptoHash>, ExecutionError> {
         let net_description = self
             .get_network_description()
             .await?
@@ -498,7 +596,7 @@ pub trait ExecutionRuntimeContext {
             (epoch_range.start().0..=epoch_range.end().0).map(|epoch| async move {
                 if epoch == 0 {
                     // Genesis epoch is stored in NetworkDescription.
-                    Ok((epoch, net_description.genesis_committee_blob_hash))
+                    Ok((Epoch(epoch), net_description.genesis_committee_blob_hash))
                 } else {
                     let event_id = EventId {
                         chain_id: net_description.admin_chain_id,
@@ -509,7 +607,8 @@ pub trait ExecutionRuntimeContext {
                         .get_event(event_id.clone())
                         .await?
                         .ok_or_else(|| ExecutionError::EventsNotFound(vec![event_id]))?;
-                    Ok((epoch, bcs::from_bytes(&event)?))
+                    let event_data: EpochEventData = bcs::from_bytes(&event)?;
+                    Ok((Epoch(epoch), event_data.blob_hash))
                 }
             }),
         )
@@ -529,48 +628,23 @@ pub trait ExecutionRuntimeContext {
             missing_events.is_empty(),
             ExecutionError::EventsNotFound(missing_events)
         );
-        let committee_hashes = committee_hashes
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
-        let committees = futures::future::join_all(committee_hashes.into_iter().map(
-            |(epoch, committee_hash)| async move {
-                let blob_id = BlobId::new(committee_hash, BlobType::Committee);
-                let committee_blob = self
-                    .get_blob(blob_id)
-                    .await?
-                    .ok_or_else(|| ExecutionError::BlobsNotFound(vec![blob_id]))?;
-                Ok((Epoch(epoch), bcs::from_bytes(committee_blob.bytes())?))
-            },
-        ))
-        .await;
-        let missing_blobs = committees
-            .iter()
-            .filter_map(|result| {
-                if let Err(ExecutionError::BlobsNotFound(blob_ids)) = result {
-                    return Some(blob_ids);
-                }
-                None
-            })
-            .flatten()
-            .cloned()
-            .collect::<Vec<_>>();
-        ensure!(
-            missing_blobs.is_empty(),
-            ExecutionError::BlobsNotFound(missing_blobs)
-        );
-        committees.into_iter().collect()
+        committee_hashes.into_iter().collect()
     }
 
+    /// Returns whether a blob with the given ID is available.
     async fn contains_blob(&self, blob_id: BlobId) -> Result<bool, ViewError>;
 
+    /// Returns whether an event with the given ID is available.
     async fn contains_event(&self, event_id: EventId) -> Result<bool, ViewError>;
 
+    /// Adds the given blobs to the context, for use in tests.
     #[cfg(with_testing)]
     async fn add_blobs(
         &self,
         blobs: impl IntoIterator<Item = Blob> + Send,
     ) -> Result<(), ViewError>;
 
+    /// Adds the given events to the context, for use in tests.
     #[cfg(with_testing)]
     async fn add_events(
         &self,
@@ -578,6 +652,7 @@ pub trait ExecutionRuntimeContext {
     ) -> Result<(), ViewError>;
 }
 
+/// The context in which an operation is executed.
 #[derive(Clone, Copy, Debug)]
 pub struct OperationContext {
     /// The current chain ID.
@@ -593,12 +668,15 @@ pub struct OperationContext {
     pub timestamp: Timestamp,
 }
 
+/// The context in which a message is executed.
 #[derive(Clone, Copy, Debug)]
 pub struct MessageContext {
     /// The current chain ID.
     pub chain_id: ChainId,
     /// The chain ID where the message originated from.
     pub origin: ChainId,
+    /// The timestamp of the block on the origin chain that sent the message.
+    pub origin_timestamp: Timestamp,
     /// Whether the message was rejected by the original receiver and is now bouncing back.
     pub is_bouncing: bool,
     /// The authenticated owner of the operation that created the message, if any.
@@ -615,6 +693,7 @@ pub struct MessageContext {
     pub timestamp: Timestamp,
 }
 
+/// The context in which stream updates are processed.
 #[derive(Clone, Copy, Debug)]
 pub struct ProcessStreamsContext {
     /// The current chain ID.
@@ -649,6 +728,7 @@ impl From<OperationContext> for ProcessStreamsContext {
     }
 }
 
+/// The context in which a transaction is finalized.
 #[derive(Clone, Copy, Debug)]
 pub struct FinalizeContext {
     /// The current chain ID.
@@ -662,6 +742,7 @@ pub struct FinalizeContext {
     pub round: Option<u32>,
 }
 
+/// The context in which a query is executed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct QueryContext {
     /// The current chain ID.
@@ -672,13 +753,21 @@ pub struct QueryContext {
     pub local_time: Timestamp,
 }
 
+/// The runtime API shared by the contract and service parts of an application.
 pub trait BaseRuntime {
+    /// The pending result of a generic read.
     type Read: fmt::Debug + Send + Sync;
+    /// The pending result of a key existence check.
     type ContainsKey: fmt::Debug + Send + Sync;
+    /// The pending result of a multi-key existence check.
     type ContainsKeys: fmt::Debug + Send + Sync;
+    /// The pending result of reading the values for multiple keys.
     type ReadMultiValuesBytes: fmt::Debug + Send + Sync;
+    /// The pending result of reading the value for a single key.
     type ReadValueBytes: fmt::Debug + Send + Sync;
+    /// The pending result of finding the keys with a given prefix.
     type FindKeysByPrefix: fmt::Debug + Send + Sync;
+    /// The pending result of finding the key-value pairs with a given prefix.
     type FindKeyValuesByPrefix: fmt::Debug + Send + Sync;
 
     /// The current chain ID.
@@ -692,6 +781,12 @@ pub trait BaseRuntime {
 
     /// The current application creator's chain ID.
     fn application_creator_chain_id(&mut self) -> Result<ChainId, ExecutionError>;
+
+    /// Returns the description of the given application.
+    fn read_application_description(
+        &mut self,
+        application_id: ApplicationId,
+    ) -> Result<ApplicationDescription, ExecutionError>;
 
     /// The current application parameters.
     fn application_parameters(&mut self) -> Result<Vec<u8>, ExecutionError>;
@@ -711,8 +806,23 @@ pub trait BaseRuntime {
     /// Reads balance owners.
     fn read_balance_owners(&mut self) -> Result<Vec<AccountOwner>, ExecutionError>;
 
+    /// Reads the allowance for a given owner-spender pair.
+    fn read_allowance(
+        &mut self,
+        owner: AccountOwner,
+        spender: AccountOwner,
+    ) -> Result<Amount, ExecutionError>;
+
+    /// Reads all allowances.
+    fn read_allowances(
+        &mut self,
+    ) -> Result<Vec<(AccountOwner, AccountOwner, Amount)>, ExecutionError>;
+
     /// Reads the current ownership configuration for this chain.
     fn chain_ownership(&mut self) -> Result<ChainOwnership, ExecutionError>;
+
+    /// Reads the current application permissions for this chain.
+    fn application_permissions(&mut self) -> Result<ApplicationPermissions, ExecutionError>;
 
     /// Tests whether a key exists in the key-value store
     #[cfg(feature = "test")]
@@ -847,8 +957,18 @@ pub trait BaseRuntime {
 
     /// Returns the maximum blob size from the `ResourceControlPolicy`.
     fn maximum_blob_size(&mut self) -> Result<u64, ExecutionError>;
+
+    /// Returns whether contract log messages should be output.
+    /// This is typically enabled for clients but disabled for validators.
+    fn allow_application_logs(&mut self) -> Result<bool, ExecutionError>;
+
+    /// Sends a log message (used for forwarding logs from web workers to the main thread).
+    /// This is a fire-and-forget operation - errors are silently ignored.
+    #[cfg(web)]
+    fn send_log(&mut self, message: String, level: tracing::log::Level);
 }
 
+/// The runtime API available to the service part of an application.
 pub trait ServiceRuntime: BaseRuntime {
     /// Queries another application.
     fn try_query_application(
@@ -864,6 +984,7 @@ pub trait ServiceRuntime: BaseRuntime {
     fn check_execution_time(&mut self) -> Result<(), ExecutionError>;
 }
 
+/// The runtime API available to the contract part of an application.
 pub trait ContractRuntime: BaseRuntime {
     /// The authenticated owner for this execution, if there is one.
     fn authenticated_owner(&mut self) -> Result<Option<AccountOwner>, ExecutionError>;
@@ -874,6 +995,10 @@ pub trait ContractRuntime: BaseRuntime {
 
     /// The chain ID where the current message originated from, if there is one.
     fn message_origin_chain_id(&mut self) -> Result<Option<ChainId>, ExecutionError>;
+
+    /// The timestamp of the block on the origin chain that sent the current message, if there
+    /// is one.
+    fn message_origin_timestamp(&mut self) -> Result<Option<Timestamp>, ExecutionError>;
 
     /// The optional authenticated caller application ID, if it was provided and if there is one
     /// based on the execution context.
@@ -903,6 +1028,23 @@ pub trait ContractRuntime: BaseRuntime {
     fn claim(
         &mut self,
         source: Account,
+        destination: Account,
+        amount: Amount,
+    ) -> Result<(), ExecutionError>;
+
+    /// Approves spender to withdraw amount from owner's account.
+    fn approve(
+        &mut self,
+        owner: AccountOwner,
+        spender: AccountOwner,
+        amount: Amount,
+    ) -> Result<(), ExecutionError>;
+
+    /// Transfers amount from owner to destination using spender's allowance.
+    fn transfer_from(
+        &mut self,
+        owner: AccountOwner,
+        spender: AccountOwner,
         destination: Account,
         amount: Amount,
     ) -> Result<(), ExecutionError>;
@@ -952,16 +1094,20 @@ pub trait ContractRuntime: BaseRuntime {
         query: Vec<u8>,
     ) -> Result<Vec<u8>, ExecutionError>;
 
-    /// Opens a new chain.
+    /// Opens a new chain, crediting `balance` to `account` on it.
     fn open_chain(
         &mut self,
         ownership: ChainOwnership,
         application_permissions: ApplicationPermissions,
+        account: AccountOwner,
         balance: Amount,
     ) -> Result<ChainId, ExecutionError>;
 
     /// Closes the current chain.
     fn close_chain(&mut self) -> Result<(), ExecutionError>;
+
+    /// Changes the ownership of the current chain.
+    fn change_ownership(&mut self, ownership: ChainOwnership) -> Result<(), ExecutionError>;
 
     /// Changes the application permissions on the current chain.
     fn change_application_permissions(
@@ -985,12 +1131,14 @@ pub trait ContractRuntime: BaseRuntime {
     /// Creates a new data blob and returns its hash.
     fn create_data_blob(&mut self, bytes: Vec<u8>) -> Result<DataBlobHash, ExecutionError>;
 
-    /// Publishes a module with contract and service bytecode and returns the module ID.
+    /// Publishes a module with contract and service bytecode and an optional
+    /// BCS-encoded `Formats` description, returning the module ID.
     fn publish_module(
         &mut self,
         contract: Bytecode,
         service: Bytecode,
         vm_runtime: VmRuntime,
+        formats: Option<Vec<u8>>,
     ) -> Result<ModuleId, ExecutionError>;
 
     /// Returns the multi-leader round in which this block was validated.
@@ -1001,13 +1149,17 @@ pub trait ContractRuntime: BaseRuntime {
 }
 
 /// An operation to be executed in a block.
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, Allocative)]
+#[derive(
+    Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, Allocative, strum::AsRefStr,
+)]
 pub enum Operation {
     /// A system operation.
     System(Box<SystemOperation>),
     /// A user operation (in serialized form).
     User {
+        /// The ID of the application this operation targets.
         application_id: ApplicationId,
+        /// The serialized operation.
         #[serde(with = "serde_bytes")]
         #[debug(with = "hex_debug")]
         bytes: Vec<u8>,
@@ -1017,13 +1169,17 @@ pub enum Operation {
 impl BcsHashable<'_> for Operation {}
 
 /// A message to be sent and possibly executed in the receiver's block.
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, Allocative)]
+#[derive(
+    Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize, Allocative, strum::AsRefStr,
+)]
 pub enum Message {
     /// A system message.
     System(SystemMessage),
     /// A user message (in serialized form).
     User {
+        /// The ID of the application this message targets.
         application_id: ApplicationId,
+        /// The serialized message.
         #[serde(with = "serde_bytes")]
         #[debug(with = "hex_debug")]
         bytes: Vec<u8>,
@@ -1037,7 +1193,9 @@ pub enum Query {
     System(SystemQuery),
     /// A user query (in serialized form).
     User {
+        /// The ID of the application this query targets.
         application_id: ApplicationId,
+        /// The serialized query.
         #[serde(with = "serde_bytes")]
         #[debug(with = "hex_debug")]
         bytes: Vec<u8>,
@@ -1047,7 +1205,9 @@ pub enum Query {
 /// The outcome of the execution of a query.
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Serialize, Deserialize)]
 pub struct QueryOutcome<Response = QueryResponse> {
+    /// The response returned by the query.
     pub response: Response,
+    /// The operations scheduled by the query, to be included in the next block.
     pub operations: Vec<Operation>,
 }
 
@@ -1177,10 +1337,12 @@ impl OperationContext {
     }
 }
 
+/// An in-memory [`ExecutionRuntimeContext`] implementation used in tests.
 #[cfg(with_testing)]
 #[derive(Clone)]
 pub struct TestExecutionRuntimeContext {
     chain_id: ChainId,
+    thread_pool: Arc<ThreadPool>,
     execution_runtime_config: ExecutionRuntimeConfig,
     user_contracts: Arc<papaya::HashMap<ApplicationId, UserContractCode>>,
     user_services: Arc<papaya::HashMap<ApplicationId, UserServiceCode>>,
@@ -1190,9 +1352,11 @@ pub struct TestExecutionRuntimeContext {
 
 #[cfg(with_testing)]
 impl TestExecutionRuntimeContext {
+    /// Creates a new test execution runtime context for the given chain.
     pub fn new(chain_id: ChainId, execution_runtime_config: ExecutionRuntimeConfig) -> Self {
         Self {
             chain_id,
+            thread_pool: Arc::new(ThreadPool::new(20)),
             execution_runtime_config,
             user_contracts: Arc::default(),
             user_services: Arc::default(),
@@ -1208,6 +1372,10 @@ impl TestExecutionRuntimeContext {
 impl ExecutionRuntimeContext for TestExecutionRuntimeContext {
     fn chain_id(&self) -> ChainId {
         self.chain_id
+    }
+
+    fn thread_pool(&self) -> &Arc<ThreadPool> {
+        &self.thread_pool
     }
 
     fn execution_runtime_config(&self) -> ExecutionRuntimeConfig {
@@ -1252,12 +1420,12 @@ impl ExecutionRuntimeContext for TestExecutionRuntimeContext {
             .clone())
     }
 
-    async fn get_blob(&self, blob_id: BlobId) -> Result<Option<Blob>, ViewError> {
-        Ok(self.blobs.pin().get(&blob_id).cloned())
+    async fn get_blob(&self, blob_id: BlobId) -> Result<Option<Arc<Blob>>, ViewError> {
+        Ok(self.blobs.pin().get(&blob_id).cloned().map(Arc::new))
     }
 
-    async fn get_event(&self, event_id: EventId) -> Result<Option<Vec<u8>>, ViewError> {
-        Ok(self.events.pin().get(&event_id).cloned())
+    async fn get_event(&self, event_id: EventId) -> Result<Option<Arc<Vec<u8>>>, ViewError> {
+        Ok(self.events.pin().get(&event_id).cloned().map(Arc::new))
     }
 
     async fn get_network_description(&self) -> Result<Option<NetworkDescription>, ViewError> {
@@ -1276,6 +1444,21 @@ impl ExecutionRuntimeContext for TestExecutionRuntimeContext {
             genesis_committee_blob_hash,
             name: "dummy network description".to_string(),
         }))
+    }
+
+    async fn get_or_load_committee_by_hash(
+        &self,
+        hash: CryptoHash,
+    ) -> Result<Arc<Committee>, ExecutionError> {
+        let blob_id = BlobId::new(hash, BlobType::Committee);
+        let blob = self
+            .blobs
+            .pin()
+            .get(&blob_id)
+            .cloned()
+            .ok_or(ExecutionError::BlobsNotFound(vec![blob_id]))?;
+        let committee: Committee = bcs::from_bytes(blob.bytes())?;
+        Ok(Arc::new(committee))
     }
 
     async fn contains_blob(&self, blob_id: BlobId) -> Result<bool, ViewError> {
@@ -1320,6 +1503,7 @@ impl From<SystemOperation> for Operation {
 }
 
 impl Operation {
+    /// Creates a new system operation.
     pub fn system(operation: SystemOperation) -> Self {
         Operation::System(Box::new(operation))
     }
@@ -1355,6 +1539,7 @@ impl Operation {
         }
     }
 
+    /// Returns the ID of the application this operation targets.
     pub fn application_id(&self) -> GenericApplicationId {
         match self {
             Self::System(_) => GenericApplicationId::System,
@@ -1383,10 +1568,24 @@ impl Operation {
         };
         matches!(
             **system_op,
-            SystemOperation::ProcessNewEpoch(_)
-                | SystemOperation::ProcessRemovedEpoch(_)
-                | SystemOperation::UpdateStreams(_)
+            SystemOperation::ProcessNewEpoch(_) | SystemOperation::UpdateStream { .. }
         )
+    }
+
+    /// Returns whether this operation is an `UpdateStream` operation.
+    pub fn is_update_stream(&self) -> bool {
+        let Operation::System(system_op) = self else {
+            return false;
+        };
+        matches!(**system_op, SystemOperation::UpdateStream { .. })
+    }
+
+    /// Returns whether this operation is a `Checkpoint` operation.
+    pub fn is_checkpoint(&self) -> bool {
+        let Operation::System(system_op) = self else {
+            return false;
+        };
+        matches!(**system_op, SystemOperation::Checkpoint)
     }
 }
 
@@ -1397,8 +1596,14 @@ impl From<SystemMessage> for Message {
 }
 
 impl Message {
+    /// Creates a new system message.
     pub fn system(message: SystemMessage) -> Self {
         Message::System(message)
+    }
+
+    /// Returns whether this message is a `SystemMessage::CheckpointAck`.
+    pub fn is_checkpoint_ack(&self) -> bool {
+        matches!(self, Message::System(SystemMessage::CheckpointAck { .. }))
     }
 
     /// Creates a new user application message assuming that the `message` is valid for the
@@ -1415,6 +1620,7 @@ impl Message {
         })
     }
 
+    /// Returns the ID of the application this message targets.
     pub fn application_id(&self) -> GenericApplicationId {
         match self {
             Self::System(_) => GenericApplicationId::System,
@@ -1430,6 +1636,7 @@ impl From<SystemQuery> for Query {
 }
 
 impl Query {
+    /// Creates a new system query.
     pub fn system(query: SystemQuery) -> Self {
         Query::System(query)
     }
@@ -1454,6 +1661,7 @@ impl Query {
         })
     }
 
+    /// Returns the ID of the application this query targets.
     pub fn application_id(&self) -> GenericApplicationId {
         match self {
             Self::System(_) => GenericApplicationId::System,
@@ -1474,24 +1682,53 @@ impl From<Vec<u8>> for QueryResponse {
     }
 }
 
+/// Provenance of a stored blob: either defined by the genesis config (and thus
+/// known a priori to every node holding that config) or published by a confirmed
+/// block on some chain.
+#[derive(Eq, PartialEq, Debug, Hash, Clone, Serialize, Deserialize)]
+pub enum BlobOrigin {
+    /// The blob is part of the network's genesis: it isn't published by any
+    /// block, and every node that initialized storage from the same genesis
+    /// config already holds its content. Currently only the `ChainDescription`
+    /// blobs for root chains use this variant.
+    Genesis,
+    /// The blob was published by a confirmed block on the given chain at the
+    /// given height.
+    Published {
+        /// The chain on which the publishing block was confirmed.
+        chain_id: ChainId,
+        /// The height of the publishing block.
+        block_height: BlockHeight,
+    },
+}
+
 /// The state of a blob of binary data.
 #[derive(Eq, PartialEq, Debug, Hash, Clone, Serialize, Deserialize)]
 pub struct BlobState {
+    /// Where the blob comes from.
+    pub origin: BlobOrigin,
     /// Hash of the last `Certificate` that published or used this blob. If empty, the
     /// blob is known to be published by a confirmed certificate but we may not have fully
     /// processed this certificate just yet.
     pub last_used_by: Option<CryptoHash>,
-    /// The `ChainId` of the chain that published the change
-    pub chain_id: ChainId,
-    /// The `BlockHeight` of the chain that published the change
-    pub block_height: BlockHeight,
     /// Epoch of the `last_used_by` certificate (if any).
     pub epoch: Option<Epoch>,
+}
+
+impl BlobState {
+    /// The state of a blob defined by the genesis config: no publishing
+    /// certificate, no epoch.
+    pub const GENESIS: BlobState = BlobState {
+        origin: BlobOrigin::Genesis,
+        last_used_by: None,
+        epoch: None,
+    };
 }
 
 /// The runtime to use for running the application.
 #[derive(Clone, Copy, Display)]
 #[cfg_attr(with_wasm_runtime, derive(Debug, Default))]
+#[allow(missing_docs)]
 pub enum WasmRuntime {
     #[cfg(with_wasmer)]
     #[default]
@@ -1503,8 +1740,10 @@ pub enum WasmRuntime {
     Wasmtime,
 }
 
+/// The runtime to use for running EVM smart contracts.
 #[derive(Clone, Copy, Display)]
 #[cfg_attr(with_revm, derive(Debug, Default))]
+#[allow(missing_docs)]
 pub enum EvmRuntime {
     #[cfg(with_revm)]
     #[default]
@@ -1514,6 +1753,7 @@ pub enum EvmRuntime {
 
 /// Trait used to select a default `WasmRuntime`, if one is available.
 pub trait WithWasmDefault {
+    /// Returns the default `WasmRuntime` if one is available, otherwise leaves the value unchanged.
     fn with_wasm_default(self) -> Self;
 }
 
@@ -1555,3 +1795,20 @@ doc_scalar!(
     "A message to be sent and possibly executed in the receiver's block."
 );
 doc_scalar!(MessageKind, "The kind of outgoing message being sent");
+
+/// Registers every metric this crate declares.
+///
+/// Without this, a metric is only exported after the code path that observes it has run, so a
+/// rarely-taken path leaves its panels blank and makes a routine restart look like the metric
+/// was removed.
+#[cfg(with_metrics)]
+pub fn init_metrics() {
+    linera_base::init_metrics();
+    linera_views::init_metrics();
+    #[cfg(with_revm)]
+    evm::revm::metrics::init_metrics();
+    execution_state_actor::metrics::init_metrics();
+    system::metrics::init_metrics();
+    #[cfg(with_wasm_runtime)]
+    wasm::metrics::init_metrics();
+}

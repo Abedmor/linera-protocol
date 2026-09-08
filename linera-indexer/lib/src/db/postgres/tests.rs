@@ -5,7 +5,6 @@ use dockertest::{waitfor, DockerTest, Image, Source, TestBodySpecification};
 use linera_base::{
     crypto::{CryptoHash, TestString},
     data_types::{Amount, Blob, BlockHeight, Epoch, Timestamp},
-    hashed::Hashed,
     identifiers::{ApplicationId, ChainId},
 };
 use linera_chain::{
@@ -98,7 +97,7 @@ async fn test_high_level_atomic_api() {
         let height = BlockHeight(1);
         let timestamp = Timestamp::now();
         let test_block = create_test_block(chain_id, height);
-        let block_hash = Hashed::new(test_block.clone()).hash();
+        let block_hash = test_block.hash();
         let block_data = bincode::serialize(&test_block).unwrap();
 
         let blobs = vec![
@@ -145,7 +144,6 @@ async fn test_incoming_bundles_storage_and_query() {
         );
 
         let incoming_bundle_message = PostedMessage {
-            index: 0,
             authenticated_owner: None,
             grant: Amount::from_tokens(100),
             refund_grant_to: None,
@@ -180,7 +178,7 @@ async fn test_incoming_bundles_storage_and_query() {
                 incoming_bundle.clone(),
             ));
 
-        let block_hash = Hashed::new(test_block.clone()).hash();
+        let block_hash = test_block.hash();
         let block_data = bincode::serialize(&test_block).unwrap();
 
         let mut tx = db.begin_transaction().await.unwrap();
@@ -258,12 +256,12 @@ where
 {
     if let Ok(home) = std::env::var("HOME") {
         let docker_desktop_sock = if cfg!(target_os = "macos") {
-            format!("{}/.docker/run/docker.sock", home)
+            format!("{home}/.docker/run/docker.sock")
         } else {
-            format!("{}/var/run/docker.sock", home)
+            format!("{home}/var/run/docker.sock")
         };
         if std::path::Path::new(&docker_desktop_sock).exists() {
-            std::env::set_var("DOCKER_HOST", format!("unix://{}", docker_desktop_sock));
+            std::env::set_var("DOCKER_HOST", format!("unix://{docker_desktop_sock}"));
         }
     }
 
@@ -288,10 +286,7 @@ where
         let container = ops.handle("postgres");
         let (_, host_port) = container.host_port(5432).unwrap();
 
-        let database_url = format!(
-            "postgresql://testuser:testpass@localhost:{}/testdb",
-            host_port
-        );
+        let database_url = format!("postgresql://testuser:testpass@localhost:{host_port}/testdb");
 
         test_fn(database_url).await;
     })

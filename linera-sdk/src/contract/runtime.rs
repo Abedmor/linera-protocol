@@ -6,16 +6,14 @@
 use linera_base::{
     abi::{ContractAbi, ServiceAbi},
     data_types::{
-        Amount, ApplicationPermissions, BlockHeight, Bytecode, Resources, SendMessageRequest,
-        Timestamp,
+        Amount, ApplicationDescription, ApplicationPermissions, BlockHeight, Bytecode, Resources,
+        SendMessageRequest, Timestamp,
     },
     ensure, http,
     identifiers::{
         Account, AccountOwner, ApplicationId, ChainId, DataBlobHash, ModuleId, StreamName,
     },
-    ownership::{
-        AccountPermissionError, ChainOwnership, ChangeApplicationPermissionsError, CloseChainError,
-    },
+    ownership::{AccountPermissionError, ChainOwnership, ManageChainError},
     vm::VmRuntime,
 };
 use serde::Serialize;
@@ -38,6 +36,7 @@ where
     block_height: Option<BlockHeight>,
     message_is_bouncing: Option<Option<bool>>,
     message_origin_chain_id: Option<Option<ChainId>>,
+    message_origin_timestamp: Option<Option<Timestamp>>,
     timestamp: Option<Timestamp>,
 }
 
@@ -55,6 +54,7 @@ where
             block_height: None,
             message_is_bouncing: None,
             message_origin_chain_id: None,
+            message_origin_timestamp: None,
             timestamp: None,
         }
     }
@@ -99,6 +99,14 @@ where
             .get_or_insert_with(|| base_wit::get_application_creator_chain_id().into())
     }
 
+    /// Returns the description of the given application.
+    pub fn read_application_description(
+        &mut self,
+        application_id: ApplicationId,
+    ) -> ApplicationDescription {
+        base_wit::read_application_description(application_id.forget_abi().into()).into()
+    }
+
     /// Returns the ID of the current chain.
     pub fn chain_id(&mut self) -> ChainId {
         *self
@@ -135,6 +143,11 @@ where
         base_wit::get_chain_ownership().into()
     }
 
+    /// Retrieves the application permissions for the current chain.
+    pub fn application_permissions(&mut self) -> ApplicationPermissions {
+        base_wit::get_application_permissions().into()
+    }
+
     /// Makes an HTTP `request` as an oracle and returns the HTTP response.
     ///
     /// Should only be used with queries where it is very likely that all validators will receive
@@ -163,6 +176,11 @@ where
     /// Asserts that a data blob with the given hash exists in storage.
     pub fn assert_data_blob_exists(&mut self, hash: DataBlobHash) {
         base_wit::assert_data_blob_exists(hash.into())
+    }
+
+    /// Returns the amount of execution fuel remaining before execution is aborted.
+    pub fn remaining_fuel(&mut self) -> u64 {
+        contract_wit::remaining_fuel()
     }
 
     /// Returns true if the corresponding contract uses a zero amount of storage.
@@ -194,6 +212,14 @@ where
         *self
             .message_origin_chain_id
             .get_or_insert_with(|| contract_wit::message_origin_chain_id().map(ChainId::from))
+    }
+
+    /// Returns the timestamp of the block on the origin chain that sent the incoming message,
+    /// or [`None`] if not executing an incoming message.
+    pub fn message_origin_timestamp(&mut self) -> Option<Timestamp> {
+        *self
+            .message_origin_timestamp
+            .get_or_insert_with(|| contract_wit::message_origin_timestamp().map(Timestamp::from))
     }
 
     /// Returns the authenticated caller ID, if the caller configured it and if the current context
@@ -239,6 +265,28 @@ where
         contract_wit::claim(source.into(), destination.into(), amount.into())
     }
 
+    /// Approves `spender` to withdraw `amount` of native tokens from `owner`'s account.
+    pub fn approve(&mut self, owner: AccountOwner, spender: AccountOwner, amount: Amount) {
+        contract_wit::approve(owner.into(), spender.into(), amount.into())
+    }
+
+    /// Transfers `amount` of native tokens from `owner` to `destination` using `spender`'s
+    /// allowance.
+    pub fn transfer_from(
+        &mut self,
+        owner: AccountOwner,
+        spender: AccountOwner,
+        destination: Account,
+        amount: Amount,
+    ) {
+        contract_wit::transfer_from(
+            owner.into(),
+            spender.into(),
+            destination.into(),
+            amount.into(),
+        )
+    }
+
     /// Calls another application.
     pub fn call_application<A: ContractAbi + Send>(
         &mut self,
@@ -246,7 +294,7 @@ where
         application: ApplicationId<A>,
         call: &A::Operation,
     ) -> A::Response {
-        let call_bytes = A::serialize_operation(call)
+        let call_bytes = <A as ContractAbi>::serialize_operation(call)
             .expect("Failed to serialize `Operation` in cross-application call");
 
         let response_bytes = contract_wit::try_call_application(
@@ -310,24 +358,28 @@ where
     pub fn query_service<A: ServiceAbi + Send>(
         &mut self,
         application_id: ApplicationId<A>,
-        query: &A::Query,
+        query: A::Query,
     ) -> A::QueryResponse {
-        let query = serde_json::to_vec(query).expect("Failed to serialize service query");
+        let query = serde_json::to_vec(&query).expect("Failed to serialize service query");
         let response = contract_wit::query_service(application_id.forget_abi().into(), &query);
         serde_json::from_slice(&response).expect("Failed to deserialize service response")
     }
 
-    /// Opens a new chain, configuring it with the provided `chain_ownership`,
-    /// `application_permissions` and initial `balance` (debited from the current chain).
+    /// Opens a new chain, configuring it with the provided `chain_ownership` and
+    /// `application_permissions`, and crediting `balance` (debited from the current chain) to
+    /// `account` on the new chain. Use [`AccountOwner::CHAIN`] to fund the new chain's own
+    /// account, which is the only balance that pays fees for blocks it does not authenticate.
     pub fn open_chain(
         &mut self,
         chain_ownership: ChainOwnership,
         application_permissions: ApplicationPermissions,
+        account: AccountOwner,
         balance: Amount,
     ) -> ChainId {
         let chain_id = contract_wit::open_chain(
             &chain_ownership.into(),
             &application_permissions.into(),
+            account.into(),
             balance.into(),
         );
         chain_id.into()
@@ -335,15 +387,21 @@ where
 
     /// Closes the current chain. Returns an error if the application doesn't have
     /// permission to do so.
-    pub fn close_chain(&mut self) -> Result<(), CloseChainError> {
+    pub fn close_chain(&mut self) -> Result<(), ManageChainError> {
         contract_wit::close_chain().map_err(|error| error.into())
+    }
+
+    /// Changes the ownership of the current chain. Returns an error if the application doesn't
+    /// have permission to do so.
+    pub fn change_ownership(&mut self, ownership: ChainOwnership) -> Result<(), ManageChainError> {
+        contract_wit::change_ownership(&ownership.into()).map_err(|error| error.into())
     }
 
     /// Changes the application permissions for the current chain.
     pub fn change_application_permissions(
         &mut self,
         application_permissions: ApplicationPermissions,
-    ) -> Result<(), ChangeApplicationPermissionsError> {
+    ) -> Result<(), ManageChainError> {
         contract_wit::change_application_permissions(&application_permissions.into())
             .map_err(|error| error.into())
     }
@@ -380,19 +438,27 @@ where
     }
 
     /// Creates a new data blob and returns its hash.
-    pub fn create_data_blob(&mut self, bytes: &[u8]) -> DataBlobHash {
-        let hash = contract_wit::create_data_blob(bytes);
+    pub fn create_data_blob(&mut self, bytes: Vec<u8>) -> DataBlobHash {
+        let hash = contract_wit::create_data_blob(&bytes);
         hash.into()
     }
 
-    /// Publishes a module with contract and service bytecode and returns the module ID.
+    /// Publishes a module with contract and service bytecode and an optional
+    /// BCS-encoded `Formats` description, returning the module ID.
     pub fn publish_module(
         &mut self,
         contract: Bytecode,
         service: Bytecode,
         vm_runtime: VmRuntime,
+        formats: Option<Vec<u8>>,
     ) -> ModuleId {
-        contract_wit::publish_module(&contract.into(), &service.into(), vm_runtime.into()).into()
+        contract_wit::publish_module(
+            &contract.into(),
+            &service.into(),
+            vm_runtime.into(),
+            formats.as_deref(),
+        )
+        .into()
     }
 
     /// Returns the multi-leader round in which this block was validated.

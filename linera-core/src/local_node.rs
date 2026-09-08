@@ -3,29 +3,29 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     sync::Arc,
 };
 
 use futures::{stream::FuturesUnordered, TryStreamExt as _};
 use linera_base::{
     crypto::{CryptoHash, ValidatorPublicKey},
-    data_types::{ArithmeticError, Blob, BlockHeight, Epoch},
-    identifiers::{BlobId, ChainId, StreamId},
+    data_types::{ArithmeticError, Blob, BlockHeight},
+    identifiers::{BlobId, ChainId, EventId, StreamId},
 };
 use linera_chain::{
-    data_types::{BlockProposal, ProposedBlock},
-    types::{Block, GenericCertificate},
-    ChainStateView,
+    data_types::{BlockProposal, BundleExecutionPolicy, ProposedBlock},
+    types::{Block, ConfirmedBlockCertificate},
+    ChainError, ChainExecutionContext, StreamCounts,
 };
-use linera_execution::{committee::Committee, BlobState, Query, QueryOutcome};
-use linera_storage::Storage;
+use linera_execution::{BlobState, ExecutionError, Query, QueryOutcome, ResourceTracker};
+use linera_storage::{Arc as CacheArc, Storage};
 use linera_views::ViewError;
 use thiserror::Error;
-use tokio::sync::OwnedRwLockReadGuard;
 use tracing::{instrument, warn};
 
 use crate::{
+    chain_worker::ProcessConfirmedBlockMode,
     data_types::{ChainInfo, ChainInfoQuery, ChainInfoResponse},
     notifier::Notifier,
     worker::{ProcessableCertificate, WorkerError, WorkerState},
@@ -49,7 +49,8 @@ where
 }
 
 /// Error type for the operations on a local node.
-#[derive(Debug, Error)]
+#[derive(Debug, Error, strum::IntoStaticStr)]
+#[allow(missing_docs)]
 pub enum LocalNodeError {
     #[error(transparent)]
     ArithmeticError(#[from] ArithmeticError),
@@ -68,12 +69,48 @@ pub enum LocalNodeError {
 
     #[error("Blobs not found: {0:?}")]
     BlobsNotFound(Vec<BlobId>),
+
+    #[error("Blocks not found: {0:?}")]
+    BlocksNotFound(Vec<CryptoHash>),
+
+    #[error("Events not found: {0:?}")]
+    EventsNotFound(Vec<EventId>),
+}
+
+impl LocalNodeError {
+    /// Returns the qualified error variant name for the `error_type` metric label,
+    /// delegating to [`WorkerError::error_type`] for wrapped worker errors.
+    pub fn error_type(&self) -> String {
+        match self {
+            LocalNodeError::WorkerError(worker_error) => worker_error.error_type(),
+            other => {
+                let variant: &'static str = other.into();
+                format!("LocalNodeError::{variant}")
+            }
+        }
+    }
+}
+
+impl From<ExecutionError> for LocalNodeError {
+    fn from(error: ExecutionError) -> Self {
+        match error {
+            ExecutionError::BlobsNotFound(blob_ids) => LocalNodeError::BlobsNotFound(blob_ids),
+            ExecutionError::EventsNotFound(event_ids) => LocalNodeError::EventsNotFound(event_ids),
+            ExecutionError::ViewError(view_error) => LocalNodeError::ViewError(view_error),
+            error => LocalNodeError::WorkerError(WorkerError::from(ChainError::ExecutionError(
+                Box::new(error),
+                ChainExecutionContext::Block,
+            ))),
+        }
+    }
 }
 
 impl From<WorkerError> for LocalNodeError {
     fn from(error: WorkerError) -> Self {
         match error {
             WorkerError::BlobsNotFound(blob_ids) => LocalNodeError::BlobsNotFound(blob_ids),
+            WorkerError::BlocksNotFound(hashes) => LocalNodeError::BlocksNotFound(hashes),
+            WorkerError::EventsNotFound(event_ids) => LocalNodeError::EventsNotFound(event_ids),
             error => LocalNodeError::WorkerError(error),
         }
     }
@@ -81,23 +118,22 @@ impl From<WorkerError> for LocalNodeError {
 
 impl<S> LocalNodeClient<S>
 where
-    S: Storage + Clone + Send + Sync + 'static,
+    S: Storage + Clone + 'static,
 {
     #[instrument(level = "trace", skip_all)]
     pub async fn handle_block_proposal(
         &self,
         proposal: BlockProposal,
     ) -> Result<ChainInfoResponse, LocalNodeError> {
-        // In local nodes, we can trust fully_handle_certificate to carry all actions eventually.
-        let (response, _actions) =
-            Box::pin(self.node.state.handle_block_proposal(proposal)).await?;
-        Ok(response)
+        // In local nodes, cross-chain actions will be handled internally, so we discard them.
+        let (response, _actions) = Box::pin(self.node.state.handle_block_proposal(proposal)).await;
+        Ok(response?)
     }
 
     #[instrument(level = "trace", skip_all)]
     pub async fn handle_certificate<T>(
         &self,
-        certificate: GenericCertificate<T>,
+        certificate: T::Certificate,
         notifier: &impl Notifier,
     ) -> Result<ChainInfoResponse, LocalNodeError>
     where
@@ -111,14 +147,42 @@ where
         .await?)
     }
 
+    /// Same as [`Self::handle_certificate`] but for a confirmed block certificate
+    /// and with an explicit [`ProcessConfirmedBlockMode`]. The generic variant
+    /// always uses [`ProcessConfirmedBlockMode::Auto`].
+    #[instrument(level = "trace", skip_all)]
+    pub async fn handle_confirmed_certificate(
+        &self,
+        certificate: ConfirmedBlockCertificate,
+        mode: ProcessConfirmedBlockMode,
+        notifier: &impl Notifier,
+    ) -> Result<ChainInfoResponse, LocalNodeError> {
+        Ok(Box::pin(
+            self.node
+                .state
+                .fully_handle_confirmed_certificate_with_notifications(certificate, mode, notifier),
+        )
+        .await?)
+    }
+
+    /// Test helper: returns the stored [`ConfirmedBlockCertificate`] for a
+    /// chain's block at a given height (or [`WorkerError::BlocksNotFound`] if
+    /// the height is referenced but the bytes aren't local).
+    #[cfg(with_testing)]
+    pub async fn read_certificate(
+        &self,
+        chain_id: linera_base::identifiers::ChainId,
+        height: linera_base::data_types::BlockHeight,
+    ) -> Result<Option<CacheArc<ConfirmedBlockCertificate>>, LocalNodeError> {
+        Ok(self.node.state.read_certificate(chain_id, height).await?)
+    }
+
     #[instrument(level = "trace", skip_all)]
     pub async fn handle_chain_info_query(
         &self,
         query: ChainInfoQuery,
     ) -> Result<ChainInfoResponse, LocalNodeError> {
-        // In local nodes, we can trust fully_handle_certificate to carry all actions eventually.
-        let (response, _actions) = self.node.state.handle_chain_info_query(query).await?;
-        Ok(response)
+        Ok(self.node.state.handle_chain_info_query(query).await?)
     }
 
     #[instrument(level = "trace", skip_all)]
@@ -133,17 +197,31 @@ where
         self.node.state.storage_client().clone()
     }
 
+    /// Executes a block with a policy for handling bundle failures.
+    ///
+    /// Returns the modified block (bundles may be rejected/removed based on the policy),
+    /// the executed block, chain info response, and resource tracker.
     #[instrument(level = "trace", skip_all)]
     pub async fn stage_block_execution(
         &self,
         block: ProposedBlock,
         round: Option<u32>,
         published_blobs: Vec<Blob>,
-    ) -> Result<(Block, ChainInfoResponse), LocalNodeError> {
+        policy: BundleExecutionPolicy,
+    ) -> Result<
+        (
+            ProposedBlock,
+            Block,
+            ChainInfoResponse,
+            ResourceTracker,
+            HashSet<ChainId>,
+        ),
+        LocalNodeError,
+    > {
         Ok(self
             .node
             .state
-            .stage_block_execution(block, round, published_blobs)
+            .stage_block_execution(block, round, published_blobs, policy)
             .await?)
     }
 
@@ -151,7 +229,7 @@ where
     pub async fn read_blobs_from_storage(
         &self,
         blob_ids: &[BlobId],
-    ) -> Result<Option<Vec<Blob>>, LocalNodeError> {
+    ) -> Result<Option<Vec<CacheArc<Blob>>>, LocalNodeError> {
         let storage = self.storage_client();
         Ok(storage.read_blobs(blob_ids).await?.into_iter().collect())
     }
@@ -223,7 +301,7 @@ where
     pub async fn chain_state_view(
         &self,
         chain_id: ChainId,
-    ) -> Result<OwnedRwLockReadGuard<ChainStateView<S::Context>>, LocalNodeError> {
+    ) -> Result<crate::worker::ChainStateViewReadGuard<S>, LocalNodeError> {
         Ok(self.node.state.chain_state_view(chain_id).await?)
     }
 
@@ -242,29 +320,37 @@ where
         chain_id: ChainId,
         query: Query,
         block_hash: Option<CryptoHash>,
-    ) -> Result<QueryOutcome, LocalNodeError> {
-        let outcome = self
+    ) -> Result<(QueryOutcome, BlockHeight), LocalNodeError> {
+        let result = self
             .node
             .state
             .query_application(chain_id, query, block_hash)
             .await?;
-        Ok(outcome)
+        Ok(result)
     }
 
     /// Handles any pending local cross-chain requests.
-    #[instrument(level = "trace", skip(self))]
+    ///
+    /// Does not initialize the sender chain's execution state, so it is safe to
+    /// call even when the sender's `ChainDescription` blob is not in local storage.
+    /// Previously this went through `handle_chain_info_query`, which unconditionally
+    /// initialized the worker and therefore forced a `ChainDescription` download on
+    /// every call.
+    #[instrument(level = "trace", skip(self, notifier))]
     pub async fn retry_pending_cross_chain_requests(
         &self,
         sender_chain: ChainId,
+        notifier: &impl Notifier,
     ) -> Result<(), LocalNodeError> {
-        let (_response, actions) = self
+        let actions = self
             .node
             .state
-            .handle_chain_info_query(ChainInfoQuery::new(sender_chain).with_network_actions())
+            .cross_chain_network_actions(sender_chain)
             .await?;
         let mut requests = VecDeque::from_iter(actions.cross_chain_requests);
         while let Some(request) = requests.pop_front() {
             let new_actions = self.node.state.handle_cross_chain_request(request).await?;
+            notifier.notify(&new_actions.notifications);
             requests.extend(new_actions.cross_chain_requests);
         }
         Ok(())
@@ -278,8 +364,9 @@ where
         chain_ids: impl IntoIterator<Item = &ChainId>,
         receiver_id: ChainId,
     ) -> Result<BTreeMap<ChainId, BlockHeight>, LocalNodeError> {
-        let futures =
-            FuturesUnordered::from_iter(chain_ids.into_iter().map(|chain_id| async move {
+        let futures = chain_ids
+            .into_iter()
+            .map(|chain_id| async move {
                 let (next_block_height, next_height_to_schedule) = match self
                     .get_tip_state_and_outbox_info(*chain_id, receiver_id)
                     .await
@@ -296,7 +383,8 @@ where
                     next_block_height
                 };
                 Ok::<_, LocalNodeError>((*chain_id, next_height))
-            }));
+            })
+            .collect::<FuturesUnordered<_>>();
         futures.try_collect().await
     }
 
@@ -367,17 +455,40 @@ where
         Ok(self.node.state.get_event_subscriptions(chain_id).await?)
     }
 
-    /// Gets the next expected event index for a stream.
-    pub async fn get_next_expected_event(
+    /// Gets a stream's [`StreamCounts`]: its next expected event index and its lowest readable
+    /// index, read from a single chain state view so they are mutually consistent.
+    pub async fn get_stream_indices(
         &self,
         chain_id: ChainId,
         stream_id: StreamId,
-    ) -> Result<Option<u32>, LocalNodeError> {
+    ) -> Result<StreamCounts, LocalNodeError> {
         Ok(self
             .node
             .state
-            .get_next_expected_event(chain_id, stream_id)
+            .get_stream_indices(chain_id, stream_id)
             .await?)
+    }
+
+    /// Gets the `next_expected_events` indices for the given streams.
+    pub async fn next_expected_events(
+        &self,
+        chain_id: ChainId,
+        stream_ids: Vec<StreamId>,
+    ) -> Result<BTreeMap<StreamId, u32>, LocalNodeError> {
+        Ok(self
+            .node
+            .state
+            .next_expected_events(chain_id, stream_ids)
+            .await?)
+    }
+
+    /// Test helper: resets a chain and re-executes it from its latest checkpoint.
+    #[cfg(with_testing)]
+    pub async fn reset_and_reexecute_chain(
+        &self,
+        chain_id: ChainId,
+    ) -> Result<Vec<crate::data_types::CrossChainRequest>, LocalNodeError> {
+        Ok(self.node.state.reset_and_reexecute_chain(chain_id).await?)
     }
 
     /// Gets received certificate trackers.
@@ -418,37 +529,23 @@ where
     }
 }
 
-/// Extension trait for [`ChainInfo`]s from our local node. These should always be valid and
-/// contain the requested information.
-pub trait LocalChainInfoExt {
-    /// Returns the requested map of committees.
-    fn into_committees(self) -> Result<BTreeMap<Epoch, Committee>, LocalNodeError>;
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    /// Returns the current committee.
-    fn into_current_committee(self) -> Result<Committee, LocalNodeError>;
-
-    /// Returns a reference to the current committee.
-    fn current_committee(&self) -> Result<&Committee, LocalNodeError>;
-}
-
-impl LocalChainInfoExt for ChainInfo {
-    fn into_committees(self) -> Result<BTreeMap<Epoch, Committee>, LocalNodeError> {
-        self.requested_committees
-            .ok_or(LocalNodeError::InvalidChainInfoResponse)
+    #[test]
+    fn error_type_delegates_to_worker_error() {
+        assert_eq!(
+            LocalNodeError::WorkerError(WorkerError::InvalidOwner).error_type(),
+            "WorkerError::InvalidOwner"
+        );
     }
 
-    fn into_current_committee(self) -> Result<Committee, LocalNodeError> {
-        self.requested_committees
-            .ok_or(LocalNodeError::InvalidChainInfoResponse)?
-            .remove(&self.epoch)
-            .ok_or(LocalNodeError::InactiveChain(self.chain_id))
-    }
-
-    fn current_committee(&self) -> Result<&Committee, LocalNodeError> {
-        self.requested_committees
-            .as_ref()
-            .ok_or(LocalNodeError::InvalidChainInfoResponse)?
-            .get(&self.epoch)
-            .ok_or(LocalNodeError::InactiveChain(self.chain_id))
+    #[test]
+    fn error_type_falls_back_to_local_node_variant() {
+        assert_eq!(
+            LocalNodeError::InvalidChainInfoResponse.error_type(),
+            "LocalNodeError::InvalidChainInfoResponse"
+        );
     }
 }

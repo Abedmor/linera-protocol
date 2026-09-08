@@ -1,11 +1,19 @@
 <script setup lang="ts">
 import Json from './Json.vue'
+import DecodedBytes from './DecodedBytes.vue'
+import { displayValue } from './utils'
 
 defineProps<{
   messages: any[] // Vec<OutgoingMessage>
   transactionIndex: number
   blockHash: string
 }>()
+
+function bytesToHex(value: any): string | null {
+  if (Array.isArray(value)) return value.map((b: number) => b.toString(16).padStart(2, '0')).join('')
+  if (typeof value === 'string') return value
+  return null
+}
 
 // Helper function to extract message metadata from the message field
 function getMessageMetadata(msg: any) {
@@ -104,8 +112,22 @@ function getMessageMetadata(msg: any) {
 
           <div class="mb-2 small">
             <strong>Destination:</strong>
-            <span class="font-monospace" v-if="typeof msg.destination === 'string'">{{ short_hash(msg.destination) }}</span>
-            <span v-else>{{ JSON.stringify(msg.destination) }}</span>
+            <a v-if="typeof msg.destination === 'string'" @click="$root.route(undefined, [['chain', msg.destination]])" class="btn btn-link btn-sm p-0 font-monospace">{{ short_hash(msg.destination) }}</a>
+            <template v-else-if="msg.destination && typeof msg.destination === 'object'">
+              <span v-if="msg.destination.Subscribers" class="font-monospace small">
+                Subscribers:
+                <span v-for="(sub, si) in msg.destination.Subscribers" :key="si">
+                  <a v-if="typeof sub === 'string'" @click="$root.route(undefined, [['chain', sub]])" class="btn btn-link btn-sm p-0 font-monospace">{{ short_hash(sub) }}</a>
+                  <span v-else>{{ displayValue(sub) }}</span>
+                  <span v-if="si < msg.destination.Subscribers.length - 1">, </span>
+                </span>
+              </span>
+              <span v-else-if="msg.destination.Direct">
+                <a @click="$root.route(undefined, [['chain', msg.destination.Direct]])" class="btn btn-link btn-sm p-0 font-monospace">{{ short_hash(msg.destination.Direct) }}</a>
+              </span>
+              <span v-else class="font-monospace small">{{ displayValue(msg.destination) }}</span>
+            </template>
+            <span v-else>{{ msg.destination }}</span>
           </div>
 
           <!-- Display structured message metadata if available -->
@@ -124,7 +146,7 @@ function getMessageMetadata(msg: any) {
               <div v-else-if="getMessageMetadata(msg).systemMessage.withdraw" class="small">
                 <div><strong>Owner:</strong> {{ getMessageMetadata(msg).systemMessage.withdraw.owner }}</div>
                 <div><strong>Amount:</strong> {{ getMessageMetadata(msg).systemMessage.withdraw.amount }}</div>
-                <div><strong>Recipient:</strong> {{ getMessageMetadata(msg).systemMessage.withdraw.recipient.owner }}@{{ short_hash(getMessageMetadata(msg).systemMessage.withdraw.recipient.chainId) }}</div>
+                <div><strong>Recipient:</strong> {{ getMessageMetadata(msg).systemMessage.withdraw.recipient.owner }}@<a @click="$root.route(undefined, [['chain', getMessageMetadata(msg).systemMessage.withdraw.recipient.chainId]])" class="btn btn-link btn-sm p-0 font-monospace">{{ short_hash(getMessageMetadata(msg).systemMessage.withdraw.recipient.chainId) }}</a></div>
               </div>
 
               <!-- Generic system message data for other types -->
@@ -137,6 +159,13 @@ function getMessageMetadata(msg: any) {
               <span class="badge bg-success mb-2">User Message</span>
               <div v-if="getMessageMetadata(msg).applicationId" class="small">
                 <strong>Application:</strong> {{ short_app_id(getMessageMetadata(msg).applicationId) }}
+              </div>
+              <div v-if="getMessageMetadata(msg).applicationId && bytesToHex(getMessageMetadata(msg).userBytesHex)" class="mt-2">
+                <DecodedBytes
+                  :application-id="getMessageMetadata(msg).applicationId"
+                  :bytes-hex="bytesToHex(getMessageMetadata(msg).userBytesHex)!"
+                  kind="message"
+                />
               </div>
             </div>
           </div>

@@ -49,7 +49,6 @@ query ChainInbox($chainId: ChainId!, $origin: ChainId!) {
                   owner
                 }
                 kind
-                index
                 message
                 messageMetadata {
                   messageType
@@ -89,7 +88,6 @@ query ChainInbox($chainId: ChainId!, $origin: ChainId!) {
                   owner
                 }
                 kind
-                index
                 message
                 messageMetadata {
                   messageType
@@ -132,13 +130,12 @@ query Chain(
       system {
         description
         epoch
-        adminId
+        adminChainId
         ownership
         balance
         timestamp
       }
     }
-    executionStateHash
     tipState {
       blockHash
       nextBlockHeight
@@ -153,8 +150,11 @@ query Chain(
       fallbackOwners
       currentRound
     }
-    confirmedLog {
-      entries
+    blockHashes {
+      entries {
+        key
+        value
+      }
     }
     receivedLog {
       entries {
@@ -189,7 +189,6 @@ query Chain(
                   owner
                 }
                 kind
-                index
                 message
                 messageMetadata {
                   messageType
@@ -229,7 +228,6 @@ query Chain(
                   owner
                 }
                 kind
-                index
                 message
                 messageMetadata {
                   messageType
@@ -346,7 +344,6 @@ query Block($hash: CryptoHash, $chainId: ChainId!) {
                   owner
                 }
                 kind
-                index
                 message
                 messageMetadata {
                   messageType
@@ -397,6 +394,7 @@ query Block($hash: CryptoHash, $chainId: ChainId!) {
                 amount
               }
               openChain {
+                account
                 balance
                 ownership {
                   ownershipJson
@@ -447,9 +445,11 @@ query Block($hash: CryptoHash, $chainId: ChainId!) {
                 moduleId
               }
               epoch
-              updateStreams {
+              updateStream {
+                applicationId
                 chainId
                 streamId
+                firstIndex
                 nextIndex
               }
             }
@@ -524,7 +524,6 @@ query Blocks($from: CryptoHash, $chainId: ChainId!, $limit: Int) {
                   owner
                 }
                 kind
-                index
                 message
                 messageMetadata {
                   messageType
@@ -575,6 +574,7 @@ query Blocks($from: CryptoHash, $chainId: ChainId!, $limit: Int) {
                 amount
               }
               openChain {
+                account
                 balance
                 ownership {
                   ownershipJson
@@ -625,9 +625,11 @@ query Blocks($from: CryptoHash, $chainId: ChainId!, $limit: Int) {
                 moduleId
               }
               epoch
-              updateStreams {
+              updateStream {
+                applicationId
                 chainId
                 streamId
+                firstIndex
                 nextIndex
               }
             }

@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(with_simple_network)]
 use crate::simple;
 
+/// The configuration for cross-chain message delivery.
 #[derive(Clone, Debug, Parser)]
 #[cfg_attr(with_testing, derive(PartialEq))]
 pub struct CrossChainConfig {
@@ -24,6 +25,10 @@ pub struct CrossChainConfig {
     /// Delay before retrying of cross-chain message.
     #[arg(long = "cross-chain-retry-delay-ms", default_value = "2000")]
     pub(crate) retry_delay_ms: u64,
+
+    /// Maximum backoff delay for cross-chain message retries.
+    #[arg(long = "cross-chain-max-backoff-ms", default_value = "30000")]
+    pub(crate) max_backoff_ms: u64,
 
     /// Introduce a delay before sending every cross-chain message (e.g. for testing purpose).
     #[arg(long = "cross-chain-sender-delay-ms", default_value = "0")]
@@ -41,6 +46,7 @@ impl Default for CrossChainConfig {
 }
 
 impl CrossChainConfig {
+    /// Returns the command-line arguments corresponding to this configuration.
     pub fn to_args(&self) -> Vec<String> {
         vec![
             "--cross-chain-queue-size".to_string(),
@@ -49,6 +55,8 @@ impl CrossChainConfig {
             self.max_retries.to_string(),
             "--cross-chain-retry-delay-ms".to_string(),
             self.retry_delay_ms.to_string(),
+            "--cross-chain-max-backoff-ms".to_string(),
+            self.max_backoff_ms.to_string(),
             "--cross-chain-sender-delay-ms".to_string(),
             self.sender_delay_ms.to_string(),
             "--cross-chain-sender-failure-rate".to_string(),
@@ -57,13 +65,23 @@ impl CrossChainConfig {
     }
 }
 
+/// The configuration for notification delivery to proxies.
 #[derive(Clone, Debug, Parser)]
 pub struct NotificationConfig {
-    /// Number of notifications allowed before blocking the main server loop
+    /// Size of the broadcast channel buffer for notifications
     #[arg(long = "notification-queue-size", default_value = "1000")]
-    pub(crate) notification_queue_size: usize,
+    pub notification_queue_size: usize,
+
+    /// Maximum number of notifications per batch sent to proxy
+    #[arg(long = "notification-batch-size", default_value = "100")]
+    pub notification_batch_size: usize,
+
+    /// Maximum number of concurrent batch send tasks per proxy
+    #[arg(long = "notification-max-in-flight", default_value = "8")]
+    pub notification_max_in_flight: usize,
 }
 
+/// The index of a shard within a validator.
 pub type ShardId = usize;
 
 /// The network configuration of a shard.
@@ -78,10 +96,12 @@ pub struct ShardConfig {
 }
 
 impl ShardConfig {
+    /// Returns the `host:port` address of the shard.
     pub fn address(&self) -> String {
         format!("{}:{}", self.host, self.port)
     }
 
+    /// Returns the HTTP URL of the shard.
     pub fn http_address(&self) -> String {
         format!("http://{}:{}", self.host, self.port)
     }
@@ -101,6 +121,7 @@ pub struct ProxyConfig {
 }
 
 impl ProxyConfig {
+    /// Returns the internal URL used by shards to reach the proxy over the given protocol.
     pub fn internal_address(&self, protocol: &NetworkProtocol) -> String {
         format!(
             "{}://{}:{}",
@@ -114,14 +135,19 @@ impl ProxyConfig {
 /// The network protocol.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum NetworkProtocol {
+    /// The simple TCP/UDP transport protocol.
     #[cfg(with_simple_network)]
     Simple(simple::TransportProtocol),
+    /// The gRPC protocol, with the given TLS configuration.
     Grpc(TlsConfig),
 }
 
+/// The TLS configuration for the gRPC protocol.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TlsConfig {
+    /// Communicate over plaintext, without TLS encryption.
     ClearText,
+    /// Communicate over TLS-encrypted connections.
     Tls,
 }
 
@@ -163,6 +189,7 @@ pub struct ValidatorInternalNetworkPreConfig<P> {
 }
 
 impl<P> ValidatorInternalNetworkPreConfig<P> {
+    /// Returns a copy of this configuration with the protocol replaced by the given one.
     pub fn clone_with_protocol<Q>(&self, protocol: Q) -> ValidatorInternalNetworkPreConfig<Q> {
         ValidatorInternalNetworkPreConfig {
             public_key: self.public_key,
@@ -175,6 +202,7 @@ impl<P> ValidatorInternalNetworkPreConfig<P> {
 }
 
 impl ValidatorInternalNetworkConfig {
+    /// Returns the URLs of the configured block exporters.
     pub fn exporter_addresses(&self) -> Vec<String> {
         self.block_exporters
             .iter()
@@ -186,6 +214,7 @@ impl ValidatorInternalNetworkConfig {
 }
 
 impl ValidatorPublicNetworkConfig {
+    /// Returns the public HTTP URL of the validator.
     pub fn http_address(&self) -> String {
         format!("{}://{}:{}", self.protocol.scheme(), self.host, self.port)
     }
@@ -203,6 +232,7 @@ pub struct ValidatorPublicNetworkPreConfig<P> {
 }
 
 impl<P> ValidatorPublicNetworkPreConfig<P> {
+    /// Returns a copy of this configuration with the protocol replaced by the given one.
     pub fn clone_with_protocol<Q>(&self, protocol: Q) -> ValidatorPublicNetworkPreConfig<Q> {
         ValidatorPublicNetworkPreConfig {
             protocol,
@@ -225,7 +255,7 @@ impl std::fmt::Display for NetworkProtocol {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             #[cfg(with_simple_network)]
-            NetworkProtocol::Simple(protocol) => write!(f, "{:?}", protocol),
+            NetworkProtocol::Simple(protocol) => write!(f, "{protocol:?}"),
             NetworkProtocol::Grpc(tls) => match tls {
                 TlsConfig::ClearText => write!(f, "grpc"),
                 TlsConfig::Tls => write!(f, "grpcs"),
@@ -247,7 +277,7 @@ where
             parts.len() == 3,
             "Expecting format `(tcp|udp|grpc|grpcs):host:port`"
         );
-        let protocol = parts[0].parse().map_err(|s| anyhow::anyhow!("{}", s))?;
+        let protocol = parts[0].parse().map_err(|s| anyhow::anyhow!("{s}"))?;
         let host = parts[1].to_owned();
         let port = parts[2].parse()?;
         Ok(ValidatorPublicNetworkPreConfig {
@@ -276,6 +306,10 @@ impl std::str::FromStr for NetworkProtocol {
 
 impl<P> ValidatorInternalNetworkPreConfig<P> {
     /// Static shard assignment
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "result is reduced modulo shards.len(), so any truncation is irrelevant"
+    )]
     pub fn get_shard_id(&self, chain_id: ChainId) -> ShardId {
         use std::hash::{Hash, Hasher};
         let mut s = std::collections::hash_map::DefaultHasher::new();
@@ -285,6 +319,7 @@ impl<P> ValidatorInternalNetworkPreConfig<P> {
         (s.finish() as ShardId) % self.shards.len()
     }
 
+    /// Returns the [`ShardConfig`] for the given shard id.
     pub fn shard(&self, shard_id: ShardId) -> &ShardConfig {
         &self.shards[shard_id]
     }
@@ -305,6 +340,7 @@ pub struct ExporterServiceConfig {
 }
 
 impl ExporterServiceConfig {
+    /// Creates a new [`ExporterServiceConfig`] from the given host and port.
     pub fn new(host: String, port: u16) -> ExporterServiceConfig {
         ExporterServiceConfig { host, port }
     }

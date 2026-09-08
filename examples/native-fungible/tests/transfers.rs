@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, HashMap};
 
 use fungible::{self, FungibleTokenAbi};
 use linera_sdk::{
+    abis::fungible::FungibleOperation,
     linera_base_types::{Account, AccountOwner, Amount, CryptoHash},
     test::{ActiveChain, TestValidator},
 };
@@ -31,7 +32,7 @@ async fn chain_balance_transfers() {
     let funding_chain = validator.get_chain(&validator.admin_chain_id());
     let recipient = Account::chain(recipient_chain.id());
 
-    let transfer_certificate = funding_chain
+    let (transfer_certificate, _) = funding_chain
         .add_block(|block| {
             block.with_native_token_transfer(AccountOwner::CHAIN, recipient, transfer_amount);
         })
@@ -69,7 +70,7 @@ async fn transfer_to_owner() {
     let owner = AccountOwner::from(CryptoHash::test_hash("owner"));
     let recipient = Account::new(recipient_chain.id(), owner);
 
-    let transfer_certificate = funding_chain
+    let (transfer_certificate, _) = funding_chain
         .add_block(|block| {
             block.with_native_token_transfer(AccountOwner::CHAIN, recipient, transfer_amount);
         })
@@ -111,7 +112,7 @@ async fn transfer_to_multiple_owners() {
         .copied()
         .map(|account_owner| Account::new(recipient_chain.id(), account_owner));
 
-    let transfer_certificate = funding_chain
+    let (transfer_certificate, _) = funding_chain
         .add_block(|block| {
             for (recipient, transfer_amount) in recipients.zip(transfer_amounts.clone()) {
                 block.with_native_token_transfer(AccountOwner::CHAIN, recipient, transfer_amount);
@@ -152,7 +153,7 @@ async fn emptied_account_disappears_from_queries() {
     let owner = AccountOwner::from(recipient_chain.public_key());
     let recipient = Account::new(recipient_chain.id(), owner);
 
-    let transfer_certificate = funding_chain
+    let (transfer_certificate, _) = funding_chain
         .add_block(|block| {
             block.with_native_token_transfer(AccountOwner::CHAIN, recipient, transfer_amount);
         })
@@ -176,6 +177,160 @@ async fn emptied_account_disappears_from_queries() {
 
     assert_eq!(recipient_chain.owner_balance(&owner).await, None);
     assert_balances(&recipient_chain, []).await;
+}
+
+/// Tests that approvals overwrite the previous allowance and that zero clears it.
+#[test_log::test(tokio::test)]
+async fn allowance_overwrite_and_clear() {
+    let parameters = fungible::Parameters {
+        ticker_symbol: "NAT".to_owned(),
+    };
+    let initial_state = fungible::InitialStateBuilder::default().build();
+    let (validator, application_id, owner_chain) = TestValidator::with_current_application::<
+        FungibleTokenAbi,
+        _,
+        _,
+    >(parameters, initial_state)
+    .await;
+
+    let owner = AccountOwner::from(owner_chain.public_key());
+    let spender = AccountOwner::from(CryptoHash::test_hash("spender"));
+    let funding_chain = validator.get_chain(&validator.admin_chain_id());
+
+    let (transfer_certificate, _) = funding_chain
+        .add_block(|block| {
+            block.with_native_token_transfer(
+                AccountOwner::CHAIN,
+                Account::new(owner_chain.id(), owner),
+                Amount::from_tokens(10),
+            );
+        })
+        .await;
+
+    owner_chain
+        .add_block(|block| {
+            block.with_messages_from(&transfer_certificate);
+        })
+        .await;
+
+    owner_chain
+        .add_block(|block| {
+            block.with_operation(
+                application_id,
+                FungibleOperation::Approve {
+                    owner,
+                    spender,
+                    allowance: Amount::from_tokens(9),
+                },
+            );
+            block.with_operation(
+                application_id,
+                FungibleOperation::Approve {
+                    owner,
+                    spender,
+                    allowance: Amount::from_tokens(4),
+                },
+            );
+        })
+        .await;
+
+    assert_eq!(
+        owner_chain
+            .query_allowance(application_id, owner, spender)
+            .await,
+        Some(Amount::from_tokens(4)),
+    );
+
+    owner_chain
+        .add_block(|block| {
+            block.with_operation(
+                application_id,
+                FungibleOperation::Approve {
+                    owner,
+                    spender,
+                    allowance: Amount::ZERO,
+                },
+            );
+        })
+        .await;
+
+    assert_eq!(
+        owner_chain
+            .query_allowance(application_id, owner, spender)
+            .await,
+        Some(Amount::ZERO),
+    );
+}
+
+/// Tests that allowances are tracked independently for different spenders.
+#[test_log::test(tokio::test)]
+async fn allowances_are_independent() {
+    let parameters = fungible::Parameters {
+        ticker_symbol: "NAT".to_owned(),
+    };
+    let initial_state = fungible::InitialStateBuilder::default().build();
+    let (validator, application_id, owner_chain) = TestValidator::with_current_application::<
+        FungibleTokenAbi,
+        _,
+        _,
+    >(parameters, initial_state)
+    .await;
+
+    let owner = AccountOwner::from(owner_chain.public_key());
+    let spender1 = AccountOwner::from(CryptoHash::test_hash("spender1"));
+    let spender2 = AccountOwner::from(CryptoHash::test_hash("spender2"));
+    let funding_chain = validator.get_chain(&validator.admin_chain_id());
+
+    let (transfer_certificate, _) = funding_chain
+        .add_block(|block| {
+            block.with_native_token_transfer(
+                AccountOwner::CHAIN,
+                Account::new(owner_chain.id(), owner),
+                Amount::from_tokens(10),
+            );
+        })
+        .await;
+
+    owner_chain
+        .add_block(|block| {
+            block.with_messages_from(&transfer_certificate);
+        })
+        .await;
+
+    owner_chain
+        .add_block(|block| {
+            block.with_operation(
+                application_id,
+                FungibleOperation::Approve {
+                    owner,
+                    spender: spender1,
+                    allowance: Amount::from_tokens(6),
+                },
+            );
+            block.with_operation(
+                application_id,
+                FungibleOperation::Approve {
+                    owner,
+                    spender: spender2,
+                    allowance: Amount::from_tokens(2),
+                },
+            );
+        })
+        .await;
+
+    assert_eq!(
+        owner_chain
+            .query_allowance(application_id, owner, spender1)
+            .await,
+        Some(Amount::from_tokens(6)),
+    );
+    assert_eq!(
+        owner_chain
+            .query_allowance(application_id, owner, spender2)
+            .await,
+        Some(Amount::from_tokens(2)),
+    );
+    assert_balances(&owner_chain, [(owner, Amount::from_tokens(10))]).await;
 }
 
 /// Asserts that all the accounts in the [`ActiveChain`] have the `expected_balances`.

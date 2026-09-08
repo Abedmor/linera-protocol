@@ -1,18 +1,20 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::fmt;
+
 use linera_base::{
     data_types::{Blob, BlobContent, BlockHeight},
     identifiers::{BlobId, ChainId},
 };
 use linera_chain::types::ConfirmedBlockCertificate;
 
-use crate::client::requests_scheduler::cache::SubsumingKey;
+use crate::{client::requests_scheduler::cache::SubsumingKey, data_types::CompressedHeights};
 
 /// Unique identifier for different types of download requests.
 ///
 /// Used for request deduplication to avoid redundant downloads of the same data.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub enum RequestKey {
     /// Download certificates by specific heights
     Certificates {
@@ -25,6 +27,27 @@ pub enum RequestKey {
     PendingBlob { chain_id: ChainId, blob_id: BlobId },
     /// Download certificate for a specific blob
     CertificateForBlob(BlobId),
+}
+
+impl fmt::Debug for RequestKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RequestKey::Certificates { chain_id, heights } => f
+                .debug_struct("Certificates")
+                .field("chain_id", chain_id)
+                .field("heights", &CompressedHeights(heights))
+                .finish(),
+            RequestKey::Blob(blob_id) => f.debug_tuple("Blob").field(blob_id).finish(),
+            RequestKey::PendingBlob { chain_id, blob_id } => f
+                .debug_struct("PendingBlob")
+                .field("chain_id", chain_id)
+                .field("blob_id", blob_id)
+                .finish(),
+            RequestKey::CertificateForBlob(blob_id) => {
+                f.debug_tuple("CertificateForBlob").field(blob_id).finish()
+            }
+        }
+    }
 }
 
 impl RequestKey {
@@ -179,13 +202,13 @@ impl SubsumingKey<RequestResult> for super::request::RequestKey {
         let mut certificates_iter = certificates.iter();
         let mut collected = vec![];
         while let Some(height) = requested_heights.first() {
-            // Remove certs below the requested height.
-            if let Some(cert) = certificates_iter.find(|cert| &cert.value().height() == height) {
-                collected.push(cert.clone());
-                requested_heights.remove(0);
-            } else {
-                return None; // Missing a requested height
-            }
+            // Remove certs below the requested height, if present.
+            collected.push(
+                certificates_iter
+                    .find(|cert| &cert.value().height() == height)?
+                    .clone(),
+            );
+            requested_heights.remove(0);
         }
 
         Some(RequestResult::Certificates(collected))
@@ -255,7 +278,9 @@ mod tests {
         use linera_chain::{
             block::ConfirmedBlock,
             data_types::{BlockExecutionOutcome, LiteValue, LiteVote},
+            justification::JustificationChain,
             test::{make_first_block, BlockTestExt, VoteTestExt},
+            types::ConfirmedBlockCertificate,
         };
 
         let keypair = ValidatorKeypair::generate();
@@ -281,7 +306,8 @@ mod tests {
         let vote = lite_vote.with_value(confirmed_block).unwrap();
 
         // Convert vote to certificate
-        vote.into_certificate(keypair.secret_key.public())
+        let quorum = vote.into_certificate(keypair.secret_key.public());
+        ConfirmedBlockCertificate::from_parts(quorum, JustificationChain::default())
     }
 
     #[test]

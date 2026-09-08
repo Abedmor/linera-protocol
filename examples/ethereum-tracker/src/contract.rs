@@ -70,8 +70,11 @@ impl Contract for EthereumTrackerContract {
         panic!("Messages not supported");
     }
 
-    async fn store(mut self) {
-        self.state.save().await.expect("Failed to save state");
+    async fn store(self) {
+        self.state
+            .save_and_drop()
+            .await
+            .expect("Failed to save state");
     }
 }
 
@@ -82,7 +85,7 @@ impl EthereumTrackerContract {
         let request = async_graphql::Request::new("query { readInitialEvent }");
 
         let application_id = self.runtime.application_id();
-        let response = self.runtime.query_service(application_id, &request);
+        let response = self.runtime.query_service(application_id, request);
 
         let async_graphql::Value::Object(data_object) = response.data else {
             panic!("Unexpected response from `readInitialEvent`: {response:#?}");
@@ -115,7 +118,7 @@ impl EthereumTrackerContract {
         ));
 
         let application_id = self.runtime.application_id();
-        let response = self.runtime.query_service(application_id, &request);
+        let response = self.runtime.query_service(application_id, request);
 
         let async_graphql::Value::Object(data_object) = response.data else {
             panic!("Unexpected response from `readTransferEvents`: {response:#?}");

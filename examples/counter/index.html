@@ -31,7 +31,7 @@
         </div>
         <div class="ui">
           <p class="counter">Clicks: <span id="count">0</span></p>
-          <button id="increment-btn">Click me!</button>
+          <button id="increment-btn" disabled>Click me!</button>
         </div>
       </div>
 
@@ -48,67 +48,59 @@
       </div>
     </div>
 
-    <script type="importmap">
-      {
-          "imports": {
-              "@linera/client": "./js/@linera/client/index.js"
-          }
-      }
-    </script>
-
     <script type="module">
-      import * as linera from '@linera/client';
-      import { ethers } from 'ethers';
+     import * as linera from '@linera/client';
+     import { ethers } from 'ethers';
 
-     async function run() {
-         console.log(linera);
-          await linera.initialize();
-          const faucet = await new linera.Faucet(import.meta.env.LINERA_FAUCET_URL);
-          const signer = linera.PrivateKeySigner.createRandom();
-          const wallet = await faucet.createWallet();
-          const owner = await signer.address();
-          document.getElementById('owner').innerText = owner;
-          document.getElementById('chain-id').innerText = await faucet.claimChain(wallet, owner);
-          const client = await new linera.Client(wallet, signer);
-          const counter = await client.application(import.meta.env.LINERA_APPLICATION_ID);
-          const logs = document.getElementById('logs');
-          const incrementButton = document.getElementById('increment-btn');
-          const blockTemplate = document.getElementById('block-template');
+     await linera.initialize();
+     console.log('initialized');
+     const faucet = await new linera.Faucet(import.meta.env.LINERA_FAUCET_URL);
 
-          function addLogEntry(block) {
-              const entry = logs.getElementsByTagName('template')[0].content.cloneNode(true);
-              entry.querySelector('.height').textContent = block.height;
-              entry.querySelector('.hash').textContent = block.hash;
-              logs.insertBefore(entry, logs.firstChild);
-          }
+     const mnemonic = new URL(window.location.href).searchParams.get("key");
+     const signer = mnemonic
+       ? linera.signer.PrivateKey.fromMnemonic(mnemonic)
+       : linera.signer.PrivateKey.createRandom();
+     const wallet = await faucet.createWallet();
+     const owner = await signer.address();
+     const chainId = await faucet.claimChain(wallet, owner);
+     document.getElementById('owner').innerText = owner;
+     document.getElementById('chain-id').innerText = chainId;
+     const client = await new linera.Client(wallet, signer);
+     client.start();
+     let chain = await client.chain(chainId);
+     const counter = await chain.application(import.meta.env.LINERA_APPLICATION_ID);
+     const logs = document.getElementById('logs');
+     const incrementButton = document.getElementById('increment-btn');
 
-          async function updateCount(block_hash) {
-              const response = await counter.query('{ "query": "query { value }" }', block_hash || '');
-              document.getElementById('count').innerText
-                  = JSON.parse(response).data.value;
-          }
+     function addLogEntry(block) {
+         const entry = logs.getElementsByTagName('template')[0].content.cloneNode(true);
+         entry.querySelector('.height').textContent = block.height;
+         entry.querySelector('.hash').textContent = block.hash;
+         logs.insertBefore(entry, logs.firstChild);
+     }
 
-          updateCount(null);
-          client.onNotification(notification => {
-              let newBlock = notification.reason.NewBlock;
-              if (notification.reason.BlockExecuted) {
-                let hash = notification.reason.BlockExecuted.hash;
-                updateCount(hash);
-              } else if(newBlock) {
-                addLogEntry(newBlock);
-                updateCount(null);
-              }
-          });
+     async function updateCount(blockHash) {
+         const response = await counter.query('{ "query": "query { value }" }', { blockHash });
+         document.getElementById('count').innerText
+             = JSON.parse(response).data.value;
+         incrementButton.disabled = false;
+     }
 
-          incrementButton.addEventListener('click', () => {
-              counter.query('{ "query": "mutation { increment(value: 1) }" }');
-          });
-      }
+     updateCount();
+     chain.onNotification(notification => {
+         let newBlock = notification.reason.NewBlock;
+         if (notification.reason.BlockExecuted) {
+             let hash = notification.reason.BlockExecuted.hash;
+             updateCount(hash);
+         } else if (newBlock) {
+             addLogEntry(newBlock);
+             updateCount(null);
+         }
+     });
 
-      if (document.readyState === 'loading')
-          document.addEventListener('DOMContentLoaded', run);
-      else
-          run();
+     incrementButton.addEventListener('click', () => {
+         counter.query('{ "query": "mutation { increment(value: 1) }" }');
+     });
     </script>
   </body>
 </html>

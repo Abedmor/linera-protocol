@@ -34,6 +34,9 @@ pub enum ViewError {
         /// The inner error
         #[source]
         error: Box<dyn std::error::Error + Send + Sync>,
+        /// Whether this error may have left storage in an undetermined state,
+        /// so the view must be reloaded before being used again.
+        must_reload_view: bool,
     },
 
     /// The key must not be too long
@@ -56,4 +59,26 @@ pub enum ViewError {
     /// The values are incoherent.
     #[error("post load values error")]
     PostLoadValuesError,
+
+    /// The operation requires the view to have no pending in-memory changes.
+    #[error("the view has pending in-memory changes; flush them before continuing")]
+    HasPendingChanges,
+
+    /// The canonical byte stream is malformed.
+    #[error("malformed canonical content stream: {0}")]
+    MalformedContent(&'static str),
+}
+
+impl ViewError {
+    /// Returns `true` if this error may have left storage in an undetermined state,
+    /// so the view must be reloaded before being used again.
+    pub fn must_reload_view(&self) -> bool {
+        matches!(
+            self,
+            ViewError::StoreError {
+                must_reload_view: true,
+                ..
+            }
+        )
+    }
 }

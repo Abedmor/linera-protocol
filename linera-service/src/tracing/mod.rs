@@ -3,6 +3,7 @@
 
 //! This module provides unified handling for tracing subscribers within Linera binaries.
 
+/// Support for emitting traces in the Chrome tracing format.
 pub mod chrome;
 pub mod opentelemetry;
 
@@ -26,6 +27,11 @@ use tracing_subscriber::{
     registry::LookupSpan,
     util::SubscriberInitExt,
     EnvFilter,
+};
+#[cfg(not(target_arch = "wasm32"))]
+use {
+    ::opentelemetry::trace::TraceContextExt as _, tracing_opentelemetry::OtelData,
+    tracing_subscriber::fmt::FormatEvent,
 };
 
 pub(crate) struct EnvConfig {
@@ -75,6 +81,11 @@ impl EnvConfig {
 /// The `LINERA_LOG_DIR` environment variable can be used to configure a directory to
 /// store log files. If it is set, a file named `log_name` with the `log` extension is
 /// created in the directory.
+///
+/// This also installs the panic hook from [`linera_base::panic_hook`], so that panics are
+/// reported through the subscriber set up here rather than to standard error alone. Every
+/// binary reaches this function, which is why the hook is installed from it rather than
+/// from each `main`.
 pub fn init(log_name: &str) {
     let config = get_env_config(log_name);
     let maybe_log_file_layer = config.maybe_log_file_layer();
@@ -85,6 +96,8 @@ pub fn init(log_name: &str) {
         .with(maybe_log_file_layer)
         .with(stderr_layer)
         .init();
+
+    linera_base::panic_hook::init();
 }
 
 pub(crate) fn get_env_config(log_name: &str) -> EnvConfig {
@@ -129,6 +142,45 @@ pub(crate) fn open_log_file(log_name: &str) -> Option<File> {
     )
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+struct WithTraceContext;
+
+#[cfg(not(target_arch = "wasm32"))]
+impl<S, N> FormatEvent<S, N> for WithTraceContext
+where
+    S: Subscriber + for<'span> LookupSpan<'span>,
+    N: for<'writer> FormatFields<'writer> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &fmt::FmtContext<'_, S, N>,
+        mut writer: fmt::format::Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        if let Some(scope) = ctx.event_scope() {
+            for span in scope {
+                let extensions = span.extensions();
+                if let Some(otel_data) = extensions.get::<OtelData>() {
+                    // For root spans, trace_id is on the builder.
+                    // For child spans, it's inherited from the parent context.
+                    let trace_id = otel_data
+                        .builder
+                        .trace_id
+                        .unwrap_or_else(|| otel_data.parent_cx.span().span_context().trace_id());
+                    if trace_id != ::opentelemetry::trace::TraceId::INVALID {
+                        write!(writer, "traceID={trace_id} ")?;
+                    }
+                    if let Some(span_id) = otel_data.builder.span_id {
+                        write!(writer, "spanID={span_id} ")?;
+                    }
+                    break;
+                }
+            }
+        }
+        Format::default().format_event(ctx, writer, event)
+    }
+}
+
 /// Applies a requested `formatting` to the log output of the provided `layer`.
 ///
 /// Returns a boxed [`Layer`] with the formatting applied to the original `layer`.
@@ -145,7 +197,16 @@ where
     match formatting.unwrap_or("plain") {
         "json" => layer.json().boxed(),
         "pretty" => layer.pretty().boxed(),
-        "plain" => layer.boxed(),
+        "plain" => {
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                layer.event_format(WithTraceContext).boxed()
+            }
+            #[cfg(target_arch = "wasm32")]
+            {
+                layer.boxed()
+            }
+        }
         format => {
             panic!("Invalid RUST_LOG_FORMAT: `{format}`.  Valid values are `json` or `pretty`.")
         }

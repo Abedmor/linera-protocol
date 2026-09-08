@@ -6,7 +6,7 @@ use std::{borrow::Cow, num::NonZeroU16, path::PathBuf};
 use chrono::{DateTime, Utc};
 use linera_base::{
     crypto::{AccountPublicKey, CryptoHash, ValidatorPublicKey},
-    data_types::{Amount, BlockHeight, Epoch},
+    data_types::{Amount, BlockHeight, Epoch, Timestamp},
     identifiers::{Account, AccountOwner, ApplicationId, ChainId, ModuleId, StreamId},
     time::Duration,
     vm::VmRuntime,
@@ -20,7 +20,9 @@ use linera_client::{
 };
 use linera_rpc::config::CrossChainConfig;
 
-use crate::{cli::validator, task_processor::parse_operator};
+use crate::{
+    cli::validator, query_subscription::parse_subscription_ttl, task_processor::parse_operator,
+};
 
 const DEFAULT_TOKENS_PER_CHAIN: Amount = Amount::from_millis(100);
 const DEFAULT_TRANSACTIONS_PER_BLOCK: usize = 1;
@@ -31,9 +33,13 @@ const DEFAULT_BPS: usize = 10;
 /// Specification for a validator to be added to the committee.
 #[derive(Clone, Debug)]
 pub struct ValidatorToAdd {
+    /// The validator's public key.
     pub public_key: ValidatorPublicKey,
+    /// The validator's account public key.
     pub account_key: AccountPublicKey,
+    /// The network address of the validator.
     pub address: String,
+    /// The number of votes assigned to the validator.
     pub votes: u64,
 }
 
@@ -56,8 +62,35 @@ impl std::str::FromStr for ValidatorToAdd {
     }
 }
 
+/// Which client the benchmark drives its chains with.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClientMode {
+    /// A real `ChainClient`: executes every block locally and keeps chain state, so it
+    /// measures what a client experiences.
+    ///
+    /// Two network round trips per block with the root `--allow-fast-blocks` option, which
+    /// is off by default; without it the client skips the fast round and pays a third for
+    /// the validated-then-confirmed path.
+    #[default]
+    Full,
+    /// A storage-free proposer: keeps no chain state and executes nothing, so the generator
+    /// stops being part of what is measured.
+    ///
+    /// Always proposes in `Round::Fast`, which a single-super-owner chain designates as its
+    /// first round; it cannot use the validated-then-confirmed path, so unlike `full` this
+    /// is unaffected by `--allow-fast-blocks`. Three round trips per block.
+    ///
+    /// Reads the validator set and quorum weights from the wallet's *genesis* committee, so
+    /// on a network whose committee has since changed it would target stale addresses. Fine
+    /// for a freshly provisioned benchmark network; check before pointing it at a long-lived
+    /// one.
+    Lite,
+}
+
 #[derive(Clone, clap::Args, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
+/// Options controlling the behavior of the benchmark command.
 pub struct BenchmarkOptions {
     /// How many chains to use.
     #[arg(long, default_value_t = DEFAULT_NUM_CHAINS)]
@@ -75,7 +108,7 @@ pub struct BenchmarkOptions {
     /// The application ID of a fungible token on the wallet's default chain.
     /// If none is specified, the benchmark uses the native token.
     #[arg(long)]
-    pub fungible_application_id: Option<linera_base::identifiers::ApplicationId>,
+    pub fungible_application_id: Option<ApplicationId>,
 
     /// The fixed BPS (Blocks Per Second) rate that block proposals will be sent at.
     #[arg(long, default_value_t = DEFAULT_BPS)]
@@ -127,6 +160,43 @@ pub struct BenchmarkOptions {
     /// to a single chain, rotating through chains for subsequent blocks.
     #[arg(long)]
     pub single_destination_per_block: bool,
+
+    /// Which client to drive the chains with.
+    #[arg(long, value_enum, default_value_t = ClientMode::Full)]
+    pub client_mode: ClientMode,
+
+    /// How many distinct destination chains each chain sends to. Unset means every other
+    /// benchmarked chain, so cross-chain fan-out grows with `--num-chains` and cannot be
+    /// varied on its own; setting it pins fan-out while everything else is held fixed.
+    #[arg(long)]
+    pub fan_out: Option<usize>,
+
+    /// Keep sending cross-chain messages but never drain the inboxes they fill, isolating
+    /// the sending side. Inboxes then grow for the whole run, which is fine for a short
+    /// benchmark and is not a realistic steady state. `--client-mode lite` only.
+    #[arg(long)]
+    pub skip_message_processing: bool,
+
+    /// The maximum number of incoming message bundles to drain into each block, on top of
+    /// its own operations. Defaults to twice the block's operation count, so a backlog is
+    /// spread over several blocks instead of one huge one. `--client-mode lite` only.
+    #[arg(long)]
+    pub max_incoming_bundles_per_block: Option<usize>,
+
+    /// Mix self-transfers in with the cross-chain ones, so roughly half the traffic stays
+    /// on its own chain. Which half is random, not alternating: the generator shuffles its
+    /// destination list, so this sets the ratio rather than an order. Without this a chain
+    /// only ever sends elsewhere; with `--fan-out 0` it only ever sends to itself, and this
+    /// flag is then ignored. Under `--single-destination-per-block` the mix applies per
+    /// block rather than per transaction, so whole blocks are self-transfers.
+    #[arg(long)]
+    pub mixed_self_transfers: bool,
+
+    /// Broadcast each confirmed certificate in its compact, value-free form (hash plus
+    /// signatures) where possible. A validator that has forgotten the value transparently
+    /// gets a retry with the full certificate. `--client-mode lite` only.
+    #[arg(long)]
+    pub light_certificates: bool,
 }
 
 impl Default for BenchmarkOptions {
@@ -145,21 +215,30 @@ impl Default for BenchmarkOptions {
             delay_between_chains_ms: None,
             config_path: None,
             single_destination_per_block: false,
+            client_mode: ClientMode::default(),
+            fan_out: None,
+            mixed_self_transfers: false,
+            skip_message_processing: false,
+            max_incoming_bundles_per_block: None,
+            light_certificates: false,
         }
     }
 }
 
 #[derive(Clone, clap::Subcommand, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
+/// The benchmarking subcommands.
 pub enum BenchmarkCommand {
     /// Start a single benchmark process, maintaining a given TPS.
     Single {
+        /// The benchmark options.
         #[command(flatten)]
         options: BenchmarkOptions,
     },
 
     /// Run multiple benchmark processes in parallel.
     Multi {
+        /// The benchmark options.
         #[command(flatten)]
         options: BenchmarkOptions,
 
@@ -189,6 +268,7 @@ pub enum BenchmarkCommand {
 }
 
 impl BenchmarkCommand {
+    /// Returns the number of transactions per block configured for this benchmark.
     pub fn transactions_per_block(&self) -> usize {
         match self {
             Self::Single { options } => options.transactions_per_block,
@@ -197,12 +277,148 @@ impl BenchmarkCommand {
     }
 }
 
-#[cfg(feature = "kubernetes")]
-use crate::cli_wrappers::local_kubernetes_net::BuildMode;
 use crate::util::{
     DEFAULT_PAUSE_AFTER_GQL_MUTATIONS_SECS, DEFAULT_PAUSE_AFTER_LINERA_SERVICE_SECS,
 };
 
+/// Optional overrides for fields in the active resource control policy.
+#[derive(Clone, Default, clap::Args)]
+pub struct ResourceControlPolicyOverrides {
+    /// Set the price per unit of Wasm fuel.
+    #[arg(long)]
+    pub wasm_fuel_unit: Option<Amount>,
+
+    /// Set the price per unit of EVM fuel.
+    #[arg(long)]
+    pub evm_fuel_unit: Option<Amount>,
+
+    /// Set the price per read operation.
+    #[arg(long)]
+    pub read_operation: Option<Amount>,
+
+    /// Set the price per write operation.
+    #[arg(long)]
+    pub write_operation: Option<Amount>,
+
+    /// Set the price per byte read from runtime.
+    #[arg(long)]
+    pub byte_runtime: Option<Amount>,
+
+    /// Set the price per byte read.
+    #[arg(long)]
+    pub byte_read: Option<Amount>,
+
+    /// Set the price per byte written.
+    #[arg(long)]
+    pub byte_written: Option<Amount>,
+
+    /// Set the base price to read a blob.
+    #[arg(long)]
+    pub blob_read: Option<Amount>,
+
+    /// Set the base price to publish a blob.
+    #[arg(long)]
+    pub blob_published: Option<Amount>,
+
+    /// Set the price to read a blob, per byte.
+    #[arg(long)]
+    pub blob_byte_read: Option<Amount>,
+
+    /// The price to publish a blob, per byte.
+    #[arg(long)]
+    pub blob_byte_published: Option<Amount>,
+
+    /// Set the base price of sending an operation from a block..
+    #[arg(long)]
+    pub operation: Option<Amount>,
+
+    /// Set the additional price for each byte in the argument of a user operation.
+    #[arg(long)]
+    pub operation_byte: Option<Amount>,
+
+    /// Set the base price of sending a message from a block..
+    #[arg(long)]
+    pub message: Option<Amount>,
+
+    /// Set the additional price for each byte in the argument of a user message.
+    #[arg(long)]
+    pub message_byte: Option<Amount>,
+
+    /// Set the price per query to a service as an oracle.
+    #[arg(long)]
+    pub service_as_oracle_query: Option<Amount>,
+
+    /// Set the price for performing an HTTP request.
+    #[arg(long)]
+    pub http_request: Option<Amount>,
+
+    /// Set the maximum amount of Wasm fuel per block.
+    #[arg(long)]
+    pub maximum_wasm_fuel_per_block: Option<u64>,
+
+    /// Set the maximum amount of EVM fuel per block.
+    #[arg(long)]
+    pub maximum_evm_fuel_per_block: Option<u64>,
+
+    /// Set the maximum time in milliseconds that a block can spend executing services as oracles.
+    #[arg(long)]
+    pub maximum_service_oracle_execution_ms: Option<u64>,
+
+    /// Set the maximum size of a block, in bytes.
+    #[arg(long)]
+    pub maximum_block_size: Option<u64>,
+
+    /// Set the maximum size of data blobs, compressed bytecode and other binary blobs,
+    /// in bytes.
+    #[arg(long)]
+    pub maximum_blob_size: Option<u64>,
+
+    /// Set the maximum number of published blobs per block.
+    #[arg(long)]
+    pub maximum_published_blobs: Option<u64>,
+
+    /// Set the maximum size of decompressed contract or service bytecode, in bytes.
+    #[arg(long)]
+    pub maximum_bytecode_size: Option<u64>,
+
+    /// Set the maximum size of a block proposal, in bytes.
+    #[arg(long)]
+    pub maximum_block_proposal_size: Option<u64>,
+
+    /// Set the maximum read data per block.
+    #[arg(long)]
+    pub maximum_bytes_read_per_block: Option<u64>,
+
+    /// Set the maximum write data per block.
+    #[arg(long)]
+    pub maximum_bytes_written_per_block: Option<u64>,
+
+    /// Set the maximum size of oracle responses.
+    #[arg(long)]
+    pub maximum_oracle_response_bytes: Option<u64>,
+
+    /// Set the maximum size in bytes of a received HTTP response.
+    #[arg(long)]
+    pub maximum_http_response_bytes: Option<u64>,
+
+    /// Set the maximum amount of time allowed to wait for an HTTP response.
+    #[arg(long)]
+    pub http_request_timeout_ms: Option<u64>,
+
+    /// Set the list of hosts that contracts and services can send HTTP requests to.
+    #[arg(long, value_delimiter = ',')]
+    pub http_request_allow_list: Option<Vec<String>>,
+
+    /// Set the list of application IDs for which message- and event-related fees are waived.
+    #[arg(long, value_delimiter = ',')]
+    pub free_application_ids: Option<Vec<String>>,
+
+    /// Set the protocol flags that are enabled.
+    #[arg(long, value_delimiter = ',')]
+    pub flags: Option<Vec<String>>,
+}
+
+/// The subcommands of the Linera client binary.
 #[derive(Clone, clap::Subcommand)]
 pub enum ClientCommand {
     /// Transfer funds
@@ -234,20 +450,32 @@ pub enum ClientCommand {
         #[arg(long = "initial-balance", default_value = "0")]
         balance: Amount,
 
+        /// The account on the new chain credited with the initial balance. Defaults to the
+        /// chain account, which is the only balance that pays fees for blocks the account
+        /// itself does not authenticate.
+        #[arg(long = "balance-account", default_value = "0x00")]
+        account: AccountOwner,
+
         /// Whether to create a super owner for the new chain.
         #[arg(long)]
         super_owner: bool,
     },
 
     /// Open (i.e. activate) a new multi-owner chain deriving the UID from an existing one.
+    ///
+    /// If the wallet holds the key pair for exactly one of the new chain's owners, that
+    /// owner is automatically assigned as the chain's preferred owner. Otherwise the chain
+    /// can be assigned explicitly using the `assign` command.
     OpenMultiOwnerChain {
         /// Chain ID (must be one of our chains).
         #[arg(long = "from")]
         chain_id: Option<ChainId>,
 
+        /// Options configuring the new chain's ownership.
         #[clap(flatten)]
         ownership_config: ChainOwnershipConfig,
 
+        /// Options configuring the new chain's application permissions.
         #[clap(flatten)]
         application_permissions_config: ApplicationPermissionsConfig,
 
@@ -255,6 +483,12 @@ pub enum ClientCommand {
         /// balance.
         #[arg(long = "initial-balance", default_value = "0")]
         balance: Amount,
+
+        /// The account on the new chain credited with the initial balance. Defaults to the
+        /// chain account, which is the only balance that pays fees for blocks the account
+        /// itself does not authenticate.
+        #[arg(long = "balance-account", default_value = "0x00")]
+        account: AccountOwner,
     },
 
     /// Display who owns the chain, and how the owners work together proposing blocks.
@@ -268,11 +502,16 @@ pub enum ClientCommand {
     ///
     /// Specify the complete set of new owners, by public key. Existing owners that are
     /// not included will be removed.
+    ///
+    /// If the chain's current preferred owner is no longer one of the chain's owners
+    /// and the wallet holds the key pair for exactly one of the new owners, that owner
+    /// is automatically assigned as the chain's preferred owner.
     ChangeOwnership {
         /// The ID of the chain whose owners will be changed.
         #[clap(long)]
         chain_id: Option<ChainId>,
 
+        /// Options configuring the new chain's ownership.
         #[clap(flatten)]
         ownership_config: ChainOwnershipConfig,
     },
@@ -294,6 +533,7 @@ pub enum ClientCommand {
         #[arg(long)]
         chain_id: Option<ChainId>,
 
+        /// Options configuring the new chain's application permissions.
         #[clap(flatten)]
         application_permissions_config: ApplicationPermissionsConfig,
     },
@@ -307,6 +547,16 @@ pub enum ClientCommand {
         chain_id: ChainId,
     },
 
+    /// Publish a checkpoint of the chain's execution state.
+    ///
+    /// The resulting block contains a single checkpoint operation. Future nodes can
+    /// bootstrap from the published state snapshot instead of replaying the chain's
+    /// earlier history.
+    Checkpoint {
+        /// The chain to checkpoint. If not specified, the wallet's default chain is used.
+        chain_id: Option<ChainId>,
+    },
+
     /// Print out the network description.
     ShowNetworkDescription,
 
@@ -318,7 +568,7 @@ pub enum ClientCommand {
     /// `linera sync` then either `linera query-balance` or `linera process-inbox &&
     /// linera local-balance` for a consolidated balance.
     LocalBalance {
-        /// The account to read, written as `CHAIN-ID:OWNER` or simply `CHAIN-ID` for the
+        /// The account to read, written as `OWNER@CHAIN-ID` or simply `CHAIN-ID` for the
         /// chain balance. By default, we read the chain balance of the default chain in
         /// the wallet.
         account: Option<Account>,
@@ -330,7 +580,7 @@ pub enum ClientCommand {
     /// NOTE: The balance does not reflect messages that have not been synchronized from
     /// validators yet. Call `linera sync` first to do so.
     QueryBalance {
-        /// The account to query, written as `CHAIN-ID:OWNER` or simply `CHAIN-ID` for the
+        /// The account to query, written as `OWNER@CHAIN-ID` or simply `CHAIN-ID` for the
         /// chain balance. By default, we read the chain balance of the default chain in
         /// the wallet.
         account: Option<Account>,
@@ -341,7 +591,7 @@ pub enum ClientCommand {
     ///
     /// This command is deprecated. Use `linera sync && linera query-balance` instead.
     SyncBalance {
-        /// The account to query, written as `CHAIN-ID:OWNER` or simply `CHAIN-ID` for the
+        /// The account to query, written as `OWNER@CHAIN-ID` or simply `CHAIN-ID` for the
         /// chain balance. By default, we read the chain balance of the default chain in
         /// the wallet.
         account: Option<Account>,
@@ -352,6 +602,18 @@ pub enum ClientCommand {
         /// The chain to synchronize with validators. If omitted, synchronizes the
         /// default chain of the wallet.
         chain_id: Option<ChainId>,
+
+        /// Stop synchronizing at this block height (exclusive). For instance,
+        /// `--next-height 0` downloads zero blocks, `--next-height 10` downloads
+        /// blocks 0 through 9.
+        #[arg(long)]
+        next_height: Option<BlockHeight>,
+
+        /// Stop synchronizing at the first block with a timestamp greater than this
+        /// value (inclusive). The format is `YYYY-MM-DDTHH:MM:SS` or
+        /// `YYYY-MM-DD HH:MM:SS` in UTC.
+        #[arg(long)]
+        until_block_time: Option<Timestamp>,
     },
 
     /// Process all pending incoming messages from the inbox of the given chain by creating as many
@@ -369,138 +631,16 @@ pub enum ClientCommand {
     },
 
     /// Deprecates all committees up to and including the specified one.
-    RevokeEpochs { epoch: Epoch },
+    RevokeEpochs {
+        /// The highest epoch to deprecate.
+        epoch: Epoch,
+    },
 
     /// View or update the resource control policy
     ResourceControlPolicy {
-        /// Set the price per unit of Wasm fuel.
-        #[arg(long)]
-        wasm_fuel_unit: Option<Amount>,
-
-        /// Set the price per unit of EVM fuel.
-        #[arg(long)]
-        evm_fuel_unit: Option<Amount>,
-
-        /// Set the price per read operation.
-        #[arg(long)]
-        read_operation: Option<Amount>,
-
-        /// Set the price per write operation.
-        #[arg(long)]
-        write_operation: Option<Amount>,
-
-        /// Set the price per byte read from runtime.
-        #[arg(long)]
-        byte_runtime: Option<Amount>,
-
-        /// Set the price per byte read.
-        #[arg(long)]
-        byte_read: Option<Amount>,
-
-        /// Set the price per byte written.
-        #[arg(long)]
-        byte_written: Option<Amount>,
-
-        /// Set the base price to read a blob.
-        #[arg(long)]
-        blob_read: Option<Amount>,
-
-        /// Set the base price to publish a blob.
-        #[arg(long)]
-        blob_published: Option<Amount>,
-
-        /// Set the price to read a blob, per byte.
-        #[arg(long)]
-        blob_byte_read: Option<Amount>,
-
-        /// The price to publish a blob, per byte.
-        #[arg(long)]
-        blob_byte_published: Option<Amount>,
-
-        /// Set the price per byte stored.
-        #[arg(long)]
-        byte_stored: Option<Amount>,
-
-        /// Set the base price of sending an operation from a block..
-        #[arg(long)]
-        operation: Option<Amount>,
-
-        /// Set the additional price for each byte in the argument of a user operation.
-        #[arg(long)]
-        operation_byte: Option<Amount>,
-
-        /// Set the base price of sending a message from a block..
-        #[arg(long)]
-        message: Option<Amount>,
-
-        /// Set the additional price for each byte in the argument of a user message.
-        #[arg(long)]
-        message_byte: Option<Amount>,
-
-        /// Set the price per query to a service as an oracle.
-        #[arg(long)]
-        service_as_oracle_query: Option<Amount>,
-
-        /// Set the price for performing an HTTP request.
-        #[arg(long)]
-        http_request: Option<Amount>,
-
-        /// Set the maximum amount of Wasm fuel per block.
-        #[arg(long)]
-        maximum_wasm_fuel_per_block: Option<u64>,
-
-        /// Set the maximum amount of EVM fuel per block.
-        #[arg(long)]
-        maximum_evm_fuel_per_block: Option<u64>,
-
-        /// Set the maximum time in milliseconds that a block can spend executing services as oracles.
-        #[arg(long)]
-        maximum_service_oracle_execution_ms: Option<u64>,
-
-        /// Set the maximum size of a block, in bytes.
-        #[arg(long)]
-        maximum_block_size: Option<u64>,
-
-        /// Set the maximum size of data blobs, compressed bytecode and other binary blobs,
-        /// in bytes.
-        #[arg(long)]
-        maximum_blob_size: Option<u64>,
-
-        /// Set the maximum number of published blobs per block.
-        #[arg(long)]
-        maximum_published_blobs: Option<u64>,
-
-        /// Set the maximum size of decompressed contract or service bytecode, in bytes.
-        #[arg(long)]
-        maximum_bytecode_size: Option<u64>,
-
-        /// Set the maximum size of a block proposal, in bytes.
-        #[arg(long)]
-        maximum_block_proposal_size: Option<u64>,
-
-        /// Set the maximum read data per block.
-        #[arg(long)]
-        maximum_bytes_read_per_block: Option<u64>,
-
-        /// Set the maximum write data per block.
-        #[arg(long)]
-        maximum_bytes_written_per_block: Option<u64>,
-
-        /// Set the maximum size of oracle responses.
-        #[arg(long)]
-        maximum_oracle_response_bytes: Option<u64>,
-
-        /// Set the maximum size in bytes of a received HTTP response.
-        #[arg(long)]
-        maximum_http_response_bytes: Option<u64>,
-
-        /// Set the maximum amount of time allowed to wait for an HTTP response.
-        #[arg(long)]
-        http_request_timeout_ms: Option<u64>,
-
-        /// Set the list of hosts that contracts and services can send HTTP requests to.
-        #[arg(long)]
-        http_request_allow_list: Option<Vec<String>>,
+        /// Overrides for individual resource control policy parameters.
+        #[command(flatten)]
+        overrides: ResourceControlPolicyOverrides,
     },
 
     /// Run benchmarks to test network performance.
@@ -589,11 +729,6 @@ pub enum ClientCommand {
         /// (This will overwrite value from `--policy-config`)
         #[arg(long)]
         blob_byte_published_price: Option<Amount>,
-
-        /// Set the price per byte stored.
-        /// (This will overwrite value from `--policy-config`)
-        #[arg(long)]
-        byte_stored_price: Option<Amount>,
 
         /// Set the base price of sending an operation from a block..
         /// (This will overwrite value from `--policy-config`)
@@ -687,8 +822,16 @@ pub enum ClientCommand {
         http_request_timeout_ms: Option<u64>,
 
         /// Set the list of hosts that contracts and services can send HTTP requests to.
-        #[arg(long)]
+        #[arg(long, value_delimiter = ',')]
         http_request_allow_list: Option<Vec<String>>,
+
+        /// Set the list of application IDs for which message- and event-related fees are waived.
+        #[arg(long, value_delimiter = ',')]
+        free_application_ids: Option<Vec<String>>,
+
+        /// Set the protocol flags that are enabled.
+        #[arg(long, value_delimiter = ',')]
+        flags: Option<Vec<String>>,
 
         /// Force this wallet to generate keys using a PRNG and a given seed. USE FOR
         /// TESTING ONLY.
@@ -712,6 +855,7 @@ pub enum ClientCommand {
 
     /// Run a GraphQL service to explore and extend the chains of the wallet.
     Service {
+        /// Configuration for the chain listener backing the service.
         #[command(flatten)]
         config: ChainListenerConfig,
 
@@ -739,6 +883,65 @@ pub enum ClientCommand {
         /// Example: `--operators my-operator=/path/to/binary`
         #[arg(long = "operators", value_parser = parse_operator)]
         operators: Vec<(String, PathBuf)>,
+
+        /// Delay in seconds before retrying a failed operator task batch.
+        /// Only relevant when operators are configured via `--operator-application-ids`
+        /// or `--controller-id`.
+        #[arg(long, default_value = "5")]
+        task_retry_delay_secs: u64,
+
+        /// Number of seconds after which a still-running operator task group is logged and
+        /// counted as slow. The group is not interrupted and runs to completion.
+        /// Only relevant when operators are configured via `--operator-application-ids`
+        /// or `--controller-id`.
+        #[arg(long, default_value = "300")]
+        slow_task_group_secs: u64,
+
+        /// Run in read-only mode: disallow mutations and prevent queries from scheduling
+        /// operations. Use this when exposing the service to untrusted clients.
+        #[arg(long)]
+        read_only: bool,
+
+        /// Enable the application query response cache with the given per-chain capacity.
+        /// Each entry stores a serialized GraphQL response keyed by
+        /// (application_id, request_bytes). Incompatible with `--long-lived-services`.
+        #[arg(long, env = "LINERA_QUERY_CACHE_SIZE")]
+        query_cache_size: Option<usize>,
+
+        /// Allow a named GraphQL subscription query.
+        /// The operation name is extracted from the query string.
+        /// Repeatable.
+        /// Example: `--allow-subscription 'query CounterValue { getCounter { value } }'`
+        #[arg(long = "allow-subscription")]
+        allowed_subscriptions: Vec<String>,
+
+        /// Set a minimum TTL (in seconds) for a subscription query's cached result.
+        /// When set, invalidations that arrive before the TTL expires are deferred
+        /// until the remaining time elapses. Format: `Name=Secs`.
+        /// Repeatable.
+        /// Example: `--subscription-ttl-secs CounterValue=30`
+        #[arg(long = "subscription-ttl-secs", value_parser = parse_subscription_ttl)]
+        subscription_ttls: Vec<(String, u64)>,
+
+        /// Start in paused mode: do not synchronize chains from the network.
+        /// The service will serve queries from local state only, without downloading
+        /// new blocks or processing incoming messages.
+        #[arg(long)]
+        pause: bool,
+    },
+
+    /// Query an application with a read-only GraphQL query.
+    QueryApplication {
+        /// The chain on which the application is running.
+        #[arg(long)]
+        chain_id: Option<ChainId>,
+
+        /// The application to query.
+        #[arg(long)]
+        application_id: ApplicationId,
+
+        /// The GraphQL query to send (e.g. "value" for a counter application).
+        query: String,
     },
 
     /// Run a GraphQL service that exposes a faucet where users can claim tokens.
@@ -759,6 +962,10 @@ pub enum ClientCommand {
         /// The number of tokens to send to each new chain.
         #[arg(long)]
         amount: Amount,
+
+        /// The number of tokens to send per daily claim. Set to 0 to disable daily claims.
+        #[arg(long, default_value = "0")]
+        daily_claim_amount: Amount,
 
         /// The end timestamp: The faucet will rate-limit the token supply so it runs out of money
         /// no earlier than this.
@@ -789,6 +996,14 @@ pub enum ClientCommand {
         /// The virtual machine runtime to use.
         #[arg(long, default_value = "wasm")]
         vm_runtime: VmRuntime,
+
+        /// Optional path to an insta SNAP file containing the YAML serialization
+        /// of the application's `Formats`. When provided, the formats are
+        /// BCS-encoded and published as a third blob alongside the contract
+        /// and service blobs; the resulting `ModuleId` carries the formats blob
+        /// hash.
+        #[arg(long)]
+        formats: Option<PathBuf>,
 
         /// An optional chain ID to publish the module. The default chain of the wallet
         /// is used otherwise.
@@ -826,6 +1041,15 @@ pub enum ClientCommand {
         /// An optional chain ID to verify the blob. The default chain of the wallet
         /// is used otherwise.
         reader: Option<ChainId>,
+    },
+
+    /// Describe an existing application: print its `ApplicationDescription` (module
+    /// ID, creator chain, parameters and required dependencies) as JSON. The
+    /// description is content-addressed and fetched from the validators, so the
+    /// application need not be registered on the wallet's default chain.
+    DescribeApplication {
+        /// The ID of the application to describe.
+        application_id: ApplicationId,
     },
 
     /// Create an application.
@@ -920,6 +1144,23 @@ pub enum ClientCommand {
         chain_id: Option<ChainId>,
     },
 
+    /// Execute a raw user operation on an application.
+    ///
+    /// The operation bytes are provided as a hex string (BCS-encoded).
+    ExecuteOperation {
+        /// The application to send the operation to.
+        #[arg(long)]
+        application_id: ApplicationId,
+
+        /// BCS-encoded operation bytes as a hex string.
+        #[arg(long)]
+        operation: String,
+
+        /// Chain ID to submit the operation on. Defaults to the wallet's default chain.
+        #[arg(long)]
+        chain_id: Option<ChainId>,
+    },
+
     /// Show the contents of the wallet.
     #[command(subcommand)]
     Wallet(WalletCommand),
@@ -984,6 +1225,7 @@ impl ClientCommand {
             | ClientCommand::SetPreferredOwner { .. }
             | ClientCommand::ChangeApplicationPermissions { .. }
             | ClientCommand::CloseChain { .. }
+            | ClientCommand::Checkpoint { .. }
             | ClientCommand::ShowNetworkDescription
             | ClientCommand::LocalBalance { .. }
             | ClientCommand::QueryBalance { .. }
@@ -998,6 +1240,7 @@ impl ClientCommand {
             | ClientCommand::ListEventsFromIndex { .. }
             | ClientCommand::PublishDataBlob { .. }
             | ClientCommand::ReadDataBlob { .. }
+            | ClientCommand::DescribeApplication { .. }
             | ClientCommand::CreateApplication { .. }
             | ClientCommand::PublishAndCreate { .. }
             | ClientCommand::Keygen
@@ -1005,7 +1248,9 @@ impl ClientCommand {
             | ClientCommand::Wallet { .. }
             | ClientCommand::Chain { .. }
             | ClientCommand::Validator { .. }
-            | ClientCommand::RetryPendingBlock { .. } => "client".into(),
+            | ClientCommand::RetryPendingBlock { .. }
+            | ClientCommand::QueryApplication { .. } => "client".into(),
+            ClientCommand::ExecuteOperation { .. } => "client".into(),
             ClientCommand::Benchmark(BenchmarkCommand::Single { .. }) => "single-benchmark".into(),
             ClientCommand::Benchmark(BenchmarkCommand::Multi { .. }) => "multi-benchmark".into(),
             ClientCommand::Net { .. } => "net".into(),
@@ -1022,6 +1267,7 @@ impl ClientCommand {
 }
 
 #[derive(Clone, clap::Parser)]
+/// The subcommands for managing the storage database.
 pub enum DatabaseToolCommand {
     /// Delete all the namespaces in the database
     DeleteAll,
@@ -1034,6 +1280,7 @@ pub enum DatabaseToolCommand {
 
     /// Initialize a namespace in the database
     Initialize {
+        /// The path to the genesis configuration file.
         #[arg(long = "genesis")]
         genesis_config_path: PathBuf,
     },
@@ -1051,8 +1298,9 @@ pub enum DatabaseToolCommand {
     ListEventIds,
 }
 
-#[allow(clippy::large_enum_variant)]
+#[expect(clippy::large_enum_variant)]
 #[derive(Clone, clap::Parser)]
+/// The subcommands for managing a local Linera network.
 pub enum NetCommand {
     /// Start a Local Linera Network
     Up {
@@ -1094,33 +1342,6 @@ pub enum NetCommand {
         #[arg(long)]
         testing_prng_seed: Option<u64>,
 
-        /// Start the local network on a local Kubernetes deployment.
-        #[cfg(feature = "kubernetes")]
-        #[arg(long)]
-        kubernetes: bool,
-
-        /// If this is not set, we'll build the binaries from within the Docker container
-        /// If it's set, but with no directory path arg, we'll look for the binaries based on `current_binary_parent`
-        /// If it's set, but with a directory path arg, we'll get the binaries from that path directory
-        #[cfg(feature = "kubernetes")]
-        #[arg(long, num_args=0..=1)]
-        binaries: Option<Option<PathBuf>>,
-
-        /// Don't build docker image. This assumes that the image is already built.
-        #[cfg(feature = "kubernetes")]
-        #[arg(long, default_value = "false")]
-        no_build: bool,
-
-        /// The name of the docker image to use.
-        #[cfg(feature = "kubernetes")]
-        #[arg(long, default_value = "linera:latest")]
-        docker_image_name: String,
-
-        /// The build mode to use.
-        #[cfg(feature = "kubernetes")]
-        #[arg(long, default_value = "release")]
-        build_mode: BuildMode,
-
         /// Run with a specific path where the wallet and validator input files are.
         /// If none, then a temporary directory is created.
         #[arg(long)]
@@ -1130,15 +1351,9 @@ pub enum NetCommand {
         #[arg(long, default_value = "grpc")]
         external_protocol: String,
 
-        /// If present, a faucet is started using the chain provided by --faucet-chain, or
-        /// the first non-admin chain if not provided.
+        /// If present, a faucet is started on a dedicated chain with its own wallet.
         #[arg(long, default_value = "false")]
         with_faucet: bool,
-
-        /// When using --with-faucet, this specifies the chain on which the faucet will be started.
-        /// If this is `n`, the `n`-th non-admin chain (lexicographically) in the wallet is selected.
-        #[arg(long)]
-        faucet_chain: Option<u32>,
 
         /// The port on which to run the faucet server
         #[arg(long, default_value = "8080")]
@@ -1164,21 +1379,9 @@ pub enum NetCommand {
         #[arg(long, default_value = "8081")]
         exporter_port: NonZeroU16,
 
-        /// The name of the indexer docker image to use.
-        #[cfg(feature = "kubernetes")]
-        #[arg(long, default_value = "linera-indexer:latest")]
-        indexer_image_name: String,
-
-        /// The name of the explorer docker image to use.
-        #[cfg(feature = "kubernetes")]
-        #[arg(long, default_value = "linera-explorer:latest")]
-        explorer_image_name: String,
-
-        /// Use dual store (rocksdb and scylladb) instead of just scylladb. This is exclusive for
-        /// kubernetes deployments.
-        #[cfg(feature = "kubernetes")]
-        #[arg(long, default_value = "false")]
-        dual_store: bool,
+        /// Set the list of hosts that contracts and services can send HTTP requests to.
+        #[arg(long, value_delimiter = ',')]
+        http_request_allow_list: Option<Vec<String>>,
     },
 
     /// Print a bash helper script to make `linera net up` easier to use. The script is
@@ -1187,6 +1390,7 @@ pub enum NetCommand {
 }
 
 #[derive(Clone, clap::Subcommand)]
+/// The subcommands for managing the wallet.
 pub enum WalletCommand {
     /// Show the contents of the wallet.
     Show {
@@ -1201,7 +1405,10 @@ pub enum WalletCommand {
     },
 
     /// Change the wallet default chain.
-    SetDefault { chain_id: ChainId },
+    SetDefault {
+        /// The chain to set as the default.
+        chain_id: ChainId,
+    },
 
     /// Initialize a wallet from the genesis configuration.
     Init {
@@ -1231,6 +1438,25 @@ pub enum WalletCommand {
         /// Whether this chain should become the default chain.
         #[arg(long)]
         set_default: bool,
+
+        /// Whether to credit the claimed tokens to the new owner's account rather than to the
+        /// chain account. Only blocks authenticated by that owner can then pay fees.
+        #[arg(long)]
+        fund_owner_account: bool,
+    },
+
+    /// Export the genesis configuration to a JSON file.
+    ///
+    /// By default, exports the genesis config from the current wallet. Alternatively,
+    /// use `--faucet` to retrieve the genesis config directly from a faucet URL.
+    ExportGenesis {
+        /// Path to save the genesis configuration JSON file.
+        output: PathBuf,
+
+        /// The address of a faucet to retrieve the genesis config from.
+        /// If not specified, the genesis config is read from the current wallet.
+        #[arg(long)]
+        faucet: Option<String>,
     },
 
     /// Add a new followed chain (i.e. a chain without keypair) to the wallet.
@@ -1244,13 +1470,21 @@ pub enum WalletCommand {
 
     /// Forgets the specified chain's keys. The chain will still be followed by the
     /// wallet.
-    ForgetKeys { chain_id: ChainId },
+    ForgetKeys {
+        /// The chain whose keys will be forgotten.
+        chain_id: ChainId,
+    },
 
-    /// Forgets the specified chain, including the associated key pair.
-    ForgetChain { chain_id: ChainId },
+    /// Forgets the specified chain, including the associated key pair. The default
+    /// chain cannot be forgotten; switch to another chain with `set-default` first.
+    ForgetChain {
+        /// The chain to forget.
+        chain_id: ChainId,
+    },
 }
 
 #[derive(Clone, clap::Subcommand)]
+/// The subcommands for inspecting chains.
 pub enum ChainCommand {
     /// Show the contents of a block.
     ShowBlock {
@@ -1270,6 +1504,7 @@ pub enum ChainCommand {
 }
 
 #[derive(Clone, clap::Parser)]
+/// The subcommands for managing Linera projects.
 pub enum ProjectCommand {
     /// Create a new Linera project.
     New {
@@ -1279,12 +1514,20 @@ pub enum ProjectCommand {
         /// Use the given clone of the Linera repository instead of remote crates.
         #[arg(long)]
         linera_root: Option<PathBuf>,
+
+        /// Use the given directory for the project instead of creating a new one.
+        /// The directory will be created if it doesn't exist.
+        #[arg(long)]
+        dir: Option<PathBuf>,
     },
 
     /// Test a Linera project.
     ///
     /// Equivalent to running `cargo test` with the appropriate test runner.
-    Test { path: Option<PathBuf> },
+    Test {
+        /// The path of the root of the Linera project to test.
+        path: Option<PathBuf>,
+    },
 
     /// Build and publish a Linera project.
     PublishAndCreate {

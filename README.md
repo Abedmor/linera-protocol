@@ -92,8 +92,17 @@ FAUCET_URL=http://localhost:8080
 # If you're using a testnet, start here and run this instead:
 #   LINERA_TMP_DIR=$(mktemp -d)
 #   FAUCET_URL=https://faucet.testnet-XXX.linera.net  # for some value XXX
+```
 
-# Set the path of the future wallet.
+Enable logs for user applications:
+
+```bash
+export LINERA_APPLICATION_LOGS=true
+```
+
+Set the path of the future wallet:
+
+```bash
 export LINERA_WALLET="$LINERA_TMP_DIR/wallet.json"
 export LINERA_KEYSTORE="$LINERA_TMP_DIR/keystore.json"
 export LINERA_STORAGE="rocksdb:$LINERA_TMP_DIR/client.db"
@@ -125,12 +134,12 @@ linera query-balance "$CHAIN1"
 linera query-balance "$CHAIN2"
 
 # Now let's fund the user balances.
-linera transfer 5 --from "$CHAIN1" --to "$CHAIN1:$ACCOUNT1"
-linera transfer 2 --from "$CHAIN1:$ACCOUNT1" --to "$CHAIN2:$ACCOUNT2"
+linera transfer 5 --from "$CHAIN1" --to "$ACCOUNT1@$CHAIN1"
+linera transfer 2 --from "$ACCOUNT1@$CHAIN1" --to "$ACCOUNT2@$CHAIN2"
 
 # Query user balances again.
-linera query-balance "$CHAIN1:$ACCOUNT1"
-linera query-balance "$CHAIN2:$ACCOUNT2"
+linera query-balance "$ACCOUNT1@$CHAIN1"
+linera query-balance "$ACCOUNT2@$CHAIN2"
 ```
 
 More complex examples may be found in our [developer manual](https://linera.dev) as well

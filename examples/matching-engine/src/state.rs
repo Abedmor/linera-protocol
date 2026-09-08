@@ -3,11 +3,11 @@
 
 #![allow(dead_code)]
 
-use std::{cmp::min, collections::BTreeSet};
+use std::cmp::min;
 
 use async_graphql::SimpleObject;
 use linera_sdk::{
-    linera_base_types::{Account, AccountOwner, Amount},
+    linera_base_types::{Account, AccountOwner, Amount, NonCanonicalBTreeSet},
     views::{linera_views, linera_views::context::Context as _},
     KeyValueStore,
 };
@@ -54,7 +54,7 @@ pub struct KeyBook {
 #[derive(Default, Clone, Debug, Serialize, Deserialize, SimpleObject)]
 pub struct AccountInfo {
     /// The list of orders
-    pub orders: BTreeSet<OrderId>,
+    pub orders: NonCanonicalBTreeSet<OrderId>,
 }
 
 /// The price level is contained in a QueueView
@@ -393,7 +393,7 @@ impl LevelView {
         let mut remove_order = Vec::new();
         let orders = self
             .queue
-            .iter_mut()
+            .try_iter_mut()
             .await
             .expect("Failed to load iterator over orders");
         for order in orders {
@@ -528,7 +528,7 @@ impl LevelView {
         // If some order has amount zero but is after an order of non-zero amount, then it is left.
         let iter = self
             .queue
-            .iter_mut()
+            .try_iter_mut()
             .await
             .expect("Failed to load iterator over level queue");
         let n_remove = iter
@@ -550,7 +550,7 @@ impl LevelView {
     ) -> Option<(Amount, bool)> {
         let mut iter = self
             .queue
-            .iter_mut()
+            .try_iter_mut()
             .await
             .expect("Failed to load iterator over level queue");
         let state_order = iter.find(|order| order.order_id == order_id)?;

@@ -1,15 +1,13 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-#![allow(clippy::field_reassign_with_default)]
-
-use std::{collections::BTreeMap, vec};
+use std::vec;
 
 use assert_matches::assert_matches;
 use linera_base::{
     crypto::{AccountPublicKey, ValidatorPublicKey},
     data_types::{
-        Amount, ApplicationPermissions, Blob, BlockHeight, ChainDescription, ChainOrigin, Epoch,
+        Amount, ApplicationPermissions, Blob, BlockHeight, ChainDescription, ChainOrigin,
         InitialChainConfig, Resources, SendMessageRequest, Timestamp,
     },
     identifiers::{Account, AccountOwner, BlobType},
@@ -1139,9 +1137,23 @@ async fn test_multiple_messages_from_different_applications() -> anyhow::Result<
     Ok(())
 }
 
-/// Tests the system API calls `open_chain` and `chain_ownership`.
+/// Tests the system API calls `open_chain` and `chain_ownership`, funding the new chain's own
+/// account.
 #[tokio::test]
 async fn test_open_chain() -> anyhow::Result<()> {
+    Box::pin(run_open_chain_test(AccountOwner::CHAIN)).await
+}
+
+/// Tests that `open_chain` can credit the initial balance to an owner's account instead of the
+/// new chain's own account.
+#[tokio::test]
+async fn test_open_chain_funding_an_owner_account() -> anyhow::Result<()> {
+    Box::pin(run_open_chain_test(AccountPublicKey::test_key(3).into())).await
+}
+
+/// Opens a child chain crediting `child_account` with one token, and checks the parent's debit
+/// as well as the new chain's state after initialization.
+async fn run_open_chain_test(child_account: AccountOwner) -> anyhow::Result<()> {
     let committee = Committee::make_simple(vec![(
         ValidatorPublicKey::test_key(0),
         AccountPublicKey::test_key(0),
@@ -1180,6 +1192,7 @@ async fn test_open_chain() -> anyhow::Result<()> {
     };
     let child_application_permissions = ApplicationPermissions::new_single(application_id);
     let child_config = InitialChainConfig {
+        account: child_account,
         balance: Amount::ONE,
         ownership: child_ownership.clone(),
         application_permissions: child_application_permissions.clone(),
@@ -1195,8 +1208,12 @@ async fn test_open_chain() -> anyhow::Result<()> {
             let destination = Account::chain(dummy_chain_description(2).id());
             runtime.transfer(AccountOwner::CHAIN, destination, Amount::ONE)?;
             let application_permissions = child_application_permissions.clone();
-            let chain_id =
-                runtime.open_chain(child_ownership, application_permissions, Amount::ONE)?;
+            let chain_id = runtime.open_chain(
+                child_ownership,
+                application_permissions,
+                child_account,
+                Amount::ONE,
+            )?;
             assert_eq!(chain_id, child_id);
             Ok(vec![])
         }
@@ -1228,6 +1245,7 @@ async fn test_open_chain() -> anyhow::Result<()> {
     let created_description: ChainDescription =
         bcs::from_bytes(new_blob.bytes()).expect("should deserialize a chain description");
     assert_eq!(created_description.config().balance, Amount::ONE);
+    assert_eq!(created_description.config().account, child_account);
     assert_eq!(created_description.config().ownership, child_ownership);
 
     // Initialize the child chain using the new blob.
@@ -1247,16 +1265,25 @@ async fn test_open_chain() -> anyhow::Result<()> {
         .initialize_chain(child_description.id())
         .await
         .expect("should initialize chain correctly");
-    assert_eq!(*child_view.system.balance.get(), Amount::ONE);
-    assert_eq!(*child_view.system.ownership.get(), child_ownership);
+    if child_account.is_chain() {
+        assert_eq!(*child_view.system.balance.get(), Amount::ONE);
+        assert!(child_view.system.balances.indices().await?.is_empty());
+    } else {
+        // The chain itself is left without funds: only blocks authenticated by `child_account`
+        // can pay fees on it.
+        assert_eq!(*child_view.system.balance.get(), Amount::ZERO);
+        assert_eq!(
+            child_view.system.balances.get(&child_account).await?,
+            Some(Amount::ONE)
+        );
+    }
+    assert_eq!(*child_view.system.ownership.get().await?, child_ownership);
     assert_eq!(
-        *child_view.system.committees.get(),
-        [(Epoch::ZERO, committee)]
-            .into_iter()
-            .collect::<BTreeMap<_, _>>()
+        *child_view.system.committee_hash.get(),
+        Some(committee_blob.id().hash)
     );
     assert_eq!(
-        *child_view.system.application_permissions.get(),
+        *child_view.system.application_permissions.get().await?,
         ApplicationPermissions::new_single(application_id)
     );
 
@@ -1408,4 +1435,44 @@ async fn test_message_receipt_spending_chain_balance(
         .await;
 
     Ok(execution_result)
+}
+
+/// Tests that an application can read the description of another application.
+#[tokio::test]
+async fn test_read_application_description() -> anyhow::Result<()> {
+    let (state, chain_id) = SystemExecutionState::dummy_chain_state(0);
+    let mut view = state.into_view().await;
+
+    let (caller_id, caller_application, caller_blobs) = view.register_mock_application(0).await?;
+    let (target_id, target_application, target_blobs) = view.register_mock_application(1).await?;
+
+    // The creator chain ID for mock applications is dummy_chain_description(1).id().
+    let expected_creator_chain_id = dummy_chain_description(1).id();
+
+    caller_application.expect_call(ExpectedCall::execute_operation(
+        move |runtime, _operation| {
+            let description = runtime.read_application_description(target_id)?;
+            assert_eq!(description.creator_chain_id, expected_creator_chain_id);
+            Ok(vec![])
+        },
+    ));
+
+    target_application.expect_call(ExpectedCall::default_finalize());
+    caller_application.expect_call(ExpectedCall::default_finalize());
+
+    let context = create_dummy_operation_context(chain_id);
+    let mut controller = ResourceController::default();
+    let mut txn_tracker =
+        TransactionTracker::new_replaying_blobs(caller_blobs.iter().chain(&target_blobs));
+    ExecutionStateActor::new(&mut view, &mut txn_tracker, &mut controller)
+        .execute_operation(
+            context,
+            Operation::User {
+                application_id: caller_id,
+                bytes: vec![],
+            },
+        )
+        .await?;
+
+    Ok(())
 }

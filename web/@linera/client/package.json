@@ -18,6 +18,7 @@
   "scripts": {
     "install": "true",
     "build": "bash build.bash --release",
+    "clean": "rm -rf dist",
     "prepare": "pnpm build",
     "lint": "pnpm build && cargo fmt --check && cargo clippy",
     "test": "pnpm exec vitest --run",
@@ -37,11 +38,12 @@
   },
   "homepage": "https://github.com/linera-io/linera-protocol/tree/main/web#readme",
   "dependencies": {
-    "ethers": "^6.15.0"
+    "ethers": "^6.15.0",
+    "bowser": "2.13.1"
   },
   "devDependencies": {
     "@vitest/browser": "^3.2.4",
-    "playwright": "1.54.0",
+    "playwright": "1.58.0",
     "prettier": "3.5.3",
     "tsc-alias": "^1.8.16",
     "typedoc": "^0.28.13",

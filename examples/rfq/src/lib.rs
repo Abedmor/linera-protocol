@@ -3,8 +3,9 @@
 
 /*! ABI of the Requests For Quotes Example Application */
 
-use async_graphql::{scalar, InputObject, Request, Response, SimpleObject};
+use async_graphql::{InputObject, Request, Response, SimpleObject};
 use linera_sdk::{
+    formats::StableEnum,
     graphql::GraphQLMutationRoot,
     linera_base_types::{
         Account, AccountOwner, Amount, ApplicationId, ChainId, ContractAbi, ServiceAbi,
@@ -77,7 +78,7 @@ pub struct Tokens {
 }
 
 /// Operations that can be sent to the application.
-#[derive(Debug, Serialize, Deserialize, GraphQLMutationRoot)]
+#[derive(Debug, StableEnum, GraphQLMutationRoot)]
 pub enum Operation {
     RequestQuote {
         target: ChainId,
@@ -101,8 +102,6 @@ pub enum Operation {
         request_id: RequestId,
     },
 }
-
-scalar!(Operation);
 
 #[derive(Debug, Deserialize, Serialize)]
 pub enum Message {
@@ -158,6 +157,55 @@ impl Message {
                 // unused
                 RequestId::new(other_chain_id, 0, false)
             }
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod formats {
+    use linera_sdk::{
+        formats::{BcsApplication, Formats, TracerExt},
+        linera_base_types::AccountOwner,
+    };
+    use serde_reflection::{Samples, Tracer, TracerConfig};
+
+    use super::{Message, Operation, RequestId, RfqAbi, TokenPair, Tokens};
+
+    /// The Rfq application.
+    pub struct RfqApplication;
+
+    impl BcsApplication for RfqApplication {
+        type Abi = RfqAbi;
+
+        fn formats() -> serde_reflection::Result<Formats> {
+            let mut tracer = Tracer::new(
+                TracerConfig::default()
+                    .record_samples_for_newtype_structs(true)
+                    .record_samples_for_tuple_structs(true),
+            );
+            let samples = Samples::new();
+
+            // Trace the ABI types
+            let operation = tracer.trace_stable_enum_type::<Operation>(&samples)?;
+            let (response, _) = tracer.trace_type::<()>(&samples)?;
+            let (message, _) = tracer.trace_type::<Message>(&samples)?;
+            let (event_value, _) = tracer.trace_type::<()>(&samples)?;
+
+            // Trace additional supporting types (notably all enums) to populate the registry
+            tracer.trace_type::<TokenPair>(&samples)?;
+            tracer.trace_type::<RequestId>(&samples)?;
+            tracer.trace_type::<Tokens>(&samples)?;
+            tracer.trace_type::<AccountOwner>(&samples)?;
+
+            let registry = tracer.registry()?;
+
+            Ok(Formats {
+                registry,
+                operation,
+                response,
+                message,
+                event_value,
+            })
         }
     }
 }

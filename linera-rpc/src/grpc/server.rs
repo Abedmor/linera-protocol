@@ -7,17 +7,17 @@ use std::{
     task::{Context, Poll},
 };
 
-use futures::{channel::mpsc, future::BoxFuture, FutureExt as _};
-use linera_base::{
-    data_types::Blob,
-    identifiers::ChainId,
-    time::{Duration, Instant},
+use futures::{
+    channel::mpsc, future::BoxFuture, stream::FuturesUnordered, FutureExt as _, StreamExt as _,
 };
+#[cfg(with_metrics)]
+use linera_base::time::Instant;
+use linera_base::{data_types::Blob, identifiers::ChainId, time::Duration};
 use linera_core::{
     join_set_ext::JoinSet,
     node::NodeError,
     worker::{NetworkActions, Notification, Reason, WorkerState},
-    JoinSetExt as _, TaskHandle,
+    JoinSetExt as _, ProcessConfirmedBlockMode, TaskHandle,
 };
 use linera_storage::Storage;
 use tokio::sync::{broadcast::error::RecvError, oneshot};
@@ -38,6 +38,8 @@ use super::{
     pool::GrpcConnectionPool,
     GrpcError, GRPC_MAX_MESSAGE_SIZE,
 };
+#[cfg(feature = "opentelemetry")]
+use crate::propagation::get_traffic_type_from_request;
 use crate::{
     config::{CrossChainConfig, NotificationConfig, ShardId, ValidatorInternalNetworkConfig},
     cross_chain_message_queue, HandleConfirmedCertificateRequest, HandleLiteCertRequest,
@@ -48,62 +50,210 @@ type CrossChainSender = mpsc::Sender<(linera_core::data_types::CrossChainRequest
 type NotificationSender = tokio::sync::broadcast::Sender<Notification>;
 
 #[cfg(with_metrics)]
-mod metrics {
-    use std::sync::LazyLock;
-
+pub(crate) mod metrics {
     use linera_base::prometheus_util::{
-        linear_bucket_interval, register_histogram_vec, register_int_counter_vec,
+        exponential_bucket_interval, linear_bucket_interval, register_histogram,
+        register_histogram_vec, register_int_counter, register_int_counter_vec,
     };
-    use prometheus::{HistogramVec, IntCounterVec};
+    use prometheus::{Histogram, HistogramVec, IntCounter, IntCounterVec};
 
-    pub static SERVER_REQUEST_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
-        register_histogram_vec(
-            "server_request_latency",
-            "Server request latency",
-            &[],
-            linear_bucket_interval(1.0, 25.0, 2000.0),
-        )
-    });
+    use super::super::{ERROR_TYPE_LABEL, METHOD_NAME_LABEL, TRAFFIC_TYPE_LABEL};
 
-    pub static SERVER_REQUEST_COUNT: LazyLock<IntCounterVec> = LazyLock::new(|| {
-        register_int_counter_vec("server_request_count", "Server request count", &[])
-    });
-
-    pub static SERVER_REQUEST_SUCCESS: LazyLock<IntCounterVec> = LazyLock::new(|| {
-        register_int_counter_vec(
-            "server_request_success",
-            "Server request success",
-            &["method_name"],
-        )
-    });
-
-    pub static SERVER_REQUEST_ERROR: LazyLock<IntCounterVec> = LazyLock::new(|| {
-        register_int_counter_vec(
-            "server_request_error",
-            "Server request error",
-            &["method_name"],
-        )
-    });
-
-    pub static SERVER_REQUEST_LATENCY_PER_REQUEST_TYPE: LazyLock<HistogramVec> =
-        LazyLock::new(|| {
+    linera_base::declare_metrics! {
+        pub static SERVER_REQUEST_LATENCY: HistogramVec =
             register_histogram_vec(
-                "server_request_latency_per_request_type",
-                "Server request latency per request type",
-                &["method_name"],
-                linear_bucket_interval(1.0, 25.0, 2000.0),
-            )
-        });
+                "server_request_latency",
+                "Server request latency",
+                &[METHOD_NAME_LABEL, TRAFFIC_TYPE_LABEL],
+                linear_bucket_interval(1.0, 50.0, 5000.0),
+            );
 
-    pub static CROSS_CHAIN_MESSAGE_CHANNEL_FULL: LazyLock<IntCounterVec> = LazyLock::new(|| {
-        register_int_counter_vec(
-            "cross_chain_message_channel_full",
-            "Cross-chain message channel full",
-            &[],
-        )
-    });
+        pub static SERVER_REQUEST_COUNT: IntCounterVec =
+            register_int_counter_vec(
+                "server_request_count",
+                "Server request count",
+                &[METHOD_NAME_LABEL, TRAFFIC_TYPE_LABEL],
+            );
+
+        pub static SERVER_REQUEST_SUCCESS: IntCounterVec =
+            register_int_counter_vec(
+                "server_request_success",
+                "Server request success",
+                &[METHOD_NAME_LABEL, TRAFFIC_TYPE_LABEL],
+            );
+
+        pub static SERVER_REQUEST_ERROR: IntCounterVec =
+            register_int_counter_vec(
+                "server_request_error",
+                "Server request error",
+                &[METHOD_NAME_LABEL, TRAFFIC_TYPE_LABEL, ERROR_TYPE_LABEL],
+            );
+
+        pub static SERVER_REQUEST_CANCELLED: IntCounterVec =
+            register_int_counter_vec(
+                "server_request_cancelled",
+                "Server requests whose handler future was dropped before completion (e.g. client-side timeout / disconnect)",
+                &[METHOD_NAME_LABEL, TRAFFIC_TYPE_LABEL],
+            );
+
+        pub static CROSS_CHAIN_MESSAGE_CHANNEL_FULL: IntCounter =
+            register_int_counter(
+                "cross_chain_message_channel_full",
+                "Cross-chain message channel full",
+            );
+
+        pub static NOTIFICATIONS_SKIPPED_RECEIVER_LAG: IntCounter =
+            register_int_counter(
+                "notifications_skipped_receiver_lag",
+                "Number of notifications skipped because receiver lagged behind sender",
+            );
+
+        pub static NOTIFICATIONS_DROPPED_NO_RECEIVER: IntCounter =
+            register_int_counter(
+                "notifications_dropped_no_receiver",
+                "Number of notifications dropped because no receiver was available",
+            );
+
+        pub static NOTIFICATION_BATCH_SIZE: Histogram =
+            register_histogram(
+                "notification_batch_size",
+                "Number of notifications per batch sent to proxy",
+                exponential_bucket_interval(1.0, 250.0),
+            );
+
+        pub static NOTIFICATION_BATCHES_SENT: IntCounterVec =
+            register_int_counter_vec(
+                "notification_batches_sent",
+                "Total notification batches sent",
+                &["status"],
+            );
+    }
 }
 
+/// Handles batched forwarding of notifications to proxy and exporters.
+struct BatchForwarder {
+    nickname: String,
+    client: NotifierServiceClient<Channel>,
+    exporter_clients: Vec<NotifierServiceClient<Channel>>,
+    pending_notifications: Vec<Notification>,
+    futures: FuturesUnordered<BoxFuture<'static, ()>>,
+    batch_limit: usize,
+    max_tasks: usize,
+}
+
+impl BatchForwarder {
+    /// Spawns batch send tasks up to max_tasks limit.
+    fn spawn_batches(&mut self) {
+        while !self.pending_notifications.is_empty() && self.futures.len() < self.max_tasks {
+            let chunk_size = std::cmp::min(self.batch_limit, self.pending_notifications.len());
+            let batch: Vec<Notification> = self.pending_notifications.drain(..chunk_size).collect();
+
+            #[cfg(with_metrics)]
+            metrics::NOTIFICATION_BATCH_SIZE.observe(batch.len() as f64);
+
+            let client = self.client.clone();
+            let exporter_clients = self.exporter_clients.clone();
+            let nickname = self.nickname.clone();
+
+            self.futures.push(
+                async move {
+                    Self::send_batch(nickname, client, exporter_clients, batch).await;
+                }
+                .boxed(),
+            );
+        }
+    }
+
+    /// Returns true if there are no pending notifications and no in-flight tasks.
+    fn is_fully_drained(&self) -> bool {
+        self.pending_notifications.is_empty() && self.futures.is_empty()
+    }
+
+    /// Sends a batch of notifications to the proxy and exporters.
+    async fn send_batch(
+        nickname: String,
+        mut client: NotifierServiceClient<Channel>,
+        mut exporter_clients: Vec<NotifierServiceClient<Channel>>,
+        batch: Vec<Notification>,
+    ) {
+        // Convert to proto notifications, logging any deserialization errors
+        let mut proto_notifications = Vec::with_capacity(batch.len());
+        for notification in &batch {
+            match notification.clone().try_into() {
+                Ok(proto) => proto_notifications.push(proto),
+                Err(error) => {
+                    warn!(
+                        %error,
+                        nickname,
+                        ?notification.chain_id,
+                        ?notification.reason,
+                        "could not deserialize notification"
+                    );
+                }
+            }
+        }
+
+        // Collect chain_ids for error logging
+        let chain_ids: Vec<_> = batch.iter().map(|n| n.chain_id).collect();
+
+        // Send batch to proxy
+        let request = Request::new(api::NotificationBatch {
+            notifications: proto_notifications.clone(),
+        });
+        let result = client.notify_batch(request).await;
+
+        #[cfg(with_metrics)]
+        {
+            let status = if result.is_ok() { "success" } else { "error" };
+            metrics::NOTIFICATION_BATCHES_SENT
+                .with_label_values(&[status])
+                .inc();
+        }
+
+        if let Err(error) = result {
+            error!(
+                %error,
+                nickname,
+                batch_size = proto_notifications.len(),
+                ?chain_ids,
+                "proxy: could not send notification batch",
+            );
+        }
+
+        // Send NewBlock notifications to exporters
+        let new_block_notifications: Vec<_> = batch
+            .iter()
+            .filter(|n| matches!(n.reason, Reason::NewBlock { .. }))
+            .collect();
+
+        let exporter_notifications: Vec<api::Notification> = new_block_notifications
+            .iter()
+            .filter_map(|n| (*n).clone().try_into().ok())
+            .collect();
+
+        if !exporter_notifications.is_empty() {
+            let exporter_chain_ids: Vec<_> =
+                new_block_notifications.iter().map(|n| n.chain_id).collect();
+
+            for exporter_client in &mut exporter_clients {
+                let request = Request::new(api::NotificationBatch {
+                    notifications: exporter_notifications.clone(),
+                });
+                if let Err(error) = exporter_client.notify_batch(request).await {
+                    error!(
+                        %error,
+                        nickname,
+                        batch_size = exporter_notifications.len(),
+                        ?exporter_chain_ids,
+                        "block exporter: could not send notification batch",
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A gRPC server exposing a validator's worker as a network service.
 #[derive(Clone)]
 pub struct GrpcServer<S>
 where
@@ -116,19 +266,41 @@ where
     notification_sender: NotificationSender,
 }
 
+/// A handle to a running [`GrpcServer`] task.
 pub struct GrpcServerHandle {
     handle: TaskHandle<Result<(), GrpcError>>,
 }
 
 impl GrpcServerHandle {
+    /// Waits for the server task to complete.
     pub async fn join(self) -> Result<(), GrpcError> {
         self.handle.await?
     }
 }
 
+#[cfg(with_metrics)]
+struct ServerRequestCancellationGuard {
+    method_name: String,
+    traffic_type: &'static str,
+    completed: bool,
+}
+
+#[cfg(with_metrics)]
+impl Drop for ServerRequestCancellationGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            metrics::SERVER_REQUEST_CANCELLED
+                .with_label_values(&[&self.method_name, self.traffic_type])
+                .inc();
+        }
+    }
+}
+
+/// A Tower layer that records Prometheus metrics for gRPC requests.
 #[derive(Clone)]
 pub struct GrpcPrometheusMetricsMiddlewareLayer;
 
+/// The Tower service produced by [`GrpcPrometheusMetricsMiddlewareLayer`].
 #[derive(Clone)]
 pub struct GrpcPrometheusMetricsMiddlewareService<T> {
     service: T,
@@ -142,10 +314,11 @@ impl<S> Layer<S> for GrpcPrometheusMetricsMiddlewareLayer {
     }
 }
 
-impl<S, Req> Service<Req> for GrpcPrometheusMetricsMiddlewareService<S>
+impl<S, B> Service<http::Request<B>> for GrpcPrometheusMetricsMiddlewareService<S>
 where
     S::Future: Send + 'static,
-    S: Service<Req> + std::marker::Send,
+    S: Service<http::Request<B>> + std::marker::Send,
+    B: Send + 'static,
 {
     type Response = S::Response;
     type Error = S::Error;
@@ -155,18 +328,39 @@ where
         self.service.poll_ready(cx)
     }
 
-    fn call(&mut self, request: Req) -> Self::Future {
+    fn call(&mut self, request: http::Request<B>) -> Self::Future {
         #[cfg(with_metrics)]
         let start = Instant::now();
+
+        #[cfg(with_metrics)]
+        let method_name = super::extract_grpc_method_name(request.uri().path()).to_owned();
+
+        // Extract traffic type from request extensions (set by OtelContextLayer).
+        // When opentelemetry is enabled but no baggage is set, defaults to "organic".
+        // When opentelemetry is disabled, defaults to "unknown".
+        #[cfg(all(with_metrics, feature = "opentelemetry"))]
+        let traffic_type: &'static str = get_traffic_type_from_request(&request);
+        #[cfg(all(with_metrics, not(feature = "opentelemetry")))]
+        let traffic_type: &'static str = "unknown";
+
         let future = self.service.call(request);
         async move {
+            #[cfg(with_metrics)]
+            let mut cancellation_guard = ServerRequestCancellationGuard {
+                method_name,
+                traffic_type,
+                completed: false,
+            };
             let response = future.await?;
             #[cfg(with_metrics)]
             {
+                cancellation_guard.completed = true;
                 metrics::SERVER_REQUEST_LATENCY
-                    .with_label_values(&[])
+                    .with_label_values(&[&cancellation_guard.method_name, traffic_type])
                     .observe(start.elapsed().as_secs_f64() * 1000.0);
-                metrics::SERVER_REQUEST_COUNT.with_label_values(&[]).inc();
+                metrics::SERVER_REQUEST_COUNT
+                    .with_label_values(&[&cancellation_guard.method_name, traffic_type])
+                    .inc();
             }
             Ok(response)
         }
@@ -178,6 +372,7 @@ impl<S> GrpcServer<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
+    /// Spawns the gRPC server on the given host and port, returning a handle to the task.
     #[expect(clippy::too_many_arguments)]
     pub fn spawn(
         host: String,
@@ -185,8 +380,8 @@ where
         state: WorkerState<S>,
         shard_id: ShardId,
         internal_network: ValidatorInternalNetworkConfig,
-        cross_chain_config: CrossChainConfig,
-        notification_config: NotificationConfig,
+        cross_chain_config: &CrossChainConfig,
+        notification_config: &NotificationConfig,
         shutdown_signal: CancellationToken,
         join_set: &mut JoinSet,
     ) -> GrpcServerHandle {
@@ -197,6 +392,20 @@ where
 
         let (cross_chain_sender, cross_chain_receiver) =
             mpsc::channel(cross_chain_config.queue_size);
+
+        // Give the worker a shard-routing sender for cross-chain requests generated
+        // outside the normal `NetworkActions` return path (specifically, the
+        // `RevertConfirm`s emitted after resetting a corrupted chain).
+        let state = {
+            let routing_network = internal_network.clone();
+            let routing_sender = cross_chain_sender.clone();
+            state.with_outbound_cross_chain_sender(std::sync::Arc::new(move |request| {
+                let shard_id = routing_network.get_shard_id(request.target_chain_id());
+                if let Err(error) = routing_sender.clone().try_send((request, shard_id)) {
+                    error!(%error, "dropping cross-chain request");
+                }
+            }))
+        };
 
         let (notification_sender, _) =
             tokio::sync::broadcast::channel(notification_config.notification_queue_size);
@@ -211,6 +420,7 @@ where
                 internal_network.clone(),
                 cross_chain_config.max_retries,
                 Duration::from_millis(cross_chain_config.retry_delay_ms),
+                Duration::from_millis(cross_chain_config.max_backoff_ms),
                 Duration::from_millis(cross_chain_config.sender_delay_ms),
                 cross_chain_config.sender_failure_rate,
                 shard_id,
@@ -237,6 +447,7 @@ where
                     proxy.internal_address(&internal_network.protocol),
                     exporter_addresses,
                     receiver,
+                    notification_config.clone(),
                 )
             });
         }
@@ -266,12 +477,24 @@ where
                 .set_serving::<ValidatorWorkerServer<Self>>()
                 .await;
 
-            tonic::transport::Server::builder()
-                .layer(
-                    ServiceBuilder::new()
-                        .layer(GrpcPrometheusMetricsMiddlewareLayer)
-                        .into_inner(),
-                )
+            #[cfg(feature = "opentelemetry")]
+            let server = tonic::transport::Server::builder().layer(
+                ServiceBuilder::new()
+                    .layer(crate::propagation::OtelContextLayer)
+                    .layer(GrpcPrometheusMetricsMiddlewareLayer)
+                    .into_inner(),
+            );
+            #[cfg(not(feature = "opentelemetry"))]
+            let server = tonic::transport::Server::builder().layer(
+                ServiceBuilder::new()
+                    .layer(GrpcPrometheusMetricsMiddlewareLayer)
+                    .into_inner(),
+            );
+            server
+                // Every dialer is part of this validator (proxies, peer cross-chain
+                // forwarders), so this cap times a known connection count bounds
+                // in-flight work -- unlike hyper's 200 default, fixed at any shard size.
+                .max_concurrent_streams(Some(10_000))
                 .add_service(health_service)
                 .add_service(reflection_service)
                 .add_service(worker_node)
@@ -284,23 +507,24 @@ where
         GrpcServerHandle { handle }
     }
 
-    /// Continuously waits for receiver to receive a notification which is then sent to
-    /// the proxy.
-    #[instrument(skip(receiver))]
+    /// Continuously waits for receiver to receive notifications and sends them to
+    /// the proxy in batches for improved throughput.
+    #[instrument(skip(receiver, config))]
     async fn forward_notifications(
         nickname: String,
         proxy_address: String,
         exporter_addresses: Vec<String>,
         mut receiver: tokio::sync::broadcast::Receiver<Notification>,
+        config: NotificationConfig,
     ) {
         let channel = tonic::transport::Channel::from_shared(proxy_address.clone())
             .expect("Proxy URI should be valid")
             .connect_lazy();
-        let mut client = NotifierServiceClient::new(channel)
+        let client = NotifierServiceClient::new(channel)
             .max_encoding_message_size(GRPC_MAX_MESSAGE_SIZE)
             .max_decoding_message_size(GRPC_MAX_MESSAGE_SIZE);
 
-        let mut exporter_clients: Vec<NotifierServiceClient<Channel>> = exporter_addresses
+        let exporter_clients: Vec<NotifierServiceClient<Channel>> = exporter_addresses
             .iter()
             .map(|address| {
                 let channel = tonic::transport::Channel::from_shared(address.clone())
@@ -312,57 +536,60 @@ where
             })
             .collect::<Vec<_>>();
 
+        let mut forwarder = BatchForwarder {
+            nickname: nickname.clone(),
+            client,
+            exporter_clients,
+            pending_notifications: Vec::new(),
+            futures: FuturesUnordered::new(),
+            batch_limit: config.notification_batch_size,
+            max_tasks: config.notification_max_in_flight,
+        };
+
         loop {
-            let notification = match receiver.recv().await {
-                Ok(notification) => notification,
-                Err(RecvError::Lagged(skipped_count)) => {
-                    warn!(
-                        nickname,
-                        skipped_count, "notification receiver lagged, messages were skipped"
-                    );
-                    continue;
-                }
-                Err(RecvError::Closed) => {
-                    warn!(
-                        nickname,
-                        "notification channel closed, exiting forwarding loop"
-                    );
-                    break;
-                }
-            };
+            tokio::select! {
+                biased;
 
-            let reason = &notification.reason;
-            let chain_id = notification.chain_id;
-            let notification: api::Notification = match notification.clone().try_into() {
-                Ok(notification) => notification,
-                Err(error) => {
-                    warn!(%error, nickname, "could not deserialize notification");
-                    continue;
-                }
-            };
-            let request = tonic::Request::new(notification.clone());
-            if let Err(error) = client.notify(request).await {
-                error!(
-                    %error,
-                    nickname,
-                    ?chain_id,
-                    ?reason,
-                    "proxy: could not send notification",
-                )
-            }
+                result = receiver.recv() => {
+                    match result {
+                        Ok(notification) => {
+                            forwarder.pending_notifications.push(notification);
 
-            if let Reason::NewBlock { height: _, hash: _ } = reason {
-                for exporter_client in &mut exporter_clients {
-                    let request = tonic::Request::new(notification.clone());
-                    if let Err(error) = exporter_client.notify(request).await {
-                        error!(
-                            %error,
-                            nickname,
-                            ?chain_id,
-                            ?reason,
-                            "block exporter: could not send notification",
-                        )
+                            if forwarder.futures.is_empty()
+                               || (forwarder.pending_notifications.len() >= forwarder.batch_limit
+                                   && forwarder.futures.len() < forwarder.max_tasks) {
+                                forwarder.spawn_batches();
+                            }
+                        }
+                        Err(RecvError::Lagged(skipped_count)) => {
+                            warn!(
+                                nickname,
+                                skipped_count, "notification receiver lagged, messages were skipped"
+                            );
+                            #[cfg(with_metrics)]
+                            metrics::NOTIFICATIONS_SKIPPED_RECEIVER_LAG
+                                .inc_by(skipped_count);
+                        }
+                        Err(RecvError::Closed) => {
+                            warn!(
+                                nickname,
+                                "notification channel closed, draining pending notifications"
+                            );
+                            // Drain all pending notifications before exiting
+                            loop {
+                                forwarder.spawn_batches();
+                                if forwarder.is_fully_drained() {
+                                    break;
+                                }
+                                forwarder.futures.next().await;
+                            }
+                            break;
+                        }
                     }
+                }
+
+                Some(()) = forwarder.futures.next() => {
+                    forwarder.spawn_batches();
                 }
             }
         }
@@ -384,9 +611,7 @@ where
                 error!(%error, "dropping cross-chain request");
                 #[cfg(with_metrics)]
                 if error.is_full() {
-                    metrics::CROSS_CHAIN_MESSAGE_CHANNEL_FULL
-                        .with_label_values(&[])
-                        .inc();
+                    metrics::CROSS_CHAIN_MESSAGE_CHANNEL_FULL.inc();
                 }
             }
         }
@@ -395,7 +620,8 @@ where
             trace!("Scheduling notification query");
             if let Err(error) = notification_sender.send(notification) {
                 error!(%error, "dropping notification");
-                break;
+                #[cfg(with_metrics)]
+                metrics::NOTIFICATIONS_DROPPED_NO_RECEIVER.inc();
             }
         }
     }
@@ -407,6 +633,7 @@ where
         network: ValidatorInternalNetworkConfig,
         cross_chain_max_retries: u32,
         cross_chain_retry_delay: Duration,
+        cross_chain_max_backoff: Duration,
         cross_chain_sender_delay: Duration,
         cross_chain_sender_failure_rate: f32,
         this_shard: ShardId,
@@ -430,6 +657,7 @@ where
             nickname,
             cross_chain_max_retries,
             cross_chain_retry_delay,
+            cross_chain_max_backoff,
             cross_chain_sender_delay,
             cross_chain_sender_failure_rate,
             this_shard,
@@ -439,23 +667,32 @@ where
         .await;
     }
 
-    fn log_request_outcome_and_latency(start: Instant, success: bool, method_name: &str) {
+    fn log_request_success(method_name: &str, traffic_type: &str) {
         #![cfg_attr(not(with_metrics), allow(unused_variables))]
         #[cfg(with_metrics)]
-        {
-            metrics::SERVER_REQUEST_LATENCY_PER_REQUEST_TYPE
-                .with_label_values(&[method_name])
-                .observe(start.elapsed().as_secs_f64() * 1000.0);
-            if success {
-                metrics::SERVER_REQUEST_SUCCESS
-                    .with_label_values(&[method_name])
-                    .inc();
-            } else {
-                metrics::SERVER_REQUEST_ERROR
-                    .with_label_values(&[method_name])
-                    .inc();
-            }
-        }
+        metrics::SERVER_REQUEST_SUCCESS
+            .with_label_values(&[method_name, traffic_type])
+            .inc();
+    }
+
+    fn log_request_error(method_name: &str, traffic_type: &str, error_type: &str) {
+        #![cfg_attr(not(with_metrics), allow(unused_variables))]
+        #[cfg(with_metrics)]
+        metrics::SERVER_REQUEST_ERROR
+            .with_label_values(&[method_name, traffic_type, error_type])
+            .inc();
+    }
+
+    /// Extracts traffic type from a tonic request's extensions.
+    #[cfg(feature = "opentelemetry")]
+    fn get_traffic_type<R>(request: &Request<R>) -> &'static str {
+        get_traffic_type_from_request(request)
+    }
+
+    /// Returns "unknown" when opentelemetry feature is disabled.
+    #[cfg(not(feature = "opentelemetry"))]
+    fn get_traffic_type<R>(_request: &Request<R>) -> &'static str {
+        "unknown"
     }
 
     fn log_error(&self, error: &linera_core::worker::WorkerError, context: &str) {
@@ -486,23 +723,26 @@ where
         &self,
         request: Request<BlockProposal>,
     ) -> Result<Response<ChainInfoResult>, Status> {
-        let start = Instant::now();
+        let traffic_type = Self::get_traffic_type(&request);
         let proposal = request.into_inner().try_into()?;
         trace!(?proposal, "Handling block proposal");
-        Ok(Response::new(
-            match self.state.clone().handle_block_proposal(proposal).await {
-                Ok((info, actions)) => {
-                    Self::log_request_outcome_and_latency(start, true, "handle_block_proposal");
-                    self.handle_network_actions(actions);
-                    info.try_into()?
-                }
-                Err(error) => {
-                    Self::log_request_outcome_and_latency(start, false, "handle_block_proposal");
-                    self.log_error(&error, "Failed to handle block proposal");
-                    NodeError::from(error).try_into()?
-                }
-            },
-        ))
+        let (result, actions) = self.state.clone().handle_block_proposal(proposal).await;
+        // Dispatch actions whether or not the proposal was accepted: a rejected
+        // proposal can still advance the manager's `current_round` (via
+        // `update_signed_proposal` on the `HasIncompatibleConfirmedVote` recovery
+        // path), and subscribers need the resulting `NewRound` notification.
+        self.handle_network_actions(actions);
+        Ok(Response::new(match result {
+            Ok(info) => {
+                Self::log_request_success("handle_block_proposal", traffic_type);
+                info.try_into()?
+            }
+            Err(error) => {
+                Self::log_request_error("handle_block_proposal", traffic_type, &error.error_type());
+                self.log_error(&error, "Failed to handle block proposal");
+                NodeError::from(error).try_into()?
+            }
+        }))
     }
 
     #[instrument(
@@ -518,7 +758,7 @@ where
         &self,
         request: Request<LiteCertificate>,
     ) -> Result<Response<ChainInfoResult>, Status> {
-        let start = Instant::now();
+        let traffic_type = Self::get_traffic_type(&request);
         let HandleLiteCertRequest {
             certificate,
             wait_for_outgoing_messages,
@@ -533,7 +773,7 @@ where
         .await
         {
             Ok((info, actions)) => {
-                Self::log_request_outcome_and_latency(start, true, "handle_lite_certificate");
+                Self::log_request_success("handle_lite_certificate", traffic_type);
                 self.handle_network_actions(actions);
                 if let Some(receiver) = receiver {
                     if let Err(e) = receiver.await {
@@ -543,7 +783,11 @@ where
                 Ok(Response::new(info.try_into()?))
             }
             Err(error) => {
-                Self::log_request_outcome_and_latency(start, false, "handle_lite_certificate");
+                Self::log_request_error(
+                    "handle_lite_certificate",
+                    traffic_type,
+                    &error.error_type(),
+                );
                 self.log_error(&error, "Failed to handle lite certificate");
                 Ok(Response::new(NodeError::from(error).try_into()?))
             }
@@ -563,7 +807,7 @@ where
         &self,
         request: Request<api::HandleConfirmedCertificateRequest>,
     ) -> Result<Response<ChainInfoResult>, Status> {
-        let start = Instant::now();
+        let traffic_type = Self::get_traffic_type(&request);
         let HandleConfirmedCertificateRequest {
             certificate,
             wait_for_outgoing_messages,
@@ -573,11 +817,11 @@ where
         match self
             .state
             .clone()
-            .handle_confirmed_certificate(certificate, sender)
+            .handle_confirmed_certificate(certificate, ProcessConfirmedBlockMode::Auto, sender)
             .await
         {
             Ok((info, actions)) => {
-                Self::log_request_outcome_and_latency(start, true, "handle_confirmed_certificate");
+                Self::log_request_success("handle_confirmed_certificate", traffic_type);
                 self.handle_network_actions(actions);
                 if let Some(receiver) = receiver {
                     if let Err(e) = receiver.await {
@@ -587,7 +831,11 @@ where
                 Ok(Response::new(info.try_into()?))
             }
             Err(error) => {
-                Self::log_request_outcome_and_latency(start, false, "handle_confirmed_certificate");
+                Self::log_request_error(
+                    "handle_confirmed_certificate",
+                    traffic_type,
+                    &error.error_type(),
+                );
                 self.log_error(&error, "Failed to handle confirmed certificate");
                 Ok(Response::new(NodeError::from(error).try_into()?))
             }
@@ -607,7 +855,7 @@ where
         &self,
         request: Request<api::HandleValidatedCertificateRequest>,
     ) -> Result<Response<ChainInfoResult>, Status> {
-        let start = Instant::now();
+        let traffic_type = Self::get_traffic_type(&request);
         let HandleValidatedCertificateRequest { certificate } = request.into_inner().try_into()?;
         trace!(?certificate, "Handling certificate");
         match self
@@ -617,12 +865,16 @@ where
             .await
         {
             Ok((info, actions)) => {
-                Self::log_request_outcome_and_latency(start, true, "handle_validated_certificate");
+                Self::log_request_success("handle_validated_certificate", traffic_type);
                 self.handle_network_actions(actions);
                 Ok(Response::new(info.try_into()?))
             }
             Err(error) => {
-                Self::log_request_outcome_and_latency(start, false, "handle_validated_certificate");
+                Self::log_request_error(
+                    "handle_validated_certificate",
+                    traffic_type,
+                    &error.error_type(),
+                );
                 self.log_error(&error, "Failed to handle validated certificate");
                 Ok(Response::new(NodeError::from(error).try_into()?))
             }
@@ -642,7 +894,7 @@ where
         &self,
         request: Request<api::HandleTimeoutCertificateRequest>,
     ) -> Result<Response<ChainInfoResult>, Status> {
-        let start = Instant::now();
+        let traffic_type = Self::get_traffic_type(&request);
         let HandleTimeoutCertificateRequest { certificate } = request.into_inner().try_into()?;
         trace!(?certificate, "Handling Timeout certificate");
         match self
@@ -652,11 +904,15 @@ where
             .await
         {
             Ok((info, _actions)) => {
-                Self::log_request_outcome_and_latency(start, true, "handle_timeout_certificate");
+                Self::log_request_success("handle_timeout_certificate", traffic_type);
                 Ok(Response::new(info.try_into()?))
             }
             Err(error) => {
-                Self::log_request_outcome_and_latency(start, false, "handle_timeout_certificate");
+                Self::log_request_error(
+                    "handle_timeout_certificate",
+                    traffic_type,
+                    &error.error_type(),
+                );
                 self.log_error(&error, "Failed to handle timeout certificate");
                 Ok(Response::new(NodeError::from(error).try_into()?))
             }
@@ -676,17 +932,20 @@ where
         &self,
         request: Request<ChainInfoQuery>,
     ) -> Result<Response<ChainInfoResult>, Status> {
-        let start = Instant::now();
+        let traffic_type = Self::get_traffic_type(&request);
         let query = request.into_inner().try_into()?;
         trace!(?query, "Handling chain info query");
         match self.state.clone().handle_chain_info_query(query).await {
-            Ok((info, actions)) => {
-                Self::log_request_outcome_and_latency(start, true, "handle_chain_info_query");
-                self.handle_network_actions(actions);
+            Ok(info) => {
+                Self::log_request_success("handle_chain_info_query", traffic_type);
                 Ok(Response::new(info.try_into()?))
             }
             Err(error) => {
-                Self::log_request_outcome_and_latency(start, false, "handle_chain_info_query");
+                Self::log_request_error(
+                    "handle_chain_info_query",
+                    traffic_type,
+                    &error.error_type(),
+                );
                 self.log_error(&error, "Failed to handle chain info query");
                 Ok(Response::new(NodeError::from(error).try_into()?))
             }
@@ -706,9 +965,9 @@ where
         &self,
         request: Request<PendingBlobRequest>,
     ) -> Result<Response<PendingBlobResult>, Status> {
-        let start = Instant::now();
+        let traffic_type = Self::get_traffic_type(&request);
         let (chain_id, blob_id) = request.into_inner().try_into()?;
-        trace!(?chain_id, ?blob_id, "Download pending blob");
+        trace!(?blob_id, "Download pending blob");
         match self
             .state
             .clone()
@@ -716,11 +975,11 @@ where
             .await
         {
             Ok(blob) => {
-                Self::log_request_outcome_and_latency(start, true, "download_pending_blob");
-                Ok(Response::new(blob.into_content().try_into()?))
+                Self::log_request_success("download_pending_blob", traffic_type);
+                Ok(Response::new(blob.content().clone().try_into()?))
             }
             Err(error) => {
-                Self::log_request_outcome_and_latency(start, false, "download_pending_blob");
+                Self::log_request_error("download_pending_blob", traffic_type, &error.error_type());
                 self.log_error(&error, "Failed to download pending blob");
                 Ok(Response::new(NodeError::from(error).try_into()?))
             }
@@ -733,25 +992,25 @@ where
         err,
         fields(
             nickname = self.state.nickname(),
-            chain_id = ?request.get_ref().chain_id
+            chain_id = ?request.get_ref().chain_id()
         )
     )]
     async fn handle_pending_blob(
         &self,
         request: Request<HandlePendingBlobRequest>,
     ) -> Result<Response<ChainInfoResult>, Status> {
-        let start = Instant::now();
+        let traffic_type = Self::get_traffic_type(&request);
         let (chain_id, blob_content) = request.into_inner().try_into()?;
         let blob = Blob::new(blob_content);
         let blob_id = blob.id();
-        trace!(?chain_id, ?blob_id, "Handle pending blob");
+        trace!(?blob_id, "Handle pending blob");
         match self.state.clone().handle_pending_blob(chain_id, blob).await {
             Ok(info) => {
-                Self::log_request_outcome_and_latency(start, true, "handle_pending_blob");
+                Self::log_request_success("handle_pending_blob", traffic_type);
                 Ok(Response::new(info.try_into()?))
             }
             Err(error) => {
-                Self::log_request_outcome_and_latency(start, false, "handle_pending_blob");
+                Self::log_request_error("handle_pending_blob", traffic_type, &error.error_type());
                 self.log_error(&error, "Failed to handle pending blob");
                 Ok(Response::new(NodeError::from(error).try_into()?))
             }
@@ -771,18 +1030,26 @@ where
         &self,
         request: Request<CrossChainRequest>,
     ) -> Result<Response<()>, Status> {
-        let start = Instant::now();
-        let request = request.into_inner().try_into()?;
-        trace!(?request, "Handling cross-chain request");
-        match self.state.clone().handle_cross_chain_request(request).await {
+        let traffic_type = Self::get_traffic_type(&request);
+        let cross_chain_request = request.into_inner().try_into()?;
+        trace!(?cross_chain_request, "Handling cross-chain request");
+        match self
+            .state
+            .clone()
+            .handle_cross_chain_request(cross_chain_request)
+            .await
+        {
             Ok(actions) => {
-                Self::log_request_outcome_and_latency(start, true, "handle_cross_chain_request");
+                Self::log_request_success("handle_cross_chain_request", traffic_type);
                 self.handle_network_actions(actions)
             }
             Err(error) => {
-                Self::log_request_outcome_and_latency(start, false, "handle_cross_chain_request");
-                let nickname = self.state.nickname();
-                error!(nickname, %error, "Failed to handle cross-chain request");
+                Self::log_request_error(
+                    "handle_cross_chain_request",
+                    traffic_type,
+                    &error.error_type(),
+                );
+                self.log_error(&error, "Failed to handle cross-chain request");
             }
         }
         Ok(Response::new(()))
@@ -792,6 +1059,7 @@ where
 /// Types which are proxyable and expose the appropriate methods to be handled
 /// by the `GrpcProxy`
 pub trait GrpcProxyable {
+    /// Returns the chain ID this message is destined for, if any.
     fn chain_id(&self) -> Option<ChainId>;
 }
 
@@ -849,7 +1117,8 @@ impl GrpcProxyable for CrossChainRequest {
 
         match self.inner.as_ref()? {
             Inner::UpdateRecipient(api::UpdateRecipient { recipient, .. })
-            | Inner::ConfirmUpdatedRecipient(api::ConfirmUpdatedRecipient { recipient, .. }) => {
+            | Inner::ConfirmUpdatedRecipient(api::ConfirmUpdatedRecipient { recipient, .. })
+            | Inner::RevertConfirm(api::RevertConfirm { recipient, .. }) => {
                 recipient.clone()?.try_into().ok()
             }
         }

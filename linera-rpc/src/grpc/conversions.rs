@@ -8,13 +8,15 @@ use linera_base::{
     },
     data_types::{BlobContent, BlockHeight, NetworkDescription},
     ensure,
-    identifiers::{AccountOwner, BlobId, ChainId},
+    identifiers::{AccountOwner, BlobId, ChainId, EventId},
 };
 use linera_chain::{
     data_types::{BlockProposal, LiteValue, ProposalContent},
+    justification::JustificationChain,
     types::{
-        Certificate, CertificateKind, ConfirmedBlock, ConfirmedBlockCertificate, LiteCertificate,
-        Timeout, TimeoutCertificate, ValidatedBlock, ValidatedBlockCertificate,
+        Certificate, CertificateKind, CertificateValue, ConfirmedBlock, ConfirmedBlockCertificate,
+        GenericCertificate, LiteCertificate, Timeout, TimeoutCertificate, ValidatedBlock,
+        ValidatedBlockCertificate,
     },
 };
 use linera_core::{
@@ -34,6 +36,7 @@ use crate::{
 };
 
 #[derive(Error, Debug)]
+#[allow(missing_docs)]
 pub enum GrpcProtoConversionError {
     #[error(transparent)]
     BincodeError(#[from] bincode::Error),
@@ -61,6 +64,16 @@ where
     T: TryInto<S, Error = GrpcProtoConversionError>,
 {
     t.ok_or(GrpcProtoConversionError::MissingField)?.try_into()
+}
+
+/// Deserializes a certificate's justification chain from the proto field. An empty field (used
+/// for timeout certificates) yields an empty chain.
+fn deserialize_justification(bytes: &[u8]) -> Result<JustificationChain, GrpcProtoConversionError> {
+    if bytes.is_empty() {
+        Ok(JustificationChain::default())
+    } else {
+        Ok(bincode::deserialize(bytes)?)
+    }
 }
 
 impl From<GrpcProtoConversionError> for Status {
@@ -285,10 +298,12 @@ impl TryFrom<api::CrossChainRequest> for CrossChainRequest {
                 sender,
                 recipient,
                 bundles,
+                previous_height,
             }) => CrossChainRequest::UpdateRecipient {
                 sender: try_proto_convert(sender)?,
                 recipient: try_proto_convert(recipient)?,
                 bundles: bincode::deserialize(&bundles)?,
+                previous_height: previous_height.map(Into::into),
             },
             Inner::ConfirmUpdatedRecipient(api::ConfirmUpdatedRecipient {
                 sender,
@@ -298,6 +313,17 @@ impl TryFrom<api::CrossChainRequest> for CrossChainRequest {
                 sender: try_proto_convert(sender)?,
                 recipient: try_proto_convert(recipient)?,
                 latest_height: latest_height
+                    .ok_or(GrpcProtoConversionError::MissingField)?
+                    .into(),
+            },
+            Inner::RevertConfirm(api::RevertConfirm {
+                sender,
+                recipient,
+                retransmit_from,
+            }) => CrossChainRequest::RevertConfirm {
+                sender: try_proto_convert(sender)?,
+                recipient: try_proto_convert(recipient)?,
+                retransmit_from: retransmit_from
                     .ok_or(GrpcProtoConversionError::MissingField)?
                     .into(),
             },
@@ -317,10 +343,12 @@ impl TryFrom<CrossChainRequest> for api::CrossChainRequest {
                 sender,
                 recipient,
                 bundles,
+                previous_height,
             } => Inner::UpdateRecipient(api::UpdateRecipient {
                 sender: Some(sender.into()),
                 recipient: Some(recipient.into()),
                 bundles: bincode::serialize(&bundles)?,
+                previous_height: previous_height.map(Into::into),
             }),
             CrossChainRequest::ConfirmUpdatedRecipient {
                 sender,
@@ -330,6 +358,15 @@ impl TryFrom<CrossChainRequest> for api::CrossChainRequest {
                 sender: Some(sender.into()),
                 recipient: Some(recipient.into()),
                 latest_height: Some(latest_height.into()),
+            }),
+            CrossChainRequest::RevertConfirm {
+                sender,
+                recipient,
+                retransmit_from,
+            } => Inner::RevertConfirm(api::RevertConfirm {
+                sender: Some(sender.into()),
+                recipient: Some(recipient.into()),
+                retransmit_from: Some(retransmit_from.into()),
             }),
         };
         Ok(Self { inner: Some(inner) })
@@ -355,10 +392,25 @@ impl TryFrom<api::LiteCertificate> for HandleLiteCertRequest<'_> {
             chain_id: try_proto_convert(certificate.chain_id)?,
             kind,
         };
-        let signatures = bincode::deserialize(&certificate.signatures)?;
+        let signatures: Vec<_> = bincode::deserialize(&certificate.signatures)?;
         let round = bincode::deserialize(&certificate.round)?;
+        let unlocking_round = bincode::deserialize(&certificate.unlocking_round)?;
+        let justification = deserialize_justification(&certificate.justification)?;
+        // The signed justification commitment is not on the wire: it is derived from the carried
+        // chain, which `LiteCertificate::check` binds it to anyway. A certificate whose voters
+        // signed a different commitment simply fails its signature check.
+        let justification_commitment = justification.commitment(value.value_hash);
+        let mut lite = LiteCertificate::new_with_payload(
+            value,
+            round,
+            unlocking_round,
+            certificate.first_round,
+            justification_commitment,
+            signatures,
+        );
+        lite.justification = std::borrow::Cow::Owned(justification);
         Ok(Self {
-            certificate: LiteCertificate::new(value, round, signatures),
+            certificate: lite,
             wait_for_outgoing_messages: certificate.wait_for_outgoing_messages,
         })
     }
@@ -375,6 +427,9 @@ impl TryFrom<HandleLiteCertRequest<'_>> for api::LiteCertificate {
             signatures: bincode::serialize(&request.certificate.signatures)?,
             wait_for_outgoing_messages: request.wait_for_outgoing_messages,
             kind: request.certificate.value.kind as i32,
+            unlocking_round: bincode::serialize(&request.certificate.unlocking_round)?,
+            justification: bincode::serialize(&request.certificate.justification)?,
+            first_round: request.certificate.first_round,
         })
     }
 }
@@ -509,7 +564,19 @@ impl TryFrom<api::Certificate> for ValidatedBlockCertificate {
 
         if cert_type == api::CertificateKind::Validated as i32 {
             let value: ValidatedBlock = bincode::deserialize(&certificate.value)?;
-            Ok(ValidatedBlockCertificate::new(value, round, signatures))
+            let below = deserialize_justification(&certificate.justification)?;
+            // The signed unlocking round and justification commitment are derived from the
+            // carried chain, which the certificate check binds them to anyway.
+            let justification_commitment = below.commitment(value.hash());
+            let quorum = GenericCertificate::new_with_payload(
+                value,
+                round,
+                below.top_unlocking_round(),
+                false,
+                justification_commitment,
+                signatures,
+            );
+            Ok(ValidatedBlockCertificate::from_parts(quorum, below))
         } else {
             Err(GrpcProtoConversionError::InvalidCertificateType)
         }
@@ -526,7 +593,19 @@ impl TryFrom<api::Certificate> for ConfirmedBlockCertificate {
 
         if cert_type == api::CertificateKind::Confirmed as i32 {
             let value: ConfirmedBlock = bincode::deserialize(&certificate.value)?;
-            Ok(ConfirmedBlockCertificate::new(value, round, signatures))
+            let validated = deserialize_justification(&certificate.justification)?;
+            // The signed justification commitment is derived from the carried chain, which the
+            // certificate check binds it to anyway.
+            let justification_commitment = validated.commitment(value.hash());
+            let quorum = GenericCertificate::new_with_payload(
+                value,
+                round,
+                None,
+                certificate.first_round,
+                justification_commitment,
+                signatures,
+            );
+            Ok(ConfirmedBlockCertificate::from_parts(quorum, validated))
         } else {
             Err(GrpcProtoConversionError::InvalidCertificateType)
         }
@@ -547,6 +626,8 @@ impl TryFrom<TimeoutCertificate> for api::Certificate {
             round,
             signatures,
             kind: api::CertificateKind::Timeout as i32,
+            justification: Vec::new(),
+            first_round: false,
         })
     }
 }
@@ -555,8 +636,10 @@ impl TryFrom<ConfirmedBlockCertificate> for api::Certificate {
     type Error = GrpcProtoConversionError;
 
     fn try_from(certificate: ConfirmedBlockCertificate) -> Result<Self, Self::Error> {
-        let round = bincode::serialize(&certificate.round)?;
+        let round = bincode::serialize(&certificate.round())?;
         let signatures = bincode::serialize(certificate.signatures())?;
+        let justification = bincode::serialize(certificate.justification())?;
+        let first_round = certificate.quorum().first_round();
 
         let value = bincode::serialize(certificate.value())?;
 
@@ -565,6 +648,8 @@ impl TryFrom<ConfirmedBlockCertificate> for api::Certificate {
             round,
             signatures,
             kind: api::CertificateKind::Confirmed as i32,
+            justification,
+            first_round,
         })
     }
 }
@@ -573,8 +658,9 @@ impl TryFrom<ValidatedBlockCertificate> for api::Certificate {
     type Error = GrpcProtoConversionError;
 
     fn try_from(certificate: ValidatedBlockCertificate) -> Result<Self, Self::Error> {
-        let round = bincode::serialize(&certificate.round)?;
+        let round = bincode::serialize(&certificate.round())?;
         let signatures = bincode::serialize(certificate.signatures())?;
+        let justification = bincode::serialize(certificate.justification())?;
 
         let value = bincode::serialize(certificate.value())?;
 
@@ -583,6 +669,8 @@ impl TryFrom<ValidatedBlockCertificate> for api::Certificate {
             round,
             signatures,
             kind: api::CertificateKind::Validated as i32,
+            justification,
+            first_round: false,
         })
     }
 }
@@ -600,9 +688,13 @@ impl TryFrom<api::ChainInfoQuery> for ChainInfoQuery {
             .request_leader_timeout
             .map(|height_and_round| bincode::deserialize(&height_and_round))
             .transpose()?;
+        let request_previous_event_blocks = chain_info_query
+            .request_previous_event_blocks
+            .map(|stream_ids| bincode::deserialize(&stream_ids))
+            .transpose()?
+            .unwrap_or_default();
 
         Ok(Self {
-            request_committees: chain_info_query.request_committees,
             request_owner_balance: try_proto_convert(chain_info_query.request_owner_balance)?,
             request_pending_message_bundles: chain_info_query.request_pending_message_bundles,
             chain_id: try_proto_convert(chain_info_query.chain_id)?,
@@ -613,8 +705,8 @@ impl TryFrom<api::ChainInfoQuery> for ChainInfoQuery {
             request_leader_timeout,
             request_fallback: chain_info_query.request_fallback,
             request_sent_certificate_hashes_by_heights,
-            request_sent_certificate_hashes_in_range: None,
-            create_network_actions: chain_info_query.create_network_actions.unwrap_or(true),
+            request_previous_event_blocks,
+            request_latest_checkpoint_height: chain_info_query.request_latest_checkpoint_height,
         })
     }
 }
@@ -630,10 +722,11 @@ impl TryFrom<ChainInfoQuery> for api::ChainInfoQuery {
             .request_leader_timeout
             .map(|height_and_round| bincode::serialize(&height_and_round))
             .transpose()?;
+        let request_previous_event_blocks =
+            bincode::serialize(&chain_info_query.request_previous_event_blocks)?;
 
         Ok(Self {
             chain_id: Some(chain_info_query.chain_id.into()),
-            request_committees: chain_info_query.request_committees,
             request_owner_balance,
             request_pending_message_bundles: chain_info_query.request_pending_message_bundles,
             test_next_block_height: chain_info_query.test_next_block_height.map(Into::into),
@@ -645,7 +738,8 @@ impl TryFrom<ChainInfoQuery> for api::ChainInfoQuery {
             request_manager_values: chain_info_query.request_manager_values,
             request_leader_timeout,
             request_fallback: chain_info_query.request_fallback,
-            create_network_actions: Some(chain_info_query.create_network_actions),
+            request_previous_event_blocks: Some(request_previous_event_blocks),
+            request_latest_checkpoint_height: chain_info_query.request_latest_checkpoint_height,
         })
     }
 }
@@ -939,30 +1033,13 @@ impl TryFrom<Certificate> for api::Certificate {
     type Error = GrpcProtoConversionError;
 
     fn try_from(certificate: Certificate) -> Result<Self, Self::Error> {
-        let round = bincode::serialize(&certificate.round())?;
-        let signatures = bincode::serialize(certificate.signatures())?;
-
-        let (kind, value) = match certificate {
-            Certificate::Confirmed(confirmed) => (
-                api::CertificateKind::Confirmed,
-                bincode::serialize(confirmed.value())?,
-            ),
-            Certificate::Validated(validated) => (
-                api::CertificateKind::Validated,
-                bincode::serialize(validated.value())?,
-            ),
-            Certificate::Timeout(timeout) => (
-                api::CertificateKind::Timeout,
-                bincode::serialize(timeout.value())?,
-            ),
-        };
-
-        Ok(Self {
-            value,
-            round,
-            signatures,
-            kind: kind as i32,
-        })
+        // Delegate to the per-type conversions so the justification/first-round wire encoding
+        // lives in exactly one place per certificate kind.
+        match certificate {
+            Certificate::Confirmed(confirmed) => confirmed.try_into(),
+            Certificate::Validated(validated) => validated.try_into(),
+            Certificate::Timeout(timeout) => timeout.try_into(),
+        }
     }
 }
 
@@ -970,23 +1047,22 @@ impl TryFrom<api::Certificate> for Certificate {
     type Error = GrpcProtoConversionError;
 
     fn try_from(certificate: api::Certificate) -> Result<Self, Self::Error> {
-        let round = bincode::deserialize(&certificate.round)?;
-        let signatures = bincode::deserialize(&certificate.signatures)?;
-
-        let value = if certificate.kind == api::CertificateKind::Confirmed as i32 {
-            let value: ConfirmedBlock = bincode::deserialize(&certificate.value)?;
-            Certificate::Confirmed(ConfirmedBlockCertificate::new(value, round, signatures))
+        // Delegate to the per-type conversions, which own the justification/first-round decoding.
+        if certificate.kind == api::CertificateKind::Confirmed as i32 {
+            Ok(Certificate::Confirmed(ConfirmedBlockCertificate::try_from(
+                certificate,
+            )?))
         } else if certificate.kind == api::CertificateKind::Validated as i32 {
-            let value: ValidatedBlock = bincode::deserialize(&certificate.value)?;
-            Certificate::Validated(ValidatedBlockCertificate::new(value, round, signatures))
+            Ok(Certificate::Validated(ValidatedBlockCertificate::try_from(
+                certificate,
+            )?))
         } else if certificate.kind == api::CertificateKind::Timeout as i32 {
-            let value: Timeout = bincode::deserialize(&certificate.value)?;
-            Certificate::Timeout(TimeoutCertificate::new(value, round, signatures))
+            Ok(Certificate::Timeout(TimeoutCertificate::try_from(
+                certificate,
+            )?))
         } else {
-            return Err(GrpcProtoConversionError::InvalidCertificateType);
-        };
-
-        Ok(value)
+            Err(GrpcProtoConversionError::InvalidCertificateType)
+        }
     }
 }
 
@@ -1035,9 +1111,45 @@ impl TryFrom<api::DownloadCertificatesByHeightsRequest> for CertificatesByHeight
     }
 }
 
+impl From<Vec<EventId>> for api::EventBlockHeightsRequest {
+    fn from(event_ids: Vec<EventId>) -> Self {
+        Self {
+            event_ids: bincode::serialize(&event_ids).expect("serialize event_ids"),
+        }
+    }
+}
+
+impl TryFrom<api::EventBlockHeightsRequest> for Vec<EventId> {
+    type Error = GrpcProtoConversionError;
+
+    fn try_from(request: api::EventBlockHeightsRequest) -> Result<Self, Self::Error> {
+        Ok(bincode::deserialize(&request.event_ids)?)
+    }
+}
+
+impl From<Vec<Option<BlockHeight>>> for api::EventBlockHeightsResponse {
+    fn from(heights: Vec<Option<BlockHeight>>) -> Self {
+        Self {
+            heights: bincode::serialize(&heights).expect("serialize heights"),
+        }
+    }
+}
+
+impl TryFrom<api::EventBlockHeightsResponse> for Vec<Option<BlockHeight>> {
+    type Error = GrpcProtoConversionError;
+
+    fn try_from(response: api::EventBlockHeightsResponse) -> Result<Self, Self::Error> {
+        Ok(bincode::deserialize(&response.heights)?)
+    }
+}
+
 #[cfg(test)]
+/// Tests for the gRPC protobuf conversions.
 pub mod tests {
-    use std::{borrow::Cow, fmt::Debug};
+    // Test helpers in this module don't need individual documentation.
+    #![allow(missing_docs)]
+
+    use std::{borrow::Cow, collections::BTreeMap, fmt::Debug};
 
     use linera_base::{
         crypto::{AccountSecretKey, BcsSignable, CryptoHash, Secp256k1SecretKey, ValidatorKeypair},
@@ -1059,7 +1171,7 @@ pub mod tests {
     impl BcsSignable<'_> for Foo {}
 
     fn dummy_chain_id(index: u32) -> ChainId {
-        ChainId(CryptoHash::test_hash(format!("chain{}", index)))
+        ChainId(CryptoHash::test_hash(format!("chain{index}")))
     }
 
     fn get_block() -> ProposedBlock {
@@ -1068,7 +1180,7 @@ pub mod tests {
 
     /// A convenience function for testing. It converts a type into its
     /// RPC equivalent and back - asserting that the two are equal.
-    fn round_trip_check<T, M>(value: T)
+    fn round_trip_check<T, M>(value: &T)
     where
         T: TryFrom<M> + Clone + Debug + Eq,
         M: TryFrom<T>,
@@ -1076,16 +1188,17 @@ pub mod tests {
         M::Error: Debug,
     {
         let message = M::try_from(value.clone()).unwrap();
-        assert_eq!(value, message.try_into().unwrap());
+        let round_trip_value: T = message.try_into().unwrap();
+        assert_eq!(value, &round_trip_value);
     }
 
     #[test]
     pub fn test_public_key() {
         let account_key = AccountSecretKey::generate().public();
-        round_trip_check::<_, api::AccountPublicKey>(account_key);
+        round_trip_check::<_, api::AccountPublicKey>(&account_key);
 
         let validator_key = ValidatorKeypair::generate().public_key;
-        round_trip_check::<_, api::ValidatorPublicKey>(validator_key);
+        round_trip_check::<_, api::ValidatorPublicKey>(&validator_key);
     }
 
     #[test]
@@ -1093,30 +1206,30 @@ pub mod tests {
         let validator_key_pair = ValidatorKeypair::generate();
         let validator_signature =
             ValidatorSignature::new(&Foo("test".into()), &validator_key_pair.secret_key);
-        round_trip_check::<_, api::ValidatorSignature>(validator_signature);
+        round_trip_check::<_, api::ValidatorSignature>(&validator_signature);
 
         let account_key_pair = AccountSecretKey::generate();
         let account_signature = account_key_pair.sign(&Foo("test".into()));
-        round_trip_check::<_, api::AccountSignature>(account_signature);
+        round_trip_check::<_, api::AccountSignature>(&account_signature);
     }
 
     #[test]
     pub fn test_owner() {
         let key_pair = AccountSecretKey::generate();
         let owner = AccountOwner::from(key_pair.public());
-        round_trip_check::<_, api::AccountOwner>(owner);
+        round_trip_check::<_, api::AccountOwner>(&owner);
     }
 
     #[test]
     pub fn test_block_height() {
         let block_height = BlockHeight::from(10);
-        round_trip_check::<_, api::BlockHeight>(block_height);
+        round_trip_check::<_, api::BlockHeight>(&block_height);
     }
 
     #[test]
     pub fn test_chain_id() {
         let chain_id = dummy_chain_id(0);
-        round_trip_check::<_, api::ChainId>(chain_id);
+        round_trip_check::<_, api::ChainId>(&chain_id);
     }
 
     #[test]
@@ -1131,12 +1244,14 @@ pub mod tests {
             timestamp: Timestamp::default(),
             next_block_height: BlockHeight::ZERO,
             state_hash: None,
-            requested_committees: None,
+            committee_hash: None,
             requested_owner_balance: None,
             requested_pending_message_bundles: vec![],
             requested_sent_certificate_hashes: vec![],
             count_received_log: 0,
             requested_received_log: vec![],
+            requested_previous_event_blocks: BTreeMap::new(),
+            requested_latest_checkpoint_height: None,
         });
 
         let chain_info_response_none = ChainInfoResponse {
@@ -1144,7 +1259,7 @@ pub mod tests {
             info: chain_info.clone(),
             signature: None,
         };
-        round_trip_check::<_, api::ChainInfoResponse>(chain_info_response_none);
+        round_trip_check::<_, api::ChainInfoResponse>(&chain_info_response_none);
 
         let chain_info_response_some = ChainInfoResponse {
             // `info` is bincode so no need to test conversions extensively
@@ -1154,18 +1269,17 @@ pub mod tests {
                 &ValidatorKeypair::generate().secret_key,
             )),
         };
-        round_trip_check::<_, api::ChainInfoResponse>(chain_info_response_some);
+        round_trip_check::<_, api::ChainInfoResponse>(&chain_info_response_some);
     }
 
     #[test]
     pub fn test_chain_info_query() {
         let chain_info_query_none = ChainInfoQuery::new(dummy_chain_id(0));
-        round_trip_check::<_, api::ChainInfoQuery>(chain_info_query_none);
+        round_trip_check::<_, api::ChainInfoQuery>(&chain_info_query_none);
 
         let chain_info_query_some = ChainInfoQuery {
             chain_id: dummy_chain_id(0),
             test_next_block_height: Some(BlockHeight::from(10)),
-            request_committees: false,
             request_owner_balance: AccountOwner::CHAIN,
             request_pending_message_bundles: false,
             request_received_log_excluding_first_n: None,
@@ -1173,10 +1287,10 @@ pub mod tests {
             request_leader_timeout: None,
             request_fallback: true,
             request_sent_certificate_hashes_by_heights: (3..8).map(BlockHeight::from).collect(),
-            request_sent_certificate_hashes_in_range: None,
-            create_network_actions: true,
+            request_previous_event_blocks: Vec::new(),
+            request_latest_checkpoint_height: true,
         };
-        round_trip_check::<_, api::ChainInfoQuery>(chain_info_query_some);
+        round_trip_check::<_, api::ChainInfoQuery>(&chain_info_query_some);
     }
 
     #[test]
@@ -1184,13 +1298,13 @@ pub mod tests {
         let chain_id = dummy_chain_id(2);
         let blob_id = Blob::new(BlobContent::new_data(*b"foo")).id();
         let pending_blob_request = (chain_id, blob_id);
-        round_trip_check::<_, api::PendingBlobRequest>(pending_blob_request);
+        round_trip_check::<_, api::PendingBlobRequest>(&pending_blob_request);
     }
 
     #[test]
     pub fn test_pending_blob_result() {
         let blob = BlobContent::new_data(*b"foo");
-        round_trip_check::<_, api::PendingBlobResult>(blob);
+        round_trip_check::<_, api::PendingBlobResult>(&blob);
     }
 
     #[test]
@@ -1198,7 +1312,7 @@ pub mod tests {
         let chain_id = dummy_chain_id(2);
         let blob_content = BlobContent::new_data(*b"foo");
         let pending_blob_request = (chain_id, blob_content);
-        round_trip_check::<_, api::HandlePendingBlobRequest>(pending_blob_request);
+        round_trip_check::<_, api::HandlePendingBlobRequest>(&pending_blob_request);
     }
 
     #[test]
@@ -1211,6 +1325,10 @@ pub mod tests {
                 kind: CertificateKind::Validated,
             },
             round: Round::MultiLeader(2),
+            unlocking_round: None,
+            first_round: false,
+            justification_commitment: None,
+            justification: Default::default(),
             signatures: Cow::Owned(vec![(
                 key_pair.public_key,
                 ValidatorSignature::new(&Foo("test".into()), &key_pair.secret_key),
@@ -1221,7 +1339,7 @@ pub mod tests {
             wait_for_outgoing_messages: true,
         };
 
-        round_trip_check::<_, api::LiteCertificate>(request);
+        round_trip_check::<_, api::LiteCertificate>(&request);
     }
 
     #[test]
@@ -1243,7 +1361,7 @@ pub mod tests {
         );
         let request = HandleValidatedCertificateRequest { certificate };
 
-        round_trip_check::<_, api::HandleValidatedCertificateRequest>(request);
+        round_trip_check::<_, api::HandleValidatedCertificateRequest>(&request);
     }
 
     #[test]
@@ -1252,8 +1370,9 @@ pub mod tests {
             sender: dummy_chain_id(0),
             recipient: dummy_chain_id(0),
             bundles: vec![],
+            previous_height: Some(BlockHeight::from(42)),
         };
-        round_trip_check::<_, api::CrossChainRequest>(cross_chain_request_update_recipient);
+        round_trip_check::<_, api::CrossChainRequest>(&cross_chain_request_update_recipient);
 
         let cross_chain_request_confirm_updated_recipient =
             CrossChainRequest::ConfirmUpdatedRecipient {
@@ -1262,7 +1381,7 @@ pub mod tests {
                 latest_height: BlockHeight(1),
             };
         round_trip_check::<_, api::CrossChainRequest>(
-            cross_chain_request_confirm_updated_recipient,
+            &cross_chain_request_confirm_updated_recipient,
         );
     }
 
@@ -1294,7 +1413,7 @@ pub mod tests {
             original_proposal: Some(OriginalProposal::Regular { certificate }),
         };
 
-        round_trip_check::<_, api::BlockProposal>(block_proposal);
+        round_trip_check::<_, api::BlockProposal>(&block_proposal);
     }
 
     #[test]

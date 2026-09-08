@@ -21,13 +21,21 @@ pub trait KeyValueStoreError:
 {
     /// The name of the backend.
     const BACKEND: &'static str;
+
+    /// Returns `true` if this error may have left storage in an undetermined state,
+    /// so the view must be reloaded before being used again.
+    fn must_reload_view(&self) -> bool {
+        false
+    }
 }
 
 impl<E: KeyValueStoreError> From<E> for ViewError {
     fn from(error: E) -> Self {
+        let must_reload_view = error.must_reload_view();
         Self::StoreError {
             backend: E::BACKEND,
             error: Box::new(error),
+            must_reload_view,
         }
     }
 }
@@ -43,9 +51,6 @@ pub trait WithError {
 pub trait ReadableKeyValueStore: WithError {
     /// The maximal size of keys that can be stored.
     const MAX_KEY_SIZE: usize;
-
-    /// Retrieve the number of stream queries.
-    fn max_stream_queries(&self) -> usize;
 
     /// Gets the root key of the store.
     fn root_key(&self) -> Result<Vec<u8>, Self::Error>;
@@ -139,12 +144,12 @@ pub trait DirectWritableKeyValueStore: WithError {
 
 /// The definition of a key-value database.
 #[cfg_attr(not(web), trait_variant::make(Send + Sync))]
-pub trait KeyValueDatabase: WithError + Sized {
+pub trait KeyValueDatabase: WithError + linera_base::util::traits::AutoTraits + Sized {
     /// The configuration needed to interact with a new backend.
     type Config: Send + Sync;
 
-    /// The result of opening a partition.
-    type Store;
+    /// The result of opening a partition. Its errors are the database's errors.
+    type Store: WithError<Error = Self::Error>;
 
     /// The name of this database.
     fn get_name() -> String;
@@ -291,10 +296,6 @@ pub mod inactive_store {
 
     impl ReadableKeyValueStore for InactiveStore {
         const MAX_KEY_SIZE: usize = 0;
-
-        fn max_stream_queries(&self) -> usize {
-            0
-        }
 
         fn root_key(&self) -> Result<Vec<u8>, Self::Error> {
             panic!("attempt to read from an inactive store!")

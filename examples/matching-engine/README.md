@@ -61,6 +61,12 @@ linera_spawn linera net up --with-faucet --faucet-port $FAUCET_PORT
 #   FAUCET_URL=https://faucet.testnet-XXX.linera.net  # for some value XXX
 ```
 
+Enable logs for user applications:
+
+```bash
+export LINERA_APPLICATION_LOGS=true
+```
+
 Create the user wallet and add chains to it:
 
 ```bash
@@ -177,11 +183,11 @@ Engine to close the chain.
 kill %% && sleep 1    # Kill the service so we can use CLI commands for chain 1.
 
 linera --wait-for-outgoing-messages change-ownership \
-    --owners $OWNER_1 $OWNER_2
+    --owners "{\"$OWNER_1\":100,\"$OWNER_2\":100}"
 
 linera --wait-for-outgoing-messages change-application-permissions \
-    --execute-operations $MATCHING_ENGINE \
-    --close-chain $MATCHING_ENGINE
+    --execute-operations "[\"$MATCHING_ENGINE\"]" \
+    --manage-chain "[\"$MATCHING_ENGINE\"]"
 
 linera service --port $PORT &
 ```

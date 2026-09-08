@@ -3,7 +3,10 @@
 
 //! Handle requests from the synchronous execution thread of user applications.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use custom_debug_derive::Debug;
 use futures::{channel::mpsc, StreamExt as _};
@@ -12,26 +15,30 @@ use linera_base::prometheus_util::MeasureLatency as _;
 use linera_base::{
     data_types::{
         Amount, ApplicationPermissions, ArithmeticError, BlobContent, BlockHeight, OracleResponse,
-        Timestamp,
+        StreamUpdate, Timestamp,
     },
     ensure, hex_debug, hex_vec_debug, http,
-    identifiers::{Account, AccountOwner, BlobId, BlobType, ChainId, EventId, StreamId},
+    identifiers::{
+        Account, AccountOwner, BlobId, BlobType, ChainId, EventId, GenericApplicationId,
+        OwnerSpender, StreamId,
+    },
     ownership::ChainOwnership,
     time::Instant,
 };
 use linera_views::{batch::Batch, context::Context, views::View};
 use oneshot::Sender;
 use reqwest::{header::HeaderMap, Client, Url};
+use tracing::{info_span, instrument, Instrument as _};
 
 use crate::{
     execution::UserAction,
     runtime::ContractSyncRuntime,
     system::{CreateApplicationResult, OpenChainConfig},
     util::{OracleResponseExt as _, RespondExt as _},
-    ApplicationDescription, ApplicationId, ExecutionError, ExecutionRuntimeConfig,
-    ExecutionRuntimeContext, ExecutionStateView, JsVec, Message, MessageContext, MessageKind,
-    ModuleId, Operation, OperationContext, OutgoingMessage, ProcessStreamsContext, QueryContext,
-    QueryOutcome, ResourceController, SystemMessage, TransactionTracker, UserContractCode,
+    ApplicationDescription, ApplicationId, ExecutionError, ExecutionRuntimeContext,
+    ExecutionStateView, JsVec, Message, MessageContext, MessageKind, ModuleId, Operation,
+    OperationContext, OutgoingMessage, ProcessStreamsContext, QueryContext, QueryOutcome,
+    ResourceController, SystemMessage, SystemOperation, TransactionTracker, UserContractCode,
     UserServiceCode,
 };
 
@@ -43,38 +50,36 @@ pub struct ExecutionStateActor<'a, C> {
 }
 
 #[cfg(with_metrics)]
-mod metrics {
-    use std::sync::LazyLock;
-
+pub(crate) mod metrics {
     use linera_base::prometheus_util::{exponential_bucket_latencies, register_histogram_vec};
     use prometheus::HistogramVec;
 
-    /// Histogram of the latency to load a contract bytecode.
-    pub static LOAD_CONTRACT_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
-        register_histogram_vec(
-            "load_contract_latency",
-            "Load contract latency",
-            &[],
-            exponential_bucket_latencies(250.0),
-        )
-    });
+    linera_base::declare_metrics! {
+        /// Histogram of the latency to load a contract bytecode.
+        pub static LOAD_CONTRACT_LATENCY: HistogramVec =
+            register_histogram_vec(
+                "load_contract_latency",
+                "Load contract latency",
+                &[],
+                exponential_bucket_latencies(250.0),
+            );
 
-    /// Histogram of the latency to load a service bytecode.
-    pub static LOAD_SERVICE_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
-        register_histogram_vec(
-            "load_service_latency",
-            "Load service latency",
-            &[],
-            exponential_bucket_latencies(250.0),
-        )
-    });
+        /// Histogram of the latency to load a service bytecode.
+        pub static LOAD_SERVICE_LATENCY: HistogramVec =
+            register_histogram_vec(
+                "load_service_latency",
+                "Load service latency",
+                &[],
+                exponential_bucket_latencies(250.0),
+            );
+    }
 }
 
 pub(crate) type ExecutionStateSender = mpsc::UnboundedSender<ExecutionRequest>;
 
 impl<'a, C> ExecutionStateActor<'a, C>
 where
-    C: Context + Clone + Send + Sync + 'static,
+    C: Context + Clone + 'static,
     C::Extra: ExecutionRuntimeContext,
 {
     /// Creates a new execution state actor.
@@ -90,6 +95,7 @@ where
         }
     }
 
+    #[instrument(skip_all, fields(application_id = %id))]
     pub(crate) async fn load_contract(
         &mut self,
         id: ApplicationId,
@@ -141,6 +147,10 @@ where
     }
 
     // TODO(#1416): Support concurrent I/O.
+    #[instrument(
+        skip_all,
+        fields(request_type = %request.as_ref())
+    )]
     pub(crate) async fn handle_request(
         &mut self,
         request: ExecutionRequest,
@@ -181,6 +191,35 @@ where
             BalanceOwners { callback } => {
                 let owners = self.state.system.balances.indices().await?;
                 callback.respond(owners);
+            }
+
+            Allowance {
+                owner,
+                spender,
+                callback,
+            } => {
+                let owner_spender = OwnerSpender::new(owner, spender);
+                let allowance = self
+                    .state
+                    .system
+                    .allowances
+                    .get(&owner_spender)
+                    .await?
+                    .unwrap_or_default();
+                callback.respond(allowance);
+            }
+
+            Allowances { callback } => {
+                let entries: Vec<_> = self
+                    .state
+                    .system
+                    .allowances
+                    .index_values()
+                    .await?
+                    .into_iter()
+                    .map(|(os, amount)| (os.owner, os.spender, amount))
+                    .collect();
+                callback.respond(entries);
             }
 
             Transfer {
@@ -224,14 +263,84 @@ where
                 callback.respond(());
             }
 
+            Approve {
+                owner,
+                spender,
+                amount,
+                signer,
+                application_id,
+                callback,
+            } => {
+                self.state
+                    .system
+                    .approve(signer, Some(application_id), owner, spender, amount)
+                    .await?;
+                callback.respond(());
+            }
+
+            TransferFrom {
+                owner,
+                spender,
+                destination,
+                amount,
+                signer,
+                application_id,
+                callback,
+            } => {
+                let maybe_message = self
+                    .state
+                    .system
+                    .transfer_from(
+                        signer,
+                        Some(application_id),
+                        owner,
+                        spender,
+                        destination,
+                        amount,
+                    )
+                    .await?;
+                self.txn_tracker.add_outgoing_messages(maybe_message);
+                callback.respond(());
+            }
+
             SystemTimestamp { callback } => {
-                let timestamp = *self.state.system.timestamp.get();
+                let timestamp = self.state.system.progress.get().timestamp;
                 callback.respond(timestamp);
             }
 
             ChainOwnership { callback } => {
-                let ownership = self.state.system.ownership.get().clone();
+                let ownership = self.state.system.ownership.get().await?.clone();
                 callback.respond(ownership);
+            }
+
+            ApplicationPermissions { callback } => {
+                let permissions = self
+                    .state
+                    .system
+                    .application_permissions
+                    .get()
+                    .await?
+                    .clone();
+                callback.respond(permissions);
+            }
+
+            ReadApplicationDescription {
+                application_id,
+                callback,
+            } => {
+                let blob_id = application_id.description_blob_id();
+                let description = match self.txn_tracker.get_blob_content(&blob_id) {
+                    Some(blob) => bcs::from_bytes(blob.bytes())?,
+                    None => {
+                        let blob_content = self.state.system.read_blob_content(blob_id).await?;
+                        self.state
+                            .system
+                            .blob_used(self.txn_tracker, blob_id)
+                            .await?;
+                        bcs::from_bytes(blob_content.bytes())?
+                    }
+                };
+                callback.respond(description);
             }
 
             ContainsKey { id, key, callback } => {
@@ -302,28 +411,27 @@ where
                 callback,
             } => {
                 let mut view = self.state.users.try_load_entry_mut(&id).await?;
-                view.write_batch(batch).await?;
+                view.write_batch(batch)?;
                 callback.respond(());
             }
 
             OpenChain {
-                ownership,
-                balance,
+                config,
                 parent_id,
                 block_height,
-                application_permissions,
                 timestamp,
                 callback,
             } => {
-                let config = OpenChainConfig {
-                    ownership,
-                    balance,
-                    application_permissions,
-                };
                 let chain_id = self
                     .state
                     .system
-                    .open_chain(config, parent_id, block_height, timestamp, self.txn_tracker)
+                    .open_chain(
+                        *config,
+                        parent_id,
+                        block_height,
+                        timestamp,
+                        self.txn_tracker,
+                    )
                     .await?;
                 callback.respond(chain_id);
             }
@@ -332,11 +440,25 @@ where
                 application_id,
                 callback,
             } => {
-                let app_permissions = self.state.system.application_permissions.get();
-                if !app_permissions.can_close_chain(&application_id) {
+                let app_permissions = self.state.system.application_permissions.get().await?;
+                if !app_permissions.can_manage_chain(&application_id) {
                     callback.respond(Err(ExecutionError::UnauthorizedApplication(application_id)));
                 } else {
                     self.state.system.close_chain();
+                    callback.respond(Ok(()));
+                }
+            }
+
+            ChangeOwnership {
+                application_id,
+                ownership,
+                callback,
+            } => {
+                let app_permissions = self.state.system.application_permissions.get().await?;
+                if !app_permissions.can_manage_chain(&application_id) {
+                    callback.respond(Err(ExecutionError::UnauthorizedApplication(application_id)));
+                } else {
+                    self.state.system.ownership.set(ownership);
                     callback.respond(Ok(()));
                 }
             }
@@ -346,8 +468,8 @@ where
                 application_permissions,
                 callback,
             } => {
-                let app_permissions = self.state.system.application_permissions.get();
-                if !app_permissions.can_change_application_permissions(&application_id) {
+                let app_permissions = self.state.system.application_permissions.get().await?;
+                if !app_permissions.can_manage_chain(&application_id) {
                     callback.respond(Err(ExecutionError::UnauthorizedApplication(application_id)));
                 } else {
                     self.state
@@ -410,6 +532,7 @@ where
 
                         let (_epoch, committee) = system
                             .current_committee()
+                            .await?
                             .ok_or_else(|| ExecutionError::UnauthorizedHttpRequest(url.clone()))?;
                         let allowed_hosts = &committee.policy().http_request_allow_list;
 
@@ -517,7 +640,10 @@ where
                             .get_event(event_id.clone())
                             .await?
                             .ok_or(ExecutionError::EventsNotFound(vec![event_id.clone()]))?;
-                        Ok(OracleResponse::Event(event_id.clone(), event))
+                        Ok(OracleResponse::Event(
+                            event_id.clone(),
+                            Arc::unwrap_or_clone(event),
+                        ))
                     })
                     .await?
                     .to_event(&event_id)?;
@@ -540,15 +666,21 @@ where
                     .event_subscriptions
                     .get_mut_or_default(&(chain_id, stream_id.clone()))
                     .await?;
-                let next_index = if subscriptions.applications.insert(subscriber_app_id) {
-                    subscriptions.next_index
-                } else {
-                    0
+                let next_index = match subscriptions.applications.entry(subscriber_app_id) {
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        entry.insert(0);
+                        subscriptions.min_next_index = 0;
+                        0
+                    }
+                    std::collections::btree_map::Entry::Occupied(entry) => *entry.get(),
                 };
+                // The publisher's floor isn't available on the subscriber at subscribe time;
+                // later `UpdateStream` operations carry the real one.
                 self.txn_tracker.add_stream_to_process(
                     subscriber_app_id,
                     chain_id,
                     stream_id,
+                    0,
                     0,
                     next_index,
                 );
@@ -571,6 +703,8 @@ where
                 subscriptions.applications.remove(&subscriber_app_id);
                 if subscriptions.applications.is_empty() {
                     self.state.system.event_subscriptions.remove(&key)?;
+                } else {
+                    subscriptions.recalculate_min();
                 }
                 if let crate::GenericApplicationId::User(app_id) = stream_id.application_id {
                     self.txn_tracker
@@ -580,7 +714,7 @@ where
             }
 
             GetApplicationPermissions { callback } => {
-                let app_permissions = self.state.system.application_permissions.get();
+                let app_permissions = self.state.system.application_permissions.get().await?;
                 callback.respond(app_permissions.clone());
             }
 
@@ -662,6 +796,9 @@ where
             }
 
             AddCreatedBlob { blob, callback } => {
+                if self.resource_controller.is_free {
+                    self.txn_tracker.mark_blob_free(blob.id());
+                }
                 self.txn_tracker.add_created_blob(blob);
                 callback.respond(());
             }
@@ -675,20 +812,43 @@ where
                 callback.respond(validation_round);
             }
 
-            TotalStorageSize {
+            HasEmptyStorage {
                 application,
                 callback,
             } => {
                 let view = self.state.users.try_load_entry(&application).await?;
                 let result = match view {
-                    Some(view) => {
-                        let total_size = view.total_size();
-                        (total_size.key, total_size.value)
-                    }
-                    None => (0, 0),
+                    Some(view) => view.iterative_count().await? == 0,
+                    None => true,
                 };
                 callback.respond(result);
             }
+
+            AllowApplicationLogs { callback } => {
+                let allow = self
+                    .state
+                    .context()
+                    .extra()
+                    .execution_runtime_config()
+                    .allow_application_logs;
+                callback.respond(allow);
+            }
+
+            #[cfg(web)]
+            Log { message, level } => match level {
+                tracing::log::Level::Trace | tracing::log::Level::Debug => {
+                    tracing::debug!(target: "user_application_log", message = %message);
+                }
+                tracing::log::Level::Info => {
+                    tracing::info!(target: "user_application_log", message = %message);
+                }
+                tracing::log::Level::Warn => {
+                    tracing::warn!(target: "user_application_log", message = %message);
+                }
+                tracing::log::Level::Error => {
+                    tracing::error!(target: "user_application_log", message = %message);
+                }
+            },
         }
 
         Ok(())
@@ -696,6 +856,7 @@ where
 
     /// Calls `process_streams` for all applications that are subscribed to streams with new
     /// events or that have new subscriptions.
+    #[instrument(skip_all)]
     async fn process_subscriptions(
         &mut self,
         context: ProcessStreamsContext,
@@ -743,6 +904,65 @@ where
         }
     }
 
+    /// Calls `summarize_events` for every application that has published events to one of its
+    /// streams since the previous checkpoint, then drops those streams' pre-checkpoint anchors.
+    ///
+    /// The work list is exactly the set of user streams currently in `previous_event_blocks`:
+    /// the previous checkpoint cleared the map, so an entry means the stream published a
+    /// summary at (or any event since) the previous checkpoint. Each application may emit a
+    /// fresh summary event; the block-level event-stream bookkeeping then re-anchors that
+    /// stream to the checkpoint height (with no recertification link to the now-unguaranteed
+    /// older blocks, since the map was cleared here). A stream whose application emits nothing
+    /// stays dropped and is effectively closed: it won't be summarized again unless it
+    /// publishes new events.
+    async fn summarize_events_at_checkpoint(
+        &mut self,
+        context: OperationContext,
+    ) -> Result<(), ExecutionError> {
+        let mut updates_by_app = BTreeMap::<ApplicationId, Vec<StreamUpdate>>::new();
+        for stream_id in self.state.previous_event_blocks.indices().await? {
+            let GenericApplicationId::User(application_id) = stream_id.application_id else {
+                continue;
+            };
+            let next_index = self
+                .state
+                .system
+                .stream_event_counts
+                .get(&stream_id)
+                .await?
+                .unwrap_or(0);
+            // A summary is an absolute-state snapshot, so the application is not handed an
+            // incremental range to fold in; `previous_index` is left at 0. The summary the
+            // application emits lands at `next_index`, which becomes the stream's readable floor.
+            updates_by_app
+                .entry(application_id)
+                .or_default()
+                .push(StreamUpdate {
+                    chain_id: context.chain_id,
+                    stream_id,
+                    previous_index: 0,
+                    first_index: next_index,
+                    next_index,
+                });
+        }
+
+        // Drop every pre-checkpoint anchor. Only user streams are present, since
+        // `prepare_checkpoint` rejects chains that published system events.
+        self.state.previous_event_blocks.clear();
+
+        let process_context = ProcessStreamsContext::from(context);
+        for (application_id, updates) in updates_by_app {
+            self.run_user_action(
+                application_id,
+                UserAction::SummarizeEvents(process_context, updates),
+                None,
+                None,
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn run_user_action(
         &mut self,
         application_id: ApplicationId,
@@ -750,7 +970,6 @@ where
         refund_grant_to: Option<Account>,
         grant: Option<&mut Amount>,
     ) -> Result<(), ExecutionError> {
-        let ExecutionRuntimeConfig {} = self.state.context().extra().execution_runtime_config();
         self.run_user_action_with_runtime(application_id, action, refund_grant_to, grant)
             .await
     }
@@ -780,6 +999,7 @@ where
     }
 
     // TODO(#5034): unify with `service_and_dependencies`
+    #[instrument(skip_all, fields(application_id = %application))]
     async fn contract_and_dependencies(
         &mut self,
         application: ApplicationId,
@@ -803,6 +1023,7 @@ where
         Ok((codes, descriptions))
     }
 
+    #[instrument(skip_all, fields(application_id = %application_id))]
     async fn run_user_action_with_runtime(
         &mut self,
         application_id: ApplicationId,
@@ -817,39 +1038,70 @@ where
             .with_state_and_grant(&mut self.state.system, cloned_grant.as_mut())
             .await?
             .balance()?;
-        let controller = ResourceController::new(
+        let mut controller = ResourceController::new(
             self.resource_controller.policy().clone(),
             self.resource_controller.tracker,
             initial_balance,
         );
+        let is_free = matches!(
+            &action,
+            UserAction::Message(..)
+                | UserAction::ProcessStreams(..)
+                | UserAction::SummarizeEvents(..)
+        ) && self
+            .resource_controller
+            .policy()
+            .is_free_app(&application_id);
+        controller.is_free = is_free;
+        self.resource_controller.is_free = is_free;
         let (execution_state_sender, mut execution_state_receiver) =
             futures::channel::mpsc::unbounded();
 
         let (codes, descriptions): (Vec<_>, Vec<_>) =
             self.contract_and_dependencies(application_id).await?;
 
-        let thread = web_thread::Thread::new();
-        let contract_runtime_task = thread.run_send(JsVec(codes), move |codes| async move {
-            let runtime = ContractSyncRuntime::new(
-                execution_state_sender,
-                chain_id,
-                refund_grant_to,
-                controller,
-                &action,
-            );
+        let allow_application_logs = self
+            .state
+            .context()
+            .extra()
+            .execution_runtime_config()
+            .allow_application_logs;
 
-            for (code, description) in codes.0.into_iter().zip(descriptions) {
-                runtime.preload_contract(ApplicationId::from(&description), code, description)?;
+        let contract_runtime_task = self
+            .state
+            .context()
+            .extra()
+            .thread_pool()
+            .run_send(JsVec(codes), move |codes| async move {
+                let runtime = ContractSyncRuntime::new(
+                    execution_state_sender,
+                    chain_id,
+                    refund_grant_to,
+                    controller,
+                    &action,
+                    allow_application_logs,
+                );
+
+                for (code, description) in codes.0.into_iter().zip(descriptions) {
+                    runtime.preload_contract(ApplicationId::from(&description), code, description);
+                }
+
+                runtime.run_action(application_id, chain_id, action)
+            })
+            .await;
+
+        async {
+            while let Some(request) = execution_state_receiver.next().await {
+                self.handle_request(request).await?;
             }
-
-            runtime.run_action(application_id, chain_id, action)
-        });
-
-        while let Some(request) = execution_state_receiver.next().await {
-            self.handle_request(request).await?;
+            Ok::<(), ExecutionError>(())
         }
+        .instrument(info_span!("handle_runtime_requests"))
+        .await?;
 
         let (result, controller) = contract_runtime_task.await??;
+
+        self.resource_controller.is_free = false;
 
         self.txn_tracker.add_operation_result(result);
 
@@ -862,6 +1114,12 @@ where
         Ok(())
     }
 
+    #[instrument(skip_all, fields(
+        chain_id = %context.chain_id,
+        block_height = %context.height,
+        operation_type = %operation.as_ref(),
+    ))]
+    /// Executes an operation, dispatching to the system or to a user application.
     pub async fn execute_operation(
         &mut self,
         context: OperationContext,
@@ -869,23 +1127,37 @@ where
     ) -> Result<(), ExecutionError> {
         assert_eq!(context.chain_id, self.state.context().extra().chain_id());
         match operation {
-            Operation::System(op) => {
-                let new_application = self
-                    .state
-                    .system
-                    .execute_operation(context, *op, self.txn_tracker, self.resource_controller)
-                    .await?;
-                if let Some((application_id, argument)) = new_application {
-                    let user_action = UserAction::Instantiate(context, argument);
-                    self.run_user_action(
-                        application_id,
-                        user_action,
-                        context.refund_grant_to(),
-                        None,
-                    )
-                    .await?;
+            Operation::System(op) => match *op {
+                SystemOperation::Checkpoint => {
+                    let prepared = self.txn_tracker.take_prepared_checkpoint().ok_or(
+                        ExecutionError::CheckpointPreconditionFailed(
+                            "Checkpoint operation reached the actor without prepared inputs; \
+                             the chain-level pre-block hook must run prepare_checkpoint first",
+                        ),
+                    )?;
+                    self.state
+                        .apply_checkpoint(prepared, self.txn_tracker)
+                        .await?;
+                    self.summarize_events_at_checkpoint(context).await?;
                 }
-            }
+                op => {
+                    let new_application = self
+                        .state
+                        .system
+                        .execute_operation(context, op, self.txn_tracker, self.resource_controller)
+                        .await?;
+                    if let Some((application_id, argument)) = new_application {
+                        let user_action = UserAction::Instantiate(context, argument);
+                        self.run_user_action(
+                            application_id,
+                            user_action,
+                            context.refund_grant_to(),
+                            None,
+                        )
+                        .await?;
+                    }
+                }
+            },
             Operation::User {
                 application_id,
                 bytes,
@@ -903,6 +1175,14 @@ where
         Ok(())
     }
 
+    #[instrument(skip_all, fields(
+        chain_id = %context.chain_id,
+        block_height = %context.height,
+        origin = %context.origin,
+        is_bouncing = %context.is_bouncing,
+        message_type = %message.as_ref(),
+    ))]
+    /// Executes an incoming message, dispatching to the system or to a user application.
     pub async fn execute_message(
         &mut self,
         context: MessageContext,
@@ -932,6 +1212,7 @@ where
         Ok(())
     }
 
+    /// Bounces a message back to its sender, returning any attached grant.
     pub fn bounce_message(
         &mut self,
         context: MessageContext,
@@ -950,6 +1231,7 @@ where
         Ok(())
     }
 
+    /// Sends a refund of the given amount to the account designated to receive grant refunds.
     pub fn send_refund(
         &mut self,
         context: MessageContext,
@@ -1012,7 +1294,9 @@ where
             }
         }
 
-        let mut body = Vec::with_capacity(maybe_content_length.unwrap_or(0) as usize);
+        let mut body = Vec::with_capacity(
+            usize::try_from(maybe_content_length.unwrap_or(0)).unwrap_or(usize::MAX),
+        );
         let mut body_stream = response.bytes_stream();
 
         while let Some(bytes) = body_stream.next().await.transpose()? {
@@ -1035,7 +1319,8 @@ where
 }
 
 /// Requests to the execution state.
-#[derive(Debug)]
+#[derive(Debug, strum::AsRefStr)]
+#[allow(missing_docs)]
 pub enum ExecutionRequest {
     #[cfg(not(web))]
     LoadContract {
@@ -1072,6 +1357,18 @@ pub enum ExecutionRequest {
         callback: Sender<Vec<AccountOwner>>,
     },
 
+    Allowance {
+        owner: AccountOwner,
+        spender: AccountOwner,
+        #[debug(skip)]
+        callback: Sender<Amount>,
+    },
+
+    Allowances {
+        #[debug(skip)]
+        callback: Sender<Vec<(AccountOwner, AccountOwner, Amount)>>,
+    },
+
     Transfer {
         source: AccountOwner,
         destination: Account,
@@ -1094,6 +1391,29 @@ pub enum ExecutionRequest {
         callback: Sender<()>,
     },
 
+    Approve {
+        owner: AccountOwner,
+        spender: AccountOwner,
+        amount: Amount,
+        #[debug(skip_if = Option::is_none)]
+        signer: Option<AccountOwner>,
+        application_id: ApplicationId,
+        #[debug(skip)]
+        callback: Sender<()>,
+    },
+
+    TransferFrom {
+        owner: AccountOwner,
+        spender: AccountOwner,
+        destination: Account,
+        amount: Amount,
+        #[debug(skip_if = Option::is_none)]
+        signer: Option<AccountOwner>,
+        application_id: ApplicationId,
+        #[debug(skip)]
+        callback: Sender<()>,
+    },
+
     SystemTimestamp {
         #[debug(skip)]
         callback: Sender<Timestamp>,
@@ -1102,6 +1422,17 @@ pub enum ExecutionRequest {
     ChainOwnership {
         #[debug(skip)]
         callback: Sender<ChainOwnership>,
+    },
+
+    ApplicationPermissions {
+        #[debug(skip)]
+        callback: Sender<ApplicationPermissions>,
+    },
+
+    ReadApplicationDescription {
+        application_id: ApplicationId,
+        #[debug(skip)]
+        callback: Sender<ApplicationDescription>,
     },
 
     ReadValueBytes {
@@ -1158,12 +1489,9 @@ pub enum ExecutionRequest {
     },
 
     OpenChain {
-        ownership: ChainOwnership,
-        #[debug(skip_if = Amount::is_zero)]
-        balance: Amount,
+        config: Box<OpenChainConfig>,
         parent_id: ChainId,
         block_height: BlockHeight,
-        application_permissions: ApplicationPermissions,
         timestamp: Timestamp,
         #[debug(skip)]
         callback: Sender<ChainId>,
@@ -1171,6 +1499,13 @@ pub enum ExecutionRequest {
 
     CloseChain {
         application_id: ApplicationId,
+        #[debug(skip)]
+        callback: Sender<Result<(), ExecutionError>>,
+    },
+
+    ChangeOwnership {
+        application_id: ApplicationId,
+        ownership: ChainOwnership,
         #[debug(skip)]
         callback: Sender<Result<(), ExecutionError>>,
     },
@@ -1289,9 +1624,21 @@ pub enum ExecutionRequest {
         callback: Sender<Option<u32>>,
     },
 
-    TotalStorageSize {
+    HasEmptyStorage {
         application: ApplicationId,
         #[debug(skip)]
-        callback: Sender<(u32, u32)>,
+        callback: Sender<bool>,
+    },
+
+    AllowApplicationLogs {
+        #[debug(skip)]
+        callback: Sender<bool>,
+    },
+
+    /// Log message from contract execution (fire-and-forget, no callback needed).
+    #[cfg(web)]
+    Log {
+        message: String,
+        level: tracing::log::Level,
     },
 }

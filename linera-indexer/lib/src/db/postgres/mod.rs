@@ -3,6 +3,15 @@
 
 //! PostgreSQL database module for storing blocks and blobs.
 
+// PostgreSQL has no native unsigned integer types, so this module routinely
+// casts `u64`/`usize` to `i64`/`i32` when binding parameters. The casts are
+// by design at the SQL boundary.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+
 mod consts;
 #[cfg(test)]
 mod tests;
@@ -53,7 +62,7 @@ pub struct PostgresDatabase {
 }
 
 impl PostgresDatabase {
-    /// Create a new PostgreSQL database connection
+    /// Creates a new PostgreSQL database connection.
     pub async fn new(database_url: &str) -> Result<Self, PostgresError> {
         tracing::info!(?database_url, "connecting to PostgreSQL database");
 
@@ -103,12 +112,12 @@ impl PostgresDatabase {
         Ok(self.pool.begin().await?)
     }
 
-    /// Commit a transaction
+    /// Commits a transaction.
     async fn commit_transaction(&self, tx: Transaction<'_, Postgres>) -> Result<(), PostgresError> {
         tx.commit().await.map_err(PostgresError::Database)
     }
 
-    /// Insert a blob within a transaction
+    /// Inserts a blob within a transaction.
     async fn insert_blob_tx(
         &self,
         tx: &mut Transaction<'_, Postgres>,
@@ -129,7 +138,7 @@ impl PostgresDatabase {
         Ok(())
     }
 
-    /// Insert a block within a transaction
+    /// Inserts a block within a transaction.
     async fn insert_block_tx(
         &self,
         tx: &mut Transaction<'_, Postgres>,
@@ -141,7 +150,7 @@ impl PostgresDatabase {
     ) -> Result<(), PostgresError> {
         // Deserialize the block to extract denormalized data
         let block: Block = bincode::deserialize(data).map_err(|e| {
-            PostgresError::Serialization(format!("Failed to deserialize block: {}", e))
+            PostgresError::Serialization(format!("Failed to deserialize block: {e}"))
         })?;
 
         // Count aggregated data
@@ -216,8 +225,8 @@ impl PostgresDatabase {
                         .insert_incoming_bundle_tx(tx, hash, index, bundle)
                         .await?;
 
-                    for message in &bundle.bundle.messages {
-                        self.insert_bundle_message_tx(tx, bundle_id, message)
+                    for (message_index, message) in bundle.bundle.messages.iter().enumerate() {
+                        self.insert_bundle_message_tx(tx, bundle_id, message_index, message)
                             .await?;
                     }
                 }
@@ -251,7 +260,7 @@ impl PostgresDatabase {
         Ok(())
     }
 
-    /// Insert an operation within a transaction
+    /// Inserts an operation within a transaction.
     async fn insert_operation_tx(
         &self,
         tx: &mut Transaction<'_, Postgres>,
@@ -278,10 +287,10 @@ impl PostgresDatabase {
                     SystemOperation::PublishDataBlob { .. } => "PublishDataBlob",
                     SystemOperation::Admin(_) => "Admin",
                     SystemOperation::ProcessNewEpoch(_) => "ProcessNewEpoch",
-                    SystemOperation::ProcessRemovedEpoch(_) => "ProcessRemovedEpoch",
-                    SystemOperation::UpdateStreams(_) => "UpdateStreams",
+                    SystemOperation::UpdateStream { .. } => "UpdateStream",
                     SystemOperation::ChangeOwnership { .. } => "ChangeOwnership",
                     SystemOperation::VerifyBlob { .. } => "VerifyBlob",
+                    SystemOperation::Checkpoint => "Checkpoint",
                 };
                 ("System", None, Some(sys_op_type))
             }
@@ -291,7 +300,7 @@ impl PostgresDatabase {
         };
 
         let data = bincode::serialize(operation).map_err(|e| {
-            PostgresError::Serialization(format!("Failed to serialize operation: {}", e))
+            PostgresError::Serialization(format!("Failed to serialize operation: {e}"))
         })?;
 
         sqlx::query(
@@ -314,7 +323,7 @@ impl PostgresDatabase {
         Ok(())
     }
 
-    /// Insert an outgoing message within a transaction
+    /// Inserts an outgoing message within a transaction.
     async fn insert_outgoing_message_tx(
         &self,
         tx: &mut Transaction<'_, Postgres>,
@@ -362,7 +371,7 @@ impl PostgresDatabase {
         Ok(())
     }
 
-    /// Insert an event within a transaction
+    /// Inserts an event within a transaction.
     async fn insert_event_tx(
         &self,
         tx: &mut Transaction<'_, Postgres>,
@@ -393,7 +402,7 @@ impl PostgresDatabase {
         Ok(())
     }
 
-    /// Insert an oracle response within a transaction
+    /// Inserts an oracle response within a transaction.
     async fn insert_oracle_response_tx(
         &self,
         tx: &mut Transaction<'_, Postgres>,
@@ -413,8 +422,7 @@ impl PostgresDatabase {
                 OracleResponse::Http(http_response) => {
                     let serialized = bincode::serialize(http_response).map_err(|e| {
                         PostgresError::Serialization(format!(
-                            "Failed to serialize HTTP response: {}",
-                            e
+                            "Failed to serialize HTTP response: {e}"
                         ))
                     })?;
                     ("Http", None, Some(serialized))
@@ -422,24 +430,40 @@ impl PostgresDatabase {
                 OracleResponse::Assert => ("Assert", None, None),
                 OracleResponse::Round(round) => {
                     let serialized = bincode::serialize(round).map_err(|e| {
-                        PostgresError::Serialization(format!("Failed to serialize round: {}", e))
+                        PostgresError::Serialization(format!("Failed to serialize round: {e}"))
                     })?;
                     ("Round", None, Some(serialized))
                 }
                 OracleResponse::Event(stream_id, index) => {
                     let serialized = bincode::serialize(&(stream_id, index)).map_err(|e| {
-                        PostgresError::Serialization(format!("Failed to serialize event: {}", e))
+                        PostgresError::Serialization(format!("Failed to serialize event: {e}"))
                     })?;
                     ("Event", None, Some(serialized))
                 }
                 OracleResponse::EventExists(event_exists) => {
                     let serialized = bincode::serialize(event_exists).map_err(|e| {
                         PostgresError::Serialization(format!(
-                            "Failed to serialize event exists: {}",
-                            e
+                            "Failed to serialize event exists: {e}"
                         ))
                     })?;
                     ("EventExists", None, Some(serialized))
+                }
+                OracleResponse::Checkpoint {
+                    execution_state_blobs,
+                    used_blobs,
+                    outbox_block_hashes,
+                    inbox_cursors,
+                } => {
+                    let serialized = bincode::serialize(&(
+                        execution_state_blobs,
+                        used_blobs,
+                        outbox_block_hashes,
+                        inbox_cursors,
+                    ))
+                    .map_err(|e| {
+                        PostgresError::Serialization(format!("Failed to serialize checkpoint: {e}"))
+                    })?;
+                    ("Checkpoint", None, Some(serialized))
                 }
             };
 
@@ -462,7 +486,7 @@ impl PostgresDatabase {
         Ok(())
     }
 
-    /// Insert an incoming bundle within a transaction and return the bundle ID
+    /// Inserts an incoming bundle within a transaction and returns the bundle ID.
     async fn insert_incoming_bundle_tx(
         &self,
         tx: &mut Transaction<'_, Postgres>,
@@ -500,11 +524,12 @@ impl PostgresDatabase {
         Ok(result.get("id"))
     }
 
-    /// Insert a posted message within a transaction
+    /// Inserts a posted message within a transaction.
     async fn insert_bundle_message_tx(
         &self,
         tx: &mut Transaction<'_, Postgres>,
         bundle_id: i64,
+        message_index: usize,
         message: &PostedMessage,
     ) -> Result<(), PostgresError> {
         let authenticated_owner_str = message.authenticated_owner.map(|s| s.to_string());
@@ -524,7 +549,7 @@ impl PostgresDatabase {
             "#
         )
         .bind(bundle_id)
-        .bind(message.index as i64)
+        .bind(message_index as i64)
         .bind(authenticated_owner_str)
         .bind(message.grant.to_string())
         .bind(refund_grant_to)
@@ -544,7 +569,7 @@ impl PostgresDatabase {
         Ok(())
     }
 
-    /// Get a block by hash
+    /// Gets a block by hash.
     pub async fn get_block(&self, hash: &CryptoHash) -> Result<Vec<u8>, PostgresError> {
         let hash_str = hash.to_string();
         let row = sqlx::query("SELECT data FROM blocks WHERE hash = $1")
@@ -558,7 +583,7 @@ impl PostgresDatabase {
         }
     }
 
-    /// Get a blob by blob_id
+    /// Gets a blob by blob ID.
     pub async fn get_blob(&self, blob_id: &BlobId) -> Result<Vec<u8>, PostgresError> {
         let blob_id_str = blob_id.hash.to_string();
         let row = sqlx::query("SELECT data FROM blobs WHERE hash = $1")
@@ -572,7 +597,7 @@ impl PostgresDatabase {
         }
     }
 
-    /// Get the latest block for a chain
+    /// Gets the latest block for a chain.
     pub async fn get_latest_block_for_chain(
         &self,
         chain_id: &ChainId,
@@ -599,7 +624,7 @@ impl PostgresDatabase {
         }
     }
 
-    /// Get blocks for a chain within a height range
+    /// Gets blocks for a chain within a height range.
     pub async fn get_blocks_for_chain_range(
         &self,
         chain_id: &ChainId,
@@ -629,7 +654,7 @@ impl PostgresDatabase {
         Ok(result)
     }
 
-    /// Check if a blob exists
+    /// Checks if a blob exists.
     pub async fn blob_exists(&self, blob_id: &BlobId) -> Result<bool, PostgresError> {
         let blob_id_str = blob_id.hash.to_string();
         let row = sqlx::query("SELECT 1 FROM blobs WHERE hash = $1 LIMIT 1")
@@ -639,7 +664,7 @@ impl PostgresDatabase {
         Ok(row.is_some())
     }
 
-    /// Check if a block exists
+    /// Checks if a block exists.
     pub async fn block_exists(&self, hash: &CryptoHash) -> Result<bool, PostgresError> {
         let hash_str = hash.to_string();
         let row = sqlx::query("SELECT 1 FROM blocks WHERE hash = $1 LIMIT 1")
@@ -649,7 +674,7 @@ impl PostgresDatabase {
         Ok(row.is_some())
     }
 
-    /// Get incoming bundles for a specific block
+    /// Gets incoming bundles for a specific block.
     pub async fn get_incoming_bundles_for_block(
         &self,
         block_hash: &CryptoHash,
@@ -695,7 +720,7 @@ impl PostgresDatabase {
         Ok(bundles)
     }
 
-    /// Get posted messages for a specific bundle
+    /// Gets posted messages for a specific bundle.
     pub async fn get_posted_messages_for_bundle(
         &self,
         bundle_id: i64,
@@ -728,7 +753,7 @@ impl PostgresDatabase {
         Ok(messages)
     }
 
-    /// Get all bundles from a specific origin chain
+    /// Gets all bundles from a specific origin chain.
     pub async fn get_bundles_from_origin_chain(
         &self,
         origin_chain_id: &ChainId,
@@ -778,7 +803,7 @@ impl PostgresDatabase {
         Ok(bundles)
     }
 
-    /// Get operations for a specific block
+    /// Gets operations for a specific block.
     pub async fn get_operations_for_block(
         &self,
         block_hash: &CryptoHash,
@@ -801,14 +826,14 @@ impl PostgresDatabase {
             let index = row.get::<i64, _>("operation_index") as usize;
             let data: Vec<u8> = row.get("data");
             let operation: Operation = bincode::deserialize(&data).map_err(|e| {
-                PostgresError::Serialization(format!("Failed to deserialize operation: {}", e))
+                PostgresError::Serialization(format!("Failed to deserialize operation: {e}"))
             })?;
             operations.push((index, operation));
         }
         Ok(operations)
     }
 
-    /// Get outgoing messages for a specific block
+    /// Gets outgoing messages for a specific block.
     pub async fn get_outgoing_messages_for_block(
         &self,
         block_hash: &CryptoHash,
@@ -855,7 +880,7 @@ impl PostgresDatabase {
         Ok(messages)
     }
 
-    /// Get events for a specific block
+    /// Gets events for a specific block.
     pub async fn get_events_for_block(
         &self,
         block_hash: &CryptoHash,
@@ -904,22 +929,22 @@ impl PostgresDatabase {
 
         if chain_id.is_some() {
             param_count += 1;
-            query.push_str(&format!(" AND chain_id = ${}", param_count));
+            query.push_str(&format!(" AND chain_id = ${param_count}"));
         }
 
         if epoch.is_some() {
             param_count += 1;
-            query.push_str(&format!(" AND epoch = ${}", param_count));
+            query.push_str(&format!(" AND epoch = ${param_count}"));
         }
 
         if min_operations.is_some() {
             param_count += 1;
-            query.push_str(&format!(" AND operation_count >= ${}", param_count));
+            query.push_str(&format!(" AND operation_count >= ${param_count}"));
         }
 
         if min_messages.is_some() {
             param_count += 1;
-            query.push_str(&format!(" AND message_count >= ${}", param_count));
+            query.push_str(&format!(" AND message_count >= ${param_count}"));
         }
 
         query.push_str(" ORDER BY height DESC");
@@ -954,7 +979,7 @@ impl PostgresDatabase {
         Ok(results)
     }
 
-    /// Get block summary (header fields without full data)
+    /// Gets block summary (header fields without full data).
     pub async fn get_block_summary(
         &self,
         hash: &CryptoHash,
@@ -1006,14 +1031,13 @@ impl PostgresDatabase {
 
     /// Serialize a Message with consistent error handling
     fn serialize_message(message: &Message) -> Result<Vec<u8>, PostgresError> {
-        bincode::serialize(message).map_err(|e| {
-            PostgresError::Serialization(format!("Failed to serialize message: {}", e))
-        })
+        bincode::serialize(message)
+            .map_err(|e| PostgresError::Serialization(format!("Failed to serialize message: {e}")))
     }
 
     fn deserialize_message(data: &[u8]) -> Result<Message, PostgresError> {
         bincode::deserialize(data).map_err(|e| {
-            PostgresError::Serialization(format!("Failed to deserialize message: {}", e))
+            PostgresError::Serialization(format!("Failed to deserialize message: {e}"))
         })
     }
 }

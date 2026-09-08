@@ -46,7 +46,6 @@ pub enum StoreInUse {
 }
 
 /// The trait for a (static) root key assignment.
-#[cfg_attr(not(web), trait_variant::make(Send + Sync))]
 pub trait DualStoreRootKeyAssignment {
     /// Obtains the store assigned to this root key.
     fn assigned_store(root_key: &[u8]) -> Result<StoreInUse, bcs::Error>;
@@ -88,13 +87,6 @@ where
     } else {
         S2::MAX_KEY_SIZE
     };
-
-    fn max_stream_queries(&self) -> usize {
-        match self {
-            Self::First(store) => store.max_stream_queries(),
-            Self::Second(store) => store.max_stream_queries(),
-        }
-    }
 
     fn root_key(&self) -> Result<Vec<u8>, Self::Error> {
         Ok(match self {
@@ -231,7 +223,7 @@ impl<D1, D2, A> KeyValueDatabase for DualDatabase<D1, D2, A>
 where
     D1: KeyValueDatabase,
     D2: KeyValueDatabase,
-    A: DualStoreRootKeyAssignment,
+    A: DualStoreRootKeyAssignment + linera_base::util::traits::AutoTraits,
 {
     type Config = DualStoreConfig<D1::Config, D2::Config>;
     type Store = DualStore<D1::Store, D2::Store>;
@@ -374,7 +366,7 @@ impl<D1, D2, A> TestKeyValueDatabase for DualDatabase<D1, D2, A>
 where
     D1: TestKeyValueDatabase,
     D2: TestKeyValueDatabase,
-    A: DualStoreRootKeyAssignment,
+    A: DualStoreRootKeyAssignment + linera_base::util::traits::AutoTraits,
 {
     async fn new_test_config() -> Result<Self::Config, Self::Error> {
         let first_config = D1::new_test_config().await.map_err(DualStoreError::First)?;
@@ -414,4 +406,12 @@ where
     E2: KeyValueStoreError,
 {
     const BACKEND: &'static str = "dual_store";
+
+    fn must_reload_view(&self) -> bool {
+        match self {
+            DualStoreError::First(e) => e.must_reload_view(),
+            DualStoreError::Second(e) => e.must_reload_view(),
+            _ => false,
+        }
+    }
 }

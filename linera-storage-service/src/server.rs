@@ -69,12 +69,12 @@ impl StorageServer {
             LocalStore::Memory(store) => store
                 .read_value_bytes(key)
                 .await
-                .map_err(|e| Status::unknown(format!("Memory error {:?} at read_value_bytes", e))),
+                .map_err(|e| Status::unknown(format!("Memory error {e:?} at read_value_bytes"))),
             #[cfg(with_rocksdb)]
             LocalStore::RocksDb(store) => store
                 .read_value_bytes(key)
                 .await
-                .map_err(|e| Status::unknown(format!("RocksDB error {:?} at read_value_bytes", e))),
+                .map_err(|e| Status::unknown(format!("RocksDB error {e:?} at read_value_bytes"))),
         }
     }
 
@@ -83,12 +83,12 @@ impl StorageServer {
             LocalStore::Memory(store) => store
                 .contains_key(key)
                 .await
-                .map_err(|e| Status::unknown(format!("Memory error {:?} at contains_key", e))),
+                .map_err(|e| Status::unknown(format!("Memory error {e:?} at contains_key"))),
             #[cfg(with_rocksdb)]
             LocalStore::RocksDb(store) => store
                 .contains_key(key)
                 .await
-                .map_err(|e| Status::unknown(format!("RocksDB error {:?} at contains_key", e))),
+                .map_err(|e| Status::unknown(format!("RocksDB error {e:?} at contains_key"))),
         }
     }
 
@@ -97,12 +97,12 @@ impl StorageServer {
             LocalStore::Memory(store) => store
                 .contains_keys(keys)
                 .await
-                .map_err(|e| Status::unknown(format!("Memory error {:?} at contains_keys", e))),
+                .map_err(|e| Status::unknown(format!("Memory error {e:?} at contains_keys"))),
             #[cfg(with_rocksdb)]
             LocalStore::RocksDb(store) => store
                 .contains_keys(keys)
                 .await
-                .map_err(|e| Status::unknown(format!("RocksDB error {:?} at contains_keys", e))),
+                .map_err(|e| Status::unknown(format!("RocksDB error {e:?} at contains_keys"))),
         }
     }
 
@@ -112,24 +112,25 @@ impl StorageServer {
     ) -> Result<Vec<Option<Vec<u8>>>, Status> {
         match &self.store {
             LocalStore::Memory(store) => store.read_multi_values_bytes(keys).await.map_err(|e| {
-                Status::unknown(format!("Memory error {:?} at read_multi_values_bytes", e))
+                Status::unknown(format!("Memory error {e:?} at read_multi_values_bytes"))
             }),
             #[cfg(with_rocksdb)]
             LocalStore::RocksDb(store) => store.read_multi_values_bytes(keys).await.map_err(|e| {
-                Status::unknown(format!("RocksDB error {:?} at read_multi_values_bytes", e))
+                Status::unknown(format!("RocksDB error {e:?} at read_multi_values_bytes"))
             }),
         }
     }
 
     pub async fn find_keys_by_prefix(&self, key_prefix: &[u8]) -> Result<Vec<Vec<u8>>, Status> {
         match &self.store {
-            LocalStore::Memory(store) => store.find_keys_by_prefix(key_prefix).await.map_err(|e| {
-                Status::unknown(format!("Memory error {:?} at find_keys_by_prefix", e))
-            }),
+            LocalStore::Memory(store) => store
+                .find_keys_by_prefix(key_prefix)
+                .await
+                .map_err(|e| Status::unknown(format!("Memory error {e:?} at find_keys_by_prefix"))),
             #[cfg(with_rocksdb)]
             LocalStore::RocksDb(store) => {
                 store.find_keys_by_prefix(key_prefix).await.map_err(|e| {
-                    Status::unknown(format!("RocksDB error {:?} at find_keys_by_prefix", e))
+                    Status::unknown(format!("RocksDB error {e:?} at find_keys_by_prefix"))
                 })
             }
         }
@@ -145,10 +146,7 @@ impl StorageServer {
                     .find_key_values_by_prefix(key_prefix)
                     .await
                     .map_err(|e| {
-                        Status::unknown(format!(
-                            "Memory error {:?} at find_key_values_by_prefix",
-                            e
-                        ))
+                        Status::unknown(format!("Memory error {e:?} at find_key_values_by_prefix"))
                     })
             }
             #[cfg(with_rocksdb)]
@@ -156,10 +154,7 @@ impl StorageServer {
                 .find_key_values_by_prefix(key_prefix)
                 .await
                 .map_err(|e| {
-                    Status::unknown(format!(
-                        "RocksDB error {:?} at find_key_values_by_prefix",
-                        e
-                    ))
+                    Status::unknown(format!("RocksDB error {e:?} at find_key_values_by_prefix"))
                 }),
         }
     }
@@ -169,12 +164,12 @@ impl StorageServer {
             LocalStore::Memory(store) => store
                 .write_batch(batch)
                 .await
-                .map_err(|e| Status::unknown(format!("Memory error {:?} at write_batch", e))),
+                .map_err(|e| Status::unknown(format!("Memory error {e:?} at write_batch"))),
             #[cfg(with_rocksdb)]
             LocalStore::RocksDb(store) => store
                 .write_batch(batch)
                 .await
-                .map_err(|e| Status::unknown(format!("RocksDB error {:?} at write_batch", e))),
+                .map_err(|e| Status::unknown(format!("RocksDB error {e:?} at write_batch"))),
         }
     }
 
@@ -238,7 +233,8 @@ impl StorageServer {
             .chunks(MAX_PAYLOAD_SIZE)
             .map(|x| x.to_vec())
             .collect::<Vec<_>>();
-        let num_chunks = chunks.len() as i32;
+        let num_chunks = i32::try_from(chunks.len())
+            .expect("number of chunks fits in i32 (each chunk is `MAX_PAYLOAD_SIZE` bytes)");
         let mut pending_big_reads = self.pending_big_reads.write().await;
         let message_index = pending_big_reads.index;
         pending_big_reads.index += 1;
@@ -266,9 +262,6 @@ enum StorageServerOptions {
         /// The storage service address.
         #[arg(long)]
         endpoint: String,
-        /// Preferred buffer size for async streams.
-        #[arg(long, default_value = "10")]
-        max_stream_queries: usize,
     },
 
     #[cfg(with_rocksdb)]
@@ -283,9 +276,6 @@ enum StorageServerOptions {
         /// Path to the rocksdb database.
         #[arg(long)]
         path: String,
-        /// Preferred buffer size for async streams.
-        #[arg(long, default_value = "10")]
-        max_stream_queries: usize,
         /// The maximum size of the cache, in bytes (keys size + value sizes)
         #[arg(long, default_value = "10000000")]
         max_cache_size: usize,
@@ -523,7 +513,8 @@ impl StorageService for StorageServer {
         let Some(entry) = pending_big_reads.big_reads.get_mut(&message_index) else {
             return Err(Status::not_found("process_specific_chunk"));
         };
-        let index = index as usize;
+        let index =
+            usize::try_from(index).map_err(|_| Status::invalid_argument("negative chunk index"))?;
         let chunk = entry.chunks[index].clone();
         entry.num_processed_chunks += 1;
         if entry.chunks.len() == entry.num_processed_chunks {
@@ -630,7 +621,7 @@ async fn main() {
                         _ => panic!("test-log: RUST_LOG_SPAN_EVENTS must contain filters separated by `,`.\n\t\
                                      For example: `active` or `new,close`\n\t\
                                      Supported filters: new, enter, exit, close, active, full\n\t\
-                                     Got: {}", value),
+                                     Got: {value}"),
                     })
                     .fold(FmtSpan::NONE, |acc, filter| filter | acc)
             }
@@ -648,10 +639,8 @@ async fn main() {
         StorageServerOptions::Memory {
             namespace,
             endpoint,
-            max_stream_queries,
         } => {
             let config = MemoryStoreConfig {
-                max_stream_queries,
                 kill_on_drop: false,
             };
             let database = MemoryDatabase::maybe_create_and_connect(&config, &namespace)
@@ -667,7 +656,6 @@ async fn main() {
             namespace,
             endpoint,
             path,
-            max_stream_queries,
             max_cache_size,
             max_value_entry_size,
             max_find_keys_entry_size,
@@ -683,7 +671,8 @@ async fn main() {
             let inner_config = RocksDbStoreInternalConfig {
                 spawn_mode,
                 path_with_guard,
-                max_stream_queries,
+                enable_statistics: false,
+                statistics_level: Default::default(),
             };
             let storage_cache_config = StorageCacheConfig {
                 max_cache_size,

@@ -3,8 +3,15 @@
 
 //! Tests for the `WitLoad` derive macro.
 
+// Width/sign casts at the WIT FFI boundary are by design.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_possible_wrap
+)]
+
 #[path = "common/types.rs"]
-mod types;
+pub mod types;
 
 use std::{fmt::Debug, iter, rc::Rc, sync::Arc};
 

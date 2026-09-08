@@ -19,7 +19,7 @@ use super::wit_import;
 /// interface.
 pub fn generate<'input, Functions>(
     wit_package: &LitStr,
-    wit_name: LitStr,
+    wit_name: &LitStr,
     functions: Functions,
 ) -> TokenStream
 where
@@ -202,7 +202,7 @@ impl<'input> From<&'_ wit_export::FunctionInformation<'input>> for FunctionInfor
             if is_unit_type(&actual_output) {
                 output = ReturnType::Default;
             } else {
-                *return_type = Box::new(actual_output);
+                **return_type = actual_output;
             }
         }
 

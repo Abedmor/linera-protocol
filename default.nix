@@ -8,6 +8,7 @@
   cargoExtraArgs = "-p linera-service";
   nativeBuildInputs = with pkgs; [
     clang
+    llvmPackages.bintools
     pkg-config
     rocksdb
     protobufc
@@ -19,8 +20,10 @@
     openssl
     protobuf
     git
-    wasm-bindgen-cli
+    wasm-bindgen-cli_0_2_100
+    symbolicator
     pnpm
+    rust-jemalloc-sys
   ];
   checkInputs = with pkgs; [
     jq

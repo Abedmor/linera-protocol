@@ -31,9 +31,11 @@ jobs:
     outputs:
       should-run: ${{ steps.files-changed.outputs.paths }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 0
       - name: Filter paths
-        uses: dorny/paths-filter@v3
+        uses: dorny/paths-filter@v4.0.1
         id: files-changed
         with:
           predicate-quantifier: 'every'
@@ -43,6 +45,18 @@ jobs:
               - '!kubernetes/**'
               - '!CONTRIBUTING.md'
               - '!INSTALL.md'
+              # Workflow-only PRs don't need heavy code tests; merge to main
+              # validates the workflow itself by running it for real.
+              - '!.github/workflows/**'
+              # Specification-only changes: doc comments on marker traits with no
+              # members, implementors or call sites. rust.yml still runs clippy,
+              # cargo doc and cargo fmt on them, which is all that can fail.
+              - '!linera-spec/**'
+              - '!linera-chain/src/proof/**'
+              - '!linera-chain/src/manager/proof/**'
+              - '!linera-chain/src/data_types/proof/**'
+              - '!linera-chain/src/justification/proof.rs'
+              - '!linera-core/src/proof/**'
 
   test:
     needs: changed-files
@@ -51,7 +65,7 @@ jobs:
     timeout-minutes: 10
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6.0.2
     - uses: actions/setup-node@v4
     - uses: actions-rust-lang/setup-rust-toolchain@v1
     - name: Check toolchain symlinks

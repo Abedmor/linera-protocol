@@ -7,9 +7,10 @@ mod state;
 
 use std::sync::Arc;
 
-use async_graphql::{EmptySubscription, InputObject, Object, Request, Response, Schema};
+use async_graphql::{EmptySubscription, Object, Request, Response, Schema};
 use linera_sdk::{
-    linera_base_types::{Timestamp, WithServiceAbi},
+    linera_base_types::{ChainId, Timestamp, WithServiceAbi},
+    task_processor::{ProcessorActions, Task, TaskOutcome},
     views::View,
     Service, ServiceRuntime,
 };
@@ -62,35 +63,6 @@ struct QueryRoot {
     runtime: Arc<ServiceRuntime<TaskProcessorService>>,
 }
 
-/// The actions requested by this application for off-chain processing.
-#[derive(Default, Debug, serde::Serialize, serde::Deserialize)]
-struct ProcessorActions {
-    /// Request a callback at the given timestamp.
-    request_callback: Option<Timestamp>,
-    /// Tasks to execute off-chain.
-    execute_tasks: Vec<Task>,
-}
-
-async_graphql::scalar!(ProcessorActions);
-
-/// A task to be executed by an off-chain operator.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct Task {
-    /// The name of the operator to execute.
-    operator: String,
-    /// The input to pass to the operator (JSON string).
-    input: String,
-}
-
-/// The outcome of executing an off-chain task.
-#[derive(Debug, InputObject, serde::Serialize, serde::Deserialize)]
-struct TaskOutcome {
-    /// The name of the operator that executed the task.
-    operator: String,
-    /// The output from the operator (JSON string).
-    output: String,
-}
-
 #[Object]
 impl QueryRoot {
     /// Returns the current task count.
@@ -98,12 +70,18 @@ impl QueryRoot {
         *self.state.task_count.get()
     }
 
+    /// Returns the stored results in order.
+    async fn results(&self) -> Vec<String> {
+        let count = self.state.results.count();
+        self.state
+            .results
+            .read_front(count)
+            .await
+            .unwrap_or_default()
+    }
+
     /// Returns the pending tasks and callback requests for the task processor.
-    async fn next_actions(
-        &self,
-        _last_requested_callback: Option<Timestamp>,
-        _now: Timestamp,
-    ) -> ProcessorActions {
+    async fn next_actions(&self, _cursor: Option<String>, _now: Timestamp) -> ProcessorActions {
         let mut actions = ProcessorActions::default();
 
         // Get all pending tasks from the queue.
@@ -111,6 +89,7 @@ impl QueryRoot {
         if let Ok(pending_tasks) = self.state.pending_tasks.read_front(count).await {
             for pending in pending_tasks {
                 actions.execute_tasks.push(Task {
+                    id: Some(pending.id.to_string()),
                     operator: pending.operator,
                     input: pending.input,
                 });
@@ -122,8 +101,14 @@ impl QueryRoot {
 
     /// Processes the outcome of a completed task and schedules operations.
     async fn process_task_outcome(&self, outcome: TaskOutcome) -> bool {
+        // The outcome is matched to its task by identity, so an outcome missing after a
+        // failure does not shift the ones that follow.
+        let Some(id) = outcome.id.and_then(|id| id.parse::<u64>().ok()) else {
+            return false;
+        };
         // Schedule an operation to store the result and remove the pending task.
         let operation = TaskProcessorOperation::StoreResult {
+            id,
             result: outcome.output,
         };
         self.runtime.schedule_operation(&operation);
@@ -140,6 +125,16 @@ impl MutationRoot {
     /// Requests a task to be processed by an off-chain operator.
     async fn request_task(&self, operator: String, input: String) -> [u8; 0] {
         let operation = TaskProcessorOperation::RequestTask { operator, input };
+        self.runtime.schedule_operation(&operation);
+        []
+    }
+
+    async fn request_task_on(&self, chain_id: ChainId, operator: String, input: String) -> [u8; 0] {
+        let operation = TaskProcessorOperation::RequestTaskOn {
+            chain_id,
+            operator,
+            input,
+        };
         self.runtime.schedule_operation(&operation);
         []
     }

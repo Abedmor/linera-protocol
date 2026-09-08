@@ -60,7 +60,7 @@ where
 {
     /// Start the gRPC indexer server
     pub async fn serve(self, port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let addr = format!("0.0.0.0:{}", port).parse()?;
+        let addr = format!("0.0.0.0:{port}").parse()?;
 
         info!("Starting gRPC indexer server on {}", addr);
 
@@ -167,10 +167,7 @@ where
                     bincode::serialize(&block_cert).map_err(ProcessingError::BlockSerialization)?;
 
                 // Convert pending blobs to the format expected by the high-level API
-                let blobs: Vec<(BlobId, Vec<u8>)> = pending_blobs
-                    .iter()
-                    .map(|(blob_id, blob_data)| (*blob_id, blob_data.clone()))
-                    .collect();
+                let blobs = pending_blobs.drain().collect::<Vec<_>>();
 
                 // Use the high-level atomic API - this manages all locking internally
                 database
@@ -190,7 +187,6 @@ where
                     block_hash,
                     pending_blobs.len()
                 );
-                pending_blobs.clear();
                 Ok(Some(()))
             }
             None => {
@@ -223,16 +219,14 @@ where
 impl From<SqliteError> for Status {
     fn from(error: SqliteError) -> Self {
         match error {
-            SqliteError::Database(e) => Status::internal(format!("Database error: {}", e)),
+            SqliteError::Database(e) => Status::internal(format!("Database error: {e}")),
             SqliteError::Serialization(e) => {
-                Status::invalid_argument(format!("Serialization error: {}", e))
+                Status::invalid_argument(format!("Serialization error: {e}"))
             }
             SqliteError::BlockNotFound(hash) => {
-                Status::not_found(format!("Block not found: {}", hash))
+                Status::not_found(format!("Block not found: {hash}"))
             }
-            SqliteError::BlobNotFound(hash) => {
-                Status::not_found(format!("Blob not found: {}", hash))
-            }
+            SqliteError::BlobNotFound(hash) => Status::not_found(format!("Blob not found: {hash}")),
         }
     }
 }
@@ -241,15 +235,15 @@ impl From<crate::db::postgres::PostgresError> for Status {
     fn from(error: crate::db::postgres::PostgresError) -> Self {
         use crate::db::postgres::PostgresError;
         match error {
-            PostgresError::Database(e) => Status::internal(format!("Database error: {}", e)),
+            PostgresError::Database(e) => Status::internal(format!("Database error: {e}")),
             PostgresError::Serialization(e) => {
-                Status::invalid_argument(format!("Serialization error: {}", e))
+                Status::invalid_argument(format!("Serialization error: {e}"))
             }
             PostgresError::BlockNotFound(hash) => {
-                Status::not_found(format!("Block not found: {}", hash))
+                Status::not_found(format!("Block not found: {hash}"))
             }
             PostgresError::BlobNotFound(hash) => {
-                Status::not_found(format!("Blob not found: {}", hash))
+                Status::not_found(format!("Blob not found: {hash}"))
             }
         }
     }
@@ -259,16 +253,16 @@ impl From<ProcessingError> for Status {
     fn from(error: ProcessingError) -> Self {
         match error {
             ProcessingError::BlobDeserialization(e) => {
-                Status::invalid_argument(format!("Invalid blob: {}", e))
+                Status::invalid_argument(format!("Invalid blob: {e}"))
             }
             ProcessingError::BlockDeserialization(e) => {
-                Status::invalid_argument(format!("Invalid block: {}", e))
+                Status::invalid_argument(format!("Invalid block: {e}"))
             }
             ProcessingError::BlobSerialization(e) => {
-                Status::internal(format!("Failed to serialize blob: {}", e))
+                Status::internal(format!("Failed to serialize blob: {e}"))
             }
             ProcessingError::BlockSerialization(e) => {
-                Status::internal(format!("Failed to serialize block: {}", e))
+                Status::internal(format!("Failed to serialize block: {e}"))
             }
             ProcessingError::DatabaseSqlite(e) => e.into(),
             ProcessingError::DatabasePostgres(e) => e.into(),

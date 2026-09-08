@@ -10,12 +10,11 @@ use std::{
 };
 
 use linera_base::{
-    abi::ServiceAbi,
-    data_types::{Amount, BlockHeight, Timestamp},
+    abi::{ContractAbi, ServiceAbi},
+    data_types::{Amount, ApplicationDescription, BlockHeight, Timestamp},
     hex, http,
     identifiers::{AccountOwner, ApplicationId, ChainId, DataBlobHash},
 };
-use serde::{de::DeserializeOwned, Serialize};
 
 use crate::{KeyValueStore, Service, ViewStorageContext};
 
@@ -27,6 +26,7 @@ where
     application_parameters: Mutex<Option<Application::Parameters>>,
     application_id: Mutex<Option<ApplicationId<Application::Abi>>>,
     application_creator_chain_id: Mutex<Option<ChainId>>,
+    application_descriptions: Mutex<HashMap<ApplicationId, ApplicationDescription>>,
     chain_id: Mutex<Option<ChainId>>,
     next_block_height: Mutex<Option<BlockHeight>>,
     timestamp: Mutex<Option<Timestamp>>,
@@ -58,6 +58,7 @@ where
             application_parameters: Mutex::new(None),
             application_id: Mutex::new(None),
             application_creator_chain_id: Mutex::new(None),
+            application_descriptions: Mutex::new(HashMap::new()),
             chain_id: Mutex::new(None),
             next_block_height: Mutex::new(None),
             timestamp: Mutex::new(None),
@@ -148,6 +149,50 @@ where
             "Application creator chain ID has not been mocked, \
             please call `MockServiceRuntime::set_application_creator_chain_id` first",
         )
+    }
+
+    /// Configures the application description to return for a specific application during the test.
+    pub fn with_application_description(
+        self,
+        application_id: ApplicationId,
+        description: ApplicationDescription,
+    ) -> Self {
+        self.application_descriptions
+            .lock()
+            .unwrap()
+            .insert(application_id, description);
+        self
+    }
+
+    /// Configures the application description to return for a specific application during the test.
+    pub fn set_application_description(
+        &self,
+        application_id: ApplicationId,
+        description: ApplicationDescription,
+    ) -> &Self {
+        self.application_descriptions
+            .lock()
+            .unwrap()
+            .insert(application_id, description);
+        self
+    }
+
+    /// Returns the description of the given application.
+    pub fn read_application_description(
+        &self,
+        application_id: ApplicationId,
+    ) -> ApplicationDescription {
+        self.application_descriptions
+            .lock()
+            .unwrap()
+            .get(&application_id)
+            .cloned()
+            .unwrap_or_else(|| {
+                panic!(
+                    "Application description for {application_id:?} has not been mocked, \
+                    please call `MockServiceRuntime::set_application_description` first"
+                )
+            })
     }
 
     /// Configures the chain ID to return during the test.
@@ -314,6 +359,16 @@ where
             .collect()
     }
 
+    /// Returns the allowance for a given owner-spender pair.
+    pub fn allowance(&self, _owner: AccountOwner, _spender: AccountOwner) -> Amount {
+        Amount::ZERO
+    }
+
+    /// Returns all allowances on this chain.
+    pub fn allowances(&self) -> Vec<(AccountOwner, AccountOwner, Amount)> {
+        Vec::new()
+    }
+
     /// Schedules an operation to be included in the block being built.
     ///
     /// The operation is specified as an opaque blob of bytes.
@@ -323,9 +378,10 @@ where
 
     /// Schedules an operation to be included in the block being built.
     ///
-    /// The operation is serialized using BCS.
-    pub fn schedule_operation(&self, operation: &impl Serialize) {
-        let bytes = bcs::to_bytes(operation).expect("Failed to serialize application operation");
+    /// The operation is serialized using the application ABI.
+    pub fn schedule_operation(&self, operation: &<Application::Abi as ContractAbi>::Operation) {
+        let bytes = <Application::Abi as ContractAbi>::serialize_operation(operation)
+            .expect("Failed to serialize application operation");
 
         self.schedule_raw_operation(bytes);
     }
@@ -345,21 +401,20 @@ where
     /// - the last call to [`Self::raw_scheduled_operations`];
     /// - or since the mock runtime was created.
     ///
-    /// All operations are deserialized using BCS into the `Operation` generic type.
-    pub fn scheduled_operations<Operation>(&self) -> Vec<Operation>
-    where
-        Operation: DeserializeOwned,
-    {
+    /// All operations are deserialized using the application ABI.
+    pub fn scheduled_operations(&self) -> Vec<<Application::Abi as ContractAbi>::Operation> {
         self.raw_scheduled_operations()
             .into_iter()
             .enumerate()
             .map(|(index, bytes)| {
-                bcs::from_bytes(&bytes).unwrap_or_else(|error| {
-                    panic!(
-                        "Failed to deserialize scheduled operation #{index} (0x{}): {error}",
-                        hex::encode(bytes)
-                    )
-                })
+                let hex_bytes = hex::encode(&bytes);
+                <Application::Abi as ContractAbi>::deserialize_operation(bytes).unwrap_or_else(
+                    |error| {
+                        panic!(
+                            "Failed to deserialize scheduled operation #{index} (0x{hex_bytes}): {error}"
+                        )
+                    },
+                )
             })
             .collect()
     }
@@ -418,10 +473,11 @@ where
     ///
     /// Cannot be used in fast blocks: A block using this call should be proposed by a regular
     /// owner, not a super owner.
+    #[expect(clippy::needless_pass_by_value)]
     pub fn http_request(&self, request: http::Request) -> http::Response {
         let maybe_request = self.expected_http_requests.lock().unwrap().pop_front();
         let (expected_request, response) = maybe_request.expect("Unexpected HTTP request");
-        assert_eq!(request, expected_request);
+        assert_eq!(&request, &expected_request);
         response
     }
 

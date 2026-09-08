@@ -7,6 +7,10 @@ edition = "2021"
 repository = "https://github.com/linera-io/linera-protocol/"
 license = "Apache-2.0"
 
+[package.metadata.cargo-machete]
+# Used through `#[serde(with = "serde_bytes")]`, which `cargo-machete` cannot see.
+ignored = ["serde_bytes"]
+
 [lints.clippy]
 pedantic = "warn"
 
@@ -16,15 +20,17 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 console_error_panic_hook.workspace = true
 futures.workspace = true
+hex.workspace = true
 js-sys.workspace = true
-log.workspace = true
-num-traits.workspace = true
 serde.workspace = true
 serde-wasm-bindgen.workspace = true
+serde_bytes.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tracing.workspace = true
 tracing-web.workspace = true
+tsify.workspace = true
 wasm-bindgen.workspace = true
 wasm-bindgen-futures.workspace = true
 
@@ -33,6 +39,10 @@ features = ["ansi", "fmt", "std"]
 workspace = true
 
 [dependencies.linera-base]
+features = ["web"]
+workspace = true
+
+[dependencies.linera-chain]
 features = ["web"]
 workspace = true
 
@@ -56,6 +66,9 @@ workspace = true
 features = ["web"]
 workspace = true
 
+[dependencies.linera-sdk]
+workspace = true
+
 [dependencies.linera-storage]
 features = ["web", "wasmer"]
 workspace = true
@@ -65,5 +78,12 @@ features = ["web", "indexeddb"]
 workspace = true
 
 [dependencies.web-sys]
-features = ["console", "Window"]
+features = [
+    "console",
+    "Lock",
+    "LockManager",
+    "LockOptions",
+    "Navigator",
+    "Window",
+]
 workspace = true

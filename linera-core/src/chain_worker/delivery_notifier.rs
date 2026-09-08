@@ -15,14 +15,12 @@ use std::{
 
 use linera_base::data_types::BlockHeight;
 use tokio::sync::oneshot;
-use tracing::warn;
+use tracing::debug;
 
 /// A set of pending listeners waiting to be notified about the delivery of messages sent
 /// from specific [`BlockHeight`]s.
 ///
 /// The notifier instance can be cheaply `clone`d and works as a shared reference.
-/// However, its methods still require `&mut self` to hint that it should only be changed by
-/// [`ChainWorkerGuard`](super::ChainWorkerGuard).
 #[derive(Clone, Default)]
 pub struct DeliveryNotifier {
     notifiers: Arc<Mutex<BTreeMap<BlockHeight, Vec<oneshot::Sender<()>>>>>,
@@ -30,7 +28,7 @@ pub struct DeliveryNotifier {
 
 impl DeliveryNotifier {
     /// Registers a delivery `notifier` for a desired [`BlockHeight`].
-    pub(super) fn register(&mut self, height: BlockHeight, notifier: oneshot::Sender<()>) {
+    pub(super) fn register(&self, height: BlockHeight, notifier: oneshot::Sender<()>) {
         let mut notifiers = self
             .notifiers
             .lock()
@@ -40,7 +38,7 @@ impl DeliveryNotifier {
     }
 
     /// Notifies that all messages up to `height` have been delivered.
-    pub(super) fn notify(&mut self, height: BlockHeight) {
+    pub(super) fn notify(&self, height: BlockHeight) {
         let relevant_notifiers = {
             let mut notifiers = self
                 .notifiers
@@ -59,7 +57,7 @@ impl DeliveryNotifier {
 
         for notifier in relevant_notifiers.into_values().flatten() {
             if let Err(()) = notifier.send(()) {
-                warn!("Failed to notify message delivery to caller");
+                debug!("Failed to notify message delivery to caller");
             }
         }
     }

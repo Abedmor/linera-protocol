@@ -20,11 +20,12 @@ test = ["linera-execution/test", "linera-views/test"]
 wasmer = ["linera-execution/wasmer"]
 wasmtime = ["linera-execution/wasmtime"]
 scylladb = ["linera-views/scylladb"]
-dynamodb = ["linera-views/dynamodb"]
+rocksdb = ["linera-views/rocksdb"]
 metrics = [
     "linera-base/metrics",
     "linera-chain/metrics",
     "linera-execution/metrics",
+    "linera-cache/metrics",
     "linera-views/metrics",
 ]
 web = [
@@ -35,12 +36,16 @@ web = [
 ]
 
 [dependencies]
+anyhow.workspace = true
 async-trait.workspace = true
 bcs.workspace = true
 cfg-if.workspace = true
+clap.workspace = true
 futures.workspace = true
+hex.workspace = true
 itertools.workspace = true
 linera-base.workspace = true
+linera-cache.workspace = true
 linera-chain.workspace = true
 linera-execution.workspace = true
 linera-views.workspace = true
@@ -48,10 +53,9 @@ papaya.workspace = true
 prometheus.workspace = true
 serde.workspace = true
 tracing.workspace = true
-web-thread.workspace = true
 
 [dev-dependencies]
-anyhow.workspace = true
+linera-chain = { workspace = true, features = ["test"] }
 linera-storage = { path = ".", default-features = false, features = ["test"] }
 test-case.workspace = true
 test-log = { workspace = true, features = ["trace"] }
@@ -59,3 +63,7 @@ tokio.workspace = true
 
 [build-dependencies]
 cfg_aliases.workspace = true
+
+[[bin]]
+name = "linera-storage-decode-key"
+path = "src/decode_key.rs"

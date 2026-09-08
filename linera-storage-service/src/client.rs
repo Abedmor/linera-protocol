@@ -49,8 +49,7 @@ const MAX_KEY_SIZE: usize = 1000000;
 // * Interior mutability is required for the client because
 // accessing requires mutability while the KeyValueStore
 // does not allow it.
-// * The semaphore and max_stream_queries work as other
-// stores.
+// * The semaphore works as other stores.
 //
 // The encoding of namespaces is done by taking their
 // serialization. This works because the set of serialization
@@ -64,19 +63,19 @@ const MAX_KEY_SIZE: usize = 1000000;
 // * A key with empty value is stored at
 //   [`KeyPrefix::RootKey`] + namespace + root_key
 //   to indicate the existence of a root key.
+/// A database handle connected to a remote storage service.
 #[derive(Clone)]
 pub struct StorageServiceDatabaseInternal {
     channel: Channel,
     semaphore: Option<Arc<Semaphore>>,
-    max_stream_queries: usize,
     namespace: Vec<u8>,
 }
 
+/// A store within a namespace and root key, backed by a remote storage service.
 #[derive(Clone)]
 pub struct StorageServiceStoreInternal {
     channel: Channel,
     semaphore: Option<Arc<Semaphore>>,
-    max_stream_queries: usize,
     prefix_len: usize,
     start_key: Vec<u8>,
     root_key_written: Arc<AtomicBool>,
@@ -92,10 +91,6 @@ impl WithError for StorageServiceStoreInternal {
 
 impl ReadableKeyValueStore for StorageServiceStoreInternal {
     const MAX_KEY_SIZE: usize = MAX_KEY_SIZE;
-
-    fn max_stream_queries(&self) -> usize {
-        self.max_stream_queries
-    }
 
     fn root_key(&self) -> Result<Vec<u8>, StorageServiceStoreError> {
         let root_key = bcs::from_bytes(&self.start_key[self.prefix_len..])?;
@@ -471,14 +466,12 @@ impl KeyValueDatabase for StorageServiceDatabaseInternal {
             .max_concurrent_queries
             .map(|n| Arc::new(Semaphore::new(n)));
         let namespace = bcs::to_bytes(namespace)?;
-        let max_stream_queries = config.max_stream_queries;
         let endpoint = config.http_address();
         let endpoint = Endpoint::from_shared(endpoint)?;
         let channel = endpoint.connect_lazy();
         Ok(Self {
             channel,
             semaphore,
-            max_stream_queries,
             namespace,
         })
     }
@@ -486,7 +479,6 @@ impl KeyValueDatabase for StorageServiceDatabaseInternal {
     fn open_shared(&self, root_key: &[u8]) -> Result<Self::Store, StorageServiceStoreError> {
         let channel = self.channel.clone();
         let semaphore = self.semaphore.clone();
-        let max_stream_queries = self.max_stream_queries;
         let mut start_key = vec![KeyPrefix::Key as u8];
         start_key.extend(&self.namespace);
         start_key.extend(bcs::to_bytes(root_key)?);
@@ -494,7 +486,6 @@ impl KeyValueDatabase for StorageServiceDatabaseInternal {
         Ok(StorageServiceStoreInternal {
             channel,
             semaphore,
-            max_stream_queries,
             prefix_len,
             start_key,
             root_key_written: Arc::new(AtomicBool::new(false)),
@@ -603,7 +594,6 @@ pub fn service_config_from_endpoint(
     Ok(StorageServiceStoreInternalConfig {
         endpoint: endpoint.to_string(),
         max_concurrent_queries: None,
-        max_stream_queries: 100,
     })
 }
 

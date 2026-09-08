@@ -1,18 +1,22 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::{collections::HashSet, fmt, iter, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashSet},
+    fmt,
+};
 
 use linera_base::{
-    data_types::{ApplicationPermissions, TimeDelta},
+    data_types::{ApplicationPermissions, BlanketMessagePolicy, MessagePolicy, TimeDelta},
     identifiers::{AccountOwner, ApplicationId, ChainId, GenericApplicationId},
-    ownership::{ChainOwnership, TimeoutConfig},
+    ownership::ChainOwnership,
     time::Duration,
 };
 use linera_core::{
     client::{
-        chain_client, BlanketMessagePolicy, MessagePolicy, DEFAULT_CERTIFICATE_DOWNLOAD_BATCH_SIZE,
-        DEFAULT_SENDER_CERTIFICATE_DOWNLOAD_BATCH_SIZE,
+        chain_client, DEFAULT_CERTIFICATE_DOWNLOAD_BATCH_SIZE,
+        DEFAULT_CERTIFICATE_UPLOAD_BATCH_SIZE, DEFAULT_MAX_CONCURRENT_BATCH_DOWNLOADS,
+        DEFAULT_MAX_EVENT_STREAM_QUERIES, DEFAULT_SENDER_CERTIFICATE_DOWNLOAD_BATCH_SIZE,
     },
     node::CrossChainMessageDelivery,
     DEFAULT_QUORUM_GRACE_PERIOD,
@@ -24,34 +28,24 @@ use crate::client_metrics::TimingConfig;
 use crate::util;
 
 #[derive(Debug, thiserror::Error)]
+#[allow(missing_docs)]
 pub enum Error {
     #[error("I/O error: {0}")]
     IoError(#[from] std::io::Error),
     #[error("there are {public_keys} public keys but {weights} weights")]
     MisalignedWeights { public_keys: usize, weights: usize },
     #[error("config error: {0}")]
-    Config(#[from] crate::config::Error),
+    Config(#[from] crate::config::GenesisConfigError),
 }
 
 util::impl_from_infallible!(Error);
 
-#[derive(Clone, clap::Parser)]
-pub struct ClientContextOptions {
-    /// Sets the file storing the private state of user chains (an empty one will be created if missing)
-    #[arg(long = "wallet")]
-    pub wallet_state_path: Option<PathBuf>,
-
-    /// Sets the file storing the keystore state.
-    #[arg(long = "keystore")]
-    pub keystore_path: Option<PathBuf>,
-
-    /// Given an ASCII alphanumeric parameter `X`, read the wallet state and the wallet
-    /// storage config from the environment variables `LINERA_WALLET_{X}` and
-    /// `LINERA_STORAGE_{X}` instead of `LINERA_WALLET` and
-    /// `LINERA_STORAGE`.
-    #[arg(long, short = 'w', value_parser = util::parse_ascii_alphanumeric_string)]
-    pub with_wallet: Option<String>,
-
+/// Command-line options controlling the behavior of the chain client.
+#[derive(Clone, clap::Parser, serde::Deserialize, tsify::Tsify)]
+#[tsify(from_wasm_abi)]
+#[group(skip)]
+#[serde(default, rename_all = "camelCase")]
+pub struct Options {
     /// Timeout for sending queries (milliseconds)
     #[arg(long = "send-timeout-ms", default_value = "4000", value_parser = util::parse_millis)]
     pub send_timeout: Duration,
@@ -61,20 +55,42 @@ pub struct ClientContextOptions {
     pub recv_timeout: Duration,
 
     /// The maximum number of incoming message bundles to include in a block proposal.
-    #[arg(long, default_value = "10")]
+    #[arg(long, default_value = "300")]
     pub max_pending_message_bundles: usize,
 
+    /// Maximum number of message bundles to discard from a block proposal due to block limit
+    /// errors before discarding all remaining bundles.
+    ///
+    /// Discarded bundles can be retried in the next block.
+    #[arg(long, default_value = "3")]
+    pub max_block_limit_errors: u32,
+
+    /// Time budget for staging message bundles in milliseconds. When set, limits bundle
+    /// execution by wall-clock time, in addition to the count limit from
+    /// `max_pending_message_bundles`.
+    #[arg(long = "staging-bundles-time-budget-ms", value_parser = util::parse_millis)]
+    pub staging_bundles_time_budget: Option<Duration>,
+
+    /// Comma-separated list of chain IDs whose incoming bundles should be processed first.
+    #[arg(long, value_parser = util::parse_chain_set)]
+    pub prioritize_bundles_from: Option<HashSet<ChainId>>,
+
+    /// Comma-separated list of chain IDs whose incoming bundles should be ignored.
+    #[arg(long, value_parser = util::parse_chain_set)]
+    pub ignore_bundles_from: Option<HashSet<ChainId>>,
+
     /// The duration in milliseconds after which an idle chain worker will free its memory.
+    /// Use 0 to disable expiry.
     #[arg(
         long = "chain-worker-ttl-ms",
         default_value = "30000",
         env = "LINERA_CHAIN_WORKER_TTL_MS",
-        value_parser = util::parse_millis
+        value_parser = util::parse_millis,
     )]
     pub chain_worker_ttl: Duration,
 
     /// The duration, in milliseconds, after which an idle sender chain worker will
-    /// free its memory.
+    /// free its memory. Use 0 to disable expiry.
     #[arg(
         long = "sender-chain-worker-ttl-ms",
         default_value = "1000",
@@ -82,6 +98,11 @@ pub struct ClientContextOptions {
         value_parser = util::parse_millis
     )]
     pub sender_chain_worker_ttl: Duration,
+
+    /// Maximum number of cross-chain requests coalesced into a single batch by the
+    /// per-chain driver. Bounds the worst-case write-lock hold time.
+    #[arg(long, default_value_t = 1000)]
+    pub cross_chain_batch_size_limit: usize,
 
     /// Delay increment for retrying to connect to a validator.
     #[arg(
@@ -95,30 +116,49 @@ pub struct ClientContextOptions {
     #[arg(long, default_value = "10")]
     pub max_retries: u32,
 
-    /// Enable OpenTelemetry Chrome JSON exporter for trace data analysis.
-    #[arg(long)]
-    pub chrome_trace_exporter: bool,
+    /// Maximum backoff delay for retrying to connect to a validator.
+    #[arg(
+        long = "max-backoff-ms",
+        default_value = "30000",
+        value_parser = util::parse_millis
+    )]
+    pub max_backoff: Duration,
 
-    /// Output file path for Chrome trace JSON format.
-    /// Can be visualized in chrome://tracing or Perfetto UI.
-    #[arg(long, env = "LINERA_CHROME_TRACE_FILE")]
-    pub chrome_trace_file: Option<String>,
+    /// Initial probe interval (ms) for the notification circuit breaker. When a validator's
+    /// notification stream exhausts retries, the circuit breaker waits this long before
+    /// probing again. Doubles on each failed probe.
+    #[arg(
+        long = "notification-circuit-breaker-initial-probe-interval-ms",
+        default_value = "300000",
+        value_parser = util::parse_millis
+    )]
+    pub notification_circuit_breaker_initial_probe_interval: Duration,
 
-    /// OpenTelemetry OTLP exporter endpoint (requires opentelemetry feature).
-    #[arg(long, env = "LINERA_OTLP_EXPORTER_ENDPOINT")]
-    pub otlp_exporter_endpoint: Option<String>,
+    /// Maximum probe interval (ms) for the notification circuit breaker. The probe interval
+    /// doubles on each failure but is capped at this value.
+    #[arg(
+        long = "notification-circuit-breaker-max-probe-interval-ms",
+        default_value = "3600000",
+        value_parser = util::parse_millis
+    )]
+    pub notification_circuit_breaker_max_probe_interval: Duration,
 
     /// Whether to wait until a quorum of validators has confirmed that all sent cross-chain
     /// messages have been delivered.
     #[arg(long)]
     pub wait_for_outgoing_messages: bool,
 
+    /// Whether to allow creating blocks in the fast round. Fast blocks have lower latency but
+    /// must be used carefully so that there are never any conflicting fast block proposals.
+    #[arg(long)]
+    pub allow_fast_blocks: bool,
+
     /// (EXPERIMENTAL) Whether application services can persist in some cases between queries.
     #[arg(long)]
     pub long_lived_services: bool,
 
     /// The policy for handling incoming messages.
-    #[arg(long, default_value = "accept")]
+    #[arg(long, default_value_t, value_enum)]
     pub blanket_message_policy: BlanketMessagePolicy,
 
     /// A set of chains to restrict incoming messages from. By default, messages
@@ -137,6 +177,20 @@ pub struct ClientContextOptions {
     #[arg(long, value_parser = util::parse_app_set)]
     pub reject_message_bundles_with_other_application_ids: Option<HashSet<GenericApplicationId>>,
 
+    /// A set of application IDs. If specified, only events coming from streams created by
+    /// applications from this set will be processed.
+    #[arg(long, value_parser = util::parse_app_set)]
+    pub process_events_from_application_ids: Option<HashSet<GenericApplicationId>>,
+
+    /// A set of application IDs whose messages must never be rejected. Bundles whose messages
+    /// are all from one of these applications bypass the other rejection rules (except
+    /// `--restrict-chain-ids-to`), and on execution failure they (and subsequent bundles from
+    /// the same sender) are removed from the block for later retry instead of being rejected,
+    /// with a warning logged. Bundles that contain any message from an application not on this
+    /// list can be rejected.
+    #[arg(long, value_parser = util::parse_app_set)]
+    pub never_reject_application_ids: Option<HashSet<GenericApplicationId>>,
+
     /// Enable timing reports during operations
     #[cfg(not(web))]
     #[arg(long)]
@@ -154,20 +208,20 @@ pub struct ClientContextOptions {
 
     /// The delay when downloading a blob, after which we try a second validator, in milliseconds.
     #[arg(
-        long = "blob-download-timeout-ms",
+        long = "blob-download-hedge-delay-ms",
         default_value = "1000",
-        value_parser = util::parse_millis
+        value_parser = util::parse_millis,
     )]
-    pub blob_download_timeout: Duration,
+    pub blob_download_hedge_delay: Duration,
 
     /// The delay when downloading a batch of certificates, after which we try a second validator,
     /// in milliseconds.
     #[arg(
-        long = "cert-batch-download-timeout-ms",
+        long = "cert-batch-download-hedge-delay-ms",
         default_value = "1000",
         value_parser = util::parse_millis
     )]
-    pub certificate_batch_download_timeout: Duration,
+    pub certificate_batch_download_hedge_delay: Duration,
 
     /// Maximum number of certificates that we download at a time from one validator when
     /// synchronizing one of our chains.
@@ -177,6 +231,14 @@ pub struct ClientContextOptions {
     )]
     pub certificate_download_batch_size: u64,
 
+    /// Maximum number of certificates read from local storage and uploaded to a validator
+    /// at a time when synchronizing a chain.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_CERTIFICATE_UPLOAD_BATCH_SIZE,
+    )]
+    pub certificate_upload_batch_size: usize,
+
     /// Maximum number of sender certificates we try to download and receive in one go
     /// when syncing sender chains.
     #[arg(
@@ -185,9 +247,18 @@ pub struct ClientContextOptions {
     )]
     pub sender_certificate_download_batch_size: usize,
 
+    /// Maximum number of certificate batches downloaded concurrently during chain sync.
+    #[arg(long, default_value_t = DEFAULT_MAX_CONCURRENT_BATCH_DOWNLOADS)]
+    pub max_concurrent_batch_downloads: usize,
+
     /// Maximum number of tasks that can are joined concurrently in the client.
     #[arg(long, default_value = "100")]
     pub max_joined_tasks: usize,
+
+    /// Maximum number of event stream IDs to include in a single `PreviousEventBlocks`
+    /// request. Larger sets are split into multiple requests.
+    #[arg(long, default_value_t = DEFAULT_MAX_EVENT_STREAM_QUERIES)]
+    pub max_event_stream_queries: usize,
 
     /// Maximum expected latency in milliseconds for score normalization.
     #[arg(
@@ -241,30 +312,71 @@ pub struct ClientContextOptions {
         env = "LINERA_REQUESTS_SCHEDULER_ALTERNATIVE_PEERS_RETRY_DELAY_MS"
     )]
     pub alternative_peers_retry_delay_ms: u64,
+
+    /// Configuration for the chain listener.
+    #[serde(flatten)]
+    #[clap(flatten)]
+    pub chain_listener_config: crate::chain_listener::ChainListenerConfig,
 }
 
-impl ClientContextOptions {
+impl Default for Options {
+    fn default() -> Self {
+        use clap::Parser;
+
+        #[derive(Parser)]
+        struct OptionsParser {
+            #[clap(flatten)]
+            options: Options,
+        }
+
+        OptionsParser::try_parse_from(std::iter::empty::<std::ffi::OsString>())
+            .expect("Options has no required arguments")
+            .options
+    }
+}
+
+impl Options {
     /// Creates [`chain_client::Options`] with the corresponding values.
     pub(crate) fn to_chain_client_options(&self) -> chain_client::Options {
-        let message_policy = MessagePolicy::new(
-            self.blanket_message_policy,
-            self.restrict_chain_ids_to.clone(),
-            self.reject_message_bundles_without_application_ids.clone(),
-            self.reject_message_bundles_with_other_application_ids
+        let message_policy = MessagePolicy {
+            blanket: self.blanket_message_policy,
+            restrict_chain_ids_to: self.restrict_chain_ids_to.clone(),
+            ignore_chain_ids: self.ignore_bundles_from.clone().unwrap_or_default(),
+            reject_message_bundles_without_application_ids: self
+                .reject_message_bundles_without_application_ids
                 .clone(),
-        );
+            reject_message_bundles_with_other_application_ids: self
+                .reject_message_bundles_with_other_application_ids
+                .clone(),
+            process_events_from_application_ids: self.process_events_from_application_ids.clone(),
+            never_reject_application_ids: self
+                .never_reject_application_ids
+                .clone()
+                .unwrap_or_default(),
+        };
         let cross_chain_message_delivery =
             CrossChainMessageDelivery::new(self.wait_for_outgoing_messages);
         chain_client::Options {
             max_pending_message_bundles: self.max_pending_message_bundles,
+            max_block_limit_errors: self.max_block_limit_errors,
+            staging_bundles_time_budget: self.staging_bundles_time_budget,
+            priority_bundle_origins: self.prioritize_bundles_from.clone().unwrap_or_default(),
             message_policy,
             cross_chain_message_delivery,
             quorum_grace_period: self.quorum_grace_period,
-            blob_download_timeout: self.blob_download_timeout,
-            certificate_batch_download_timeout: self.certificate_batch_download_timeout,
+            blob_download_hedge_delay: self.blob_download_hedge_delay,
+            certificate_batch_download_hedge_delay: self.certificate_batch_download_hedge_delay,
             certificate_download_batch_size: self.certificate_download_batch_size,
+            certificate_upload_batch_size: self.certificate_upload_batch_size,
             sender_certificate_download_batch_size: self.sender_certificate_download_batch_size,
+            max_concurrent_batch_downloads: self.max_concurrent_batch_downloads,
             max_joined_tasks: self.max_joined_tasks,
+            allow_fast_blocks: self.allow_fast_blocks,
+            notification_circuit_breaker_initial_probe_interval: self
+                .notification_circuit_breaker_initial_probe_interval,
+            notification_circuit_breaker_max_probe_interval: self
+                .notification_circuit_breaker_max_probe_interval,
+            max_event_stream_queries: self.max_event_stream_queries,
         }
     }
 
@@ -292,31 +404,34 @@ impl ClientContextOptions {
     }
 }
 
+/// Command-line options for configuring the ownership of a chain.
 #[derive(Debug, Clone, clap::Args)]
 pub struct ChainOwnershipConfig {
-    /// The new super owners.
-    #[arg(long, num_args(0..))]
-    pub super_owners: Vec<AccountOwner>,
+    /// A JSON list of the new super owners. Absence of the option leaves the current
+    /// set of super owners unchanged.
+    // NOTE (applies to all fields): we need the std::option:: and std::vec:: qualifiers in order
+    // to throw off the #[derive(Args)] macro's automatic inference of the type it should expect
+    // from the parser. Without it, it infers the inner type (so either ApplicationId or
+    // Vec<ApplicationId>), which is not what we want here - we want the parsers to return the full
+    // expected types.
+    #[arg(long, value_parser = util::parse_json::<Vec<AccountOwner>>)]
+    pub super_owners: Option<std::vec::Vec<AccountOwner>>,
 
-    /// The new regular owners.
-    #[arg(long, num_args(0..))]
-    pub owners: Vec<AccountOwner>,
+    /// A JSON map of the new owners to their weights. Absence of the option leaves the current
+    /// set of owners unchanged.
+    #[arg(long, value_parser = util::parse_json::<BTreeMap<AccountOwner, u64>>)]
+    pub owners: Option<BTreeMap<AccountOwner, u64>>,
 
-    /// The leader of the first single-leader round. If not set, this is random like other rounds.
-    #[arg(long)]
-    pub first_leader: Option<AccountOwner>,
-
-    /// Weights for the new owners.
-    ///
-    /// If they are specified there must be exactly one weight for each owner.
-    /// If no weights are given, every owner will have weight 100.
-    #[arg(long, num_args(0..))]
-    pub owner_weights: Vec<u64>,
+    /// The leader of the first single-leader round. If set to null, this is random like other
+    /// rounds. Absence of the option leaves the current setting unchanged.
+    #[arg(long, value_parser = util::parse_json::<Option<AccountOwner>>)]
+    pub first_leader: Option<std::option::Option<AccountOwner>>,
 
     /// The number of rounds in which every owner can propose blocks, i.e. the first round
-    /// number in which only a single designated leader is allowed to propose blocks.
-    #[arg(long)]
-    pub multi_leader_rounds: Option<u32>,
+    /// number in which only a single designated leader is allowed to propose blocks. "null" is
+    /// equivalent to 2^32 - 1. Absence of the option leaves the current setting unchanged.
+    #[arg(long, value_parser = util::parse_json::<Option<u32>>)]
+    pub multi_leader_rounds: Option<std::option::Option<u32>>,
 
     /// Whether the multi-leader rounds are unrestricted, i.e. not limited to chain owners.
     /// This should only be `true` on chains with restrictive application permissions and an
@@ -324,135 +439,170 @@ pub struct ChainOwnershipConfig {
     #[arg(long)]
     pub open_multi_leader_rounds: bool,
 
-    /// The duration of the fast round, in milliseconds.
-    #[arg(long = "fast-round-ms", value_parser = util::parse_millis_delta)]
-    pub fast_round_duration: Option<TimeDelta>,
+    /// The duration of the fast round, in milliseconds. "null" means the fast round will
+    /// not time out. Absence of the option leaves the current setting unchanged.
+    #[arg(long = "fast-round-ms", value_parser = util::parse_json_optional_millis_delta)]
+    pub fast_round_duration: Option<std::option::Option<TimeDelta>>,
 
-    /// The duration of the first single-leader and all multi-leader rounds.
+    /// The duration of the first single-leader and all multi-leader rounds. Absence of
+    /// the option leaves the current setting unchanged.
     #[arg(
         long = "base-timeout-ms",
-        default_value = "10000",
         value_parser = util::parse_millis_delta
     )]
-    pub base_timeout: TimeDelta,
+    pub base_timeout: Option<TimeDelta>,
 
     /// The number of milliseconds by which the timeout increases after each
-    /// single-leader round.
+    /// single-leader round. Absence of the option leaves the current setting unchanged.
     #[arg(
         long = "timeout-increment-ms",
-        default_value = "1000",
         value_parser = util::parse_millis_delta
     )]
-    pub timeout_increment: TimeDelta,
+    pub timeout_increment: Option<TimeDelta>,
 
     /// The age of an incoming tracked or protected message after which the validators start
-    /// transitioning the chain to fallback mode, in milliseconds.
+    /// transitioning the chain to fallback mode, in milliseconds. Absence of the option
+    /// leaves the current setting unchanged.
     #[arg(
         long = "fallback-duration-ms",
-        default_value = "86400000", // 1 day
         value_parser = util::parse_millis_delta
     )]
-    pub fallback_duration: TimeDelta,
+    pub fallback_duration: Option<TimeDelta>,
+}
+
+impl ChainOwnershipConfig {
+    /// Applies the configured ownership overrides to the given chain ownership.
+    pub fn update(self, chain_ownership: &mut ChainOwnership) -> Result<(), Error> {
+        let ChainOwnershipConfig {
+            super_owners,
+            owners,
+            first_leader,
+            multi_leader_rounds,
+            fast_round_duration,
+            open_multi_leader_rounds,
+            base_timeout,
+            timeout_increment,
+            fallback_duration,
+        } = self;
+
+        if let Some(owners) = owners {
+            chain_ownership.owners = owners;
+        }
+
+        if let Some(super_owners) = super_owners {
+            chain_ownership.super_owners = super_owners.into_iter().collect();
+        }
+
+        if let Some(first_leader) = first_leader {
+            chain_ownership.first_leader = first_leader;
+        }
+        if let Some(multi_leader_rounds) = multi_leader_rounds {
+            chain_ownership.multi_leader_rounds = multi_leader_rounds.unwrap_or(u32::MAX);
+        }
+
+        chain_ownership.open_multi_leader_rounds = open_multi_leader_rounds;
+
+        if let Some(fast_round_duration) = fast_round_duration {
+            chain_ownership.timeout_config.fast_round_duration = fast_round_duration;
+        }
+        if let Some(base_timeout) = base_timeout {
+            chain_ownership.timeout_config.base_timeout = base_timeout;
+        }
+        if let Some(timeout_increment) = timeout_increment {
+            chain_ownership.timeout_config.timeout_increment = timeout_increment;
+        }
+        if let Some(fallback_duration) = fallback_duration {
+            chain_ownership.timeout_config.fallback_duration = fallback_duration;
+        }
+
+        Ok(())
+    }
 }
 
 impl TryFrom<ChainOwnershipConfig> for ChainOwnership {
     type Error = Error;
 
     fn try_from(config: ChainOwnershipConfig) -> Result<ChainOwnership, Error> {
-        let ChainOwnershipConfig {
-            super_owners,
-            owners,
-            first_leader,
-            owner_weights,
-            multi_leader_rounds,
-            fast_round_duration,
-            open_multi_leader_rounds,
-            base_timeout,
-            timeout_increment,
-            fallback_duration,
-        } = config;
-        if !owner_weights.is_empty() && owner_weights.len() != owners.len() {
-            return Err(Error::MisalignedWeights {
-                public_keys: owners.len(),
-                weights: owner_weights.len(),
-            });
-        }
-        let super_owners = super_owners.into_iter().collect();
-        let owners = owners
-            .into_iter()
-            .zip(owner_weights.into_iter().chain(iter::repeat(100)))
-            .collect();
-        let multi_leader_rounds = multi_leader_rounds.unwrap_or(u32::MAX);
-        let timeout_config = TimeoutConfig {
-            fast_round_duration,
-            base_timeout,
-            timeout_increment,
-            fallback_duration,
-        };
-        Ok(ChainOwnership {
-            super_owners,
-            owners,
-            first_leader,
-            multi_leader_rounds,
-            open_multi_leader_rounds,
-            timeout_config,
-        })
+        let mut chain_ownership = ChainOwnership::default();
+        config.update(&mut chain_ownership)?;
+        Ok(chain_ownership)
     }
 }
 
+/// Command-line options for configuring application permissions on a chain.
 #[derive(Debug, Clone, clap::Args)]
 pub struct ApplicationPermissionsConfig {
-    /// If present, only operations from the specified applications are allowed, and
-    /// no system operations. Otherwise all operations are allowed.
-    #[arg(long)]
-    pub execute_operations: Option<Vec<ApplicationId>>,
-    /// At least one operation or incoming message from each of these applications must occur in
-    /// every block.
-    #[arg(long)]
-    pub mandatory_applications: Option<Vec<ApplicationId>>,
-    /// These applications are allowed to close the current chain using the system API.
-    #[arg(long)]
-    pub close_chain: Option<Vec<ApplicationId>>,
-    /// These applications are allowed to change the application permissions on the current chain
-    /// using the system API.
-    #[arg(long)]
-    pub change_application_permissions: Option<Vec<ApplicationId>>,
-    /// These applications are allowed to call services as oracles on the current chain using the
-    /// system API.
-    #[arg(long)]
-    pub call_service_as_oracle: Option<Vec<ApplicationId>>,
-    /// These applications are allowed to make HTTP requests on the current chain using the system
-    /// API.
-    #[arg(long)]
-    pub make_http_requests: Option<Vec<ApplicationId>>,
+    /// A JSON list of applications allowed to execute operations on this chain. If set to null, all
+    /// operations will be allowed. Otherwise, only operations from the specified applications are
+    /// allowed, and no system operations. Absence of the option leaves current permissions
+    /// unchanged.
+    // NOTE (applies to all fields): we need the std::option:: and std::vec:: qualifiers in order
+    // to throw off the #[derive(Args)] macro's automatic inference of the type it should expect
+    // from the parser. Without it, it infers the inner type (so either ApplicationId or
+    // Vec<ApplicationId>), which is not what we want here - we want the parsers to return the full
+    // expected types.
+    #[arg(long, value_parser = util::parse_json::<Option<Vec<ApplicationId>>>)]
+    pub execute_operations: Option<std::option::Option<Vec<ApplicationId>>>,
+    /// A JSON list of applications, such that at least one operation or incoming message from each
+    /// of these applications must occur in every block. Absence of the option leaves
+    /// current mandatory applications unchanged.
+    #[arg(long, value_parser = util::parse_json::<Vec<ApplicationId>>)]
+    pub mandatory_applications: Option<std::vec::Vec<ApplicationId>>,
+    /// A JSON list of applications allowed to manage the chain: close it, change application
+    /// permissions, and change ownership. Absence of the option leaves current managing
+    /// applications unchanged.
+    #[arg(long, value_parser = util::parse_json::<Vec<ApplicationId>>)]
+    pub manage_chain: Option<std::vec::Vec<ApplicationId>>,
+    /// A JSON list of applications that are allowed to call services as oracles on the current
+    /// chain using the system API. If set to null, all applications will be able to do
+    /// so. Absence of the option leaves the current value of the setting unchanged.
+    #[arg(long, value_parser = util::parse_json::<Option<Vec<ApplicationId>>>)]
+    pub call_service_as_oracle: Option<std::option::Option<Vec<ApplicationId>>>,
+    /// A JSON list of applications that are allowed to make HTTP requests on the current chain
+    /// using the system API. If set to null, all applications will be able to do so.
+    /// Absence of the option leaves the current value of the setting unchanged.
+    #[arg(long, value_parser = util::parse_json::<Option<Vec<ApplicationId>>>)]
+    pub make_http_requests: Option<std::option::Option<Vec<ApplicationId>>>,
 }
 
-impl From<ApplicationPermissionsConfig> for ApplicationPermissions {
-    fn from(config: ApplicationPermissionsConfig) -> ApplicationPermissions {
-        ApplicationPermissions {
-            execute_operations: config.execute_operations,
-            mandatory_applications: config.mandatory_applications.unwrap_or_default(),
-            close_chain: config.close_chain.unwrap_or_default(),
-            change_application_permissions: config
-                .change_application_permissions
-                .unwrap_or_default(),
-            call_service_as_oracle: config.call_service_as_oracle,
-            make_http_requests: config.make_http_requests,
+impl ApplicationPermissionsConfig {
+    /// Applies the configured permission overrides to the given application permissions.
+    pub fn update(self, application_permissions: &mut ApplicationPermissions) {
+        if let Some(execute_operations) = self.execute_operations {
+            application_permissions.execute_operations = execute_operations;
+        }
+        if let Some(mandatory_applications) = self.mandatory_applications {
+            application_permissions.mandatory_applications = mandatory_applications;
+        }
+        if let Some(manage_chain) = self.manage_chain {
+            application_permissions.manage_chain = manage_chain;
+        }
+        if let Some(call_service_as_oracle) = self.call_service_as_oracle {
+            application_permissions.call_service_as_oracle = call_service_as_oracle;
+        }
+        if let Some(make_http_requests) = self.make_http_requests {
+            application_permissions.make_http_requests = make_http_requests;
         }
     }
 }
 
+/// A named preset selecting which resource control policy the chain should use.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ResourceControlPolicyConfig {
+    /// Charges nothing for any resource, with no usage limits.
     NoFees,
+    /// Uses the fees and limits that match the public Testnet.
     Testnet,
+    /// Charges only for fuel, leaving all other resources free (for testing).
     #[cfg(with_testing)]
     OnlyFuel,
+    /// Charges a small non-zero amount in every fee category (for testing).
     #[cfg(with_testing)]
     AllCategories,
 }
 
 impl ResourceControlPolicyConfig {
+    /// Converts this config into the corresponding resource control policy.
     pub fn into_policy(self) -> ResourceControlPolicy {
         match self {
             ResourceControlPolicyConfig::NoFees => ResourceControlPolicy::no_fees(),
@@ -475,6 +625,6 @@ impl std::str::FromStr for ResourceControlPolicyConfig {
 
 impl fmt::Display for ResourceControlPolicyConfig {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{:?}", self)
+        write!(f, "{self:?}")
     }
 }

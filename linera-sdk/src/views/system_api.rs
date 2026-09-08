@@ -21,11 +21,10 @@ use crate::{
         contract_runtime_api::{self, WriteOperation},
     },
     service::wit::base_runtime_api as service_wit,
-    util::yield_once,
 };
 
 /// We need to have a maximum key size that handles all possible underlying
-/// sizes. The constraint so far is DynamoDB which has a key length of 1024.
+/// sizes. The tightest historical constraint was a key length of 1024.
 /// That key length is decreased by 4 due to the use of a value splitting.
 /// Then the [`KeyValueStore`] needs to handle some base key and so we
 /// reduce to 900. Depending on the size, the error can occur in `system_api`
@@ -107,10 +106,6 @@ impl ReadableKeyValueStore for KeyValueStore {
     // on the size of its values.
     const MAX_KEY_SIZE: usize = MAX_KEY_SIZE;
 
-    fn max_stream_queries(&self) -> usize {
-        1
-    }
-
     fn root_key(&self) -> Result<Vec<u8>, KeyValueStoreError> {
         Ok(Vec::new())
     }
@@ -121,7 +116,6 @@ impl ReadableKeyValueStore for KeyValueStore {
             KeyValueStoreError::KeyTooLong
         );
         let promise = self.wit_api.contains_key_new(key);
-        yield_once().await;
         Ok(self.wit_api.contains_key_wait(promise))
     }
 
@@ -133,7 +127,6 @@ impl ReadableKeyValueStore for KeyValueStore {
             );
         }
         let promise = self.wit_api.contains_keys_new(keys);
-        yield_once().await;
         Ok(self.wit_api.contains_keys_wait(promise))
     }
 
@@ -148,7 +141,6 @@ impl ReadableKeyValueStore for KeyValueStore {
             );
         }
         let promise = self.wit_api.read_multi_values_bytes_new(keys);
-        yield_once().await;
         Ok(self.wit_api.read_multi_values_bytes_wait(promise))
     }
 
@@ -158,7 +150,6 @@ impl ReadableKeyValueStore for KeyValueStore {
             KeyValueStoreError::KeyTooLong
         );
         let promise = self.wit_api.read_value_bytes_new(key);
-        yield_once().await;
         Ok(self.wit_api.read_value_bytes_wait(promise))
     }
 
@@ -171,7 +162,6 @@ impl ReadableKeyValueStore for KeyValueStore {
             KeyValueStoreError::KeyTooLong
         );
         let promise = self.wit_api.find_keys_new(key_prefix);
-        yield_once().await;
         Ok(self.wit_api.find_keys_wait(promise))
     }
 
@@ -184,7 +174,6 @@ impl ReadableKeyValueStore for KeyValueStore {
             KeyValueStoreError::KeyTooLong
         );
         let promise = self.wit_api.find_key_values_new(key_prefix);
-        yield_once().await;
         Ok(self.wit_api.find_key_values_wait(promise))
     }
 }

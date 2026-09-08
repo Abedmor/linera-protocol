@@ -5,9 +5,11 @@
 #![allow(unknown_lints)]
 
 use std::{
+    collections::HashSet,
     fmt::Debug,
     marker::PhantomData,
     net::SocketAddr,
+    str::FromStr as _,
     sync::Arc,
     task::{Context, Poll},
     time::Duration,
@@ -16,28 +18,38 @@ use std::{
 use anyhow::Result;
 use async_trait::async_trait;
 use futures::{future::BoxFuture, FutureExt as _};
-use linera_base::identifiers::ChainId;
-use linera_core::{
-    data_types::{CertificatesByHeightRequest, ChainInfo, ChainInfoQuery},
-    node::NodeError,
-    notifier::ChannelNotifier,
-    JoinSetExt as _,
+use linera_base::{
+    data_types::Epoch,
+    identifiers::{ChainId, StreamId},
 };
+use linera_core::{
+    data_types::CertificatesByHeightRequest, notifier::ChannelNotifier, JoinSetExt as _,
+};
+use linera_execution::system::EPOCH_STREAM_NAME;
 #[cfg(with_metrics)]
 use linera_metrics::monitoring_server;
+#[cfg(all(with_metrics, feature = "opentelemetry"))]
+use linera_rpc::propagation::get_traffic_type_from_request;
+#[cfg(feature = "opentelemetry")]
+use linera_rpc::propagation::OtelContextLayer;
 use linera_rpc::{
-    config::{ProxyConfig, ShardConfig, TlsConfig, ValidatorInternalNetworkConfig},
+    config::{
+        ProxyConfig, ShardConfig, TlsConfig, ValidatorInternalNetworkConfig,
+        ValidatorPublicNetworkConfig,
+    },
     grpc::{
         api::{
             self,
             notifier_service_server::{NotifierService, NotifierServiceServer},
+            validator_node_client::ValidatorNodeClient,
             validator_node_server::{ValidatorNode, ValidatorNodeServer},
+            validator_relay_server::{ValidatorRelay, ValidatorRelayServer},
             validator_worker_client::ValidatorWorkerClient,
             BlobContent, BlobId, BlobIds, BlockProposal, Certificate, CertificatesBatchRequest,
             CertificatesBatchResponse, ChainInfoResult, CryptoHash, HandlePendingBlobRequest,
-            LiteCertificate, NetworkDescription, Notification, PendingBlobRequest,
-            PendingBlobResult, RawCertificate, RawCertificatesBatch, SubscriptionRequest,
-            VersionInfo,
+            LiteCertificate, NetworkDescription, Notification, NotificationBatch,
+            PendingBlobRequest, PendingBlobResult, RawCertificate, RawCertificatesBatch,
+            SubscriptionRequest, VersionInfo,
         },
         pool::GrpcConnectionPool,
         GrpcProtoConversionError, GrpcProxyable, GRPC_CHUNKED_MESSAGE_FILL_LIMIT,
@@ -45,7 +57,7 @@ use linera_rpc::{
     },
 };
 use linera_sdk::{linera_base_types::Blob, views::ViewError};
-use linera_storage::{ResultReadCertificates, Storage};
+use linera_storage::{Arc as CacheArc, ResultReadCertificates, Storage};
 use prost::Message;
 use tokio::{select, task::JoinSet};
 use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -59,41 +71,60 @@ use tower::{builder::ServiceBuilder, Layer, Service};
 use tracing::{debug, info, instrument, Instrument as _, Level};
 
 #[cfg(with_metrics)]
-mod metrics {
-    use std::sync::LazyLock;
-
+pub(crate) mod metrics {
     use linera_base::prometheus_util::{
         linear_bucket_interval, register_histogram_vec, register_int_counter_vec,
     };
+    use linera_rpc::grpc::{ERROR_TYPE_LABEL, METHOD_NAME_LABEL, TRAFFIC_TYPE_LABEL};
     use prometheus::{HistogramVec, IntCounterVec};
 
-    pub static PROXY_REQUEST_LATENCY: LazyLock<HistogramVec> = LazyLock::new(|| {
-        register_histogram_vec(
-            "proxy_request_latency",
-            "Proxy request latency",
-            &[],
-            linear_bucket_interval(1.0, 50.0, 2000.0),
-        )
-    });
-    pub static PROXY_REQUEST_COUNT: LazyLock<IntCounterVec> = LazyLock::new(|| {
-        register_int_counter_vec("proxy_request_count", "Proxy request count", &[])
-    });
+    linera_base::declare_metrics! {
+        pub static PROXY_REQUEST_LATENCY: HistogramVec =
+            register_histogram_vec(
+                "proxy_request_latency",
+                "Proxy request latency",
+                &[METHOD_NAME_LABEL, TRAFFIC_TYPE_LABEL],
+                linear_bucket_interval(1.0, 50.0, 5000.0),
+            );
 
-    pub static PROXY_REQUEST_SUCCESS: LazyLock<IntCounterVec> = LazyLock::new(|| {
-        register_int_counter_vec(
-            "proxy_request_success",
-            "Proxy request success",
-            &["method_name"],
-        )
-    });
+        /// Requests this proxy has carried to another validator on behalf of one of its shards.
+        /// Shards have no internet route, so this is what shows the traffic goes through the relay.
+        pub static RELAYED_REQUEST_COUNT: IntCounterVec =
+            register_int_counter_vec(
+                "proxy_relayed_request_count",
+                "Requests forwarded to another validator on behalf of a shard",
+                &[METHOD_NAME_LABEL],
+            );
 
-    pub static PROXY_REQUEST_ERROR: LazyLock<IntCounterVec> = LazyLock::new(|| {
-        register_int_counter_vec(
-            "proxy_request_error",
-            "Proxy request error",
-            &["method_name"],
-        )
-    });
+        pub static PROXY_REQUEST_COUNT: IntCounterVec =
+            register_int_counter_vec(
+                "proxy_request_count",
+                "Proxy request count",
+                &[METHOD_NAME_LABEL, TRAFFIC_TYPE_LABEL],
+            );
+
+        pub static PROXY_REQUEST_SUCCESS: IntCounterVec =
+            register_int_counter_vec(
+                "proxy_request_success",
+                "Proxy request success",
+                &[METHOD_NAME_LABEL, TRAFFIC_TYPE_LABEL],
+            );
+
+        pub static PROXY_REQUEST_ERROR: IntCounterVec =
+            register_int_counter_vec(
+                "proxy_request_error",
+                "Proxy request error",
+                &[METHOD_NAME_LABEL, TRAFFIC_TYPE_LABEL, ERROR_TYPE_LABEL],
+            );
+    }
+}
+
+#[cfg(with_metrics)]
+fn grpc_status_name(status: Option<&str>) -> String {
+    match status {
+        Some(code) => format!("{:?}", tonic::Code::from_bytes(code.as_bytes())),
+        None => "HTTP_ERROR".to_owned(),
+    }
 }
 
 #[derive(Clone)]
@@ -112,10 +143,11 @@ impl<S> Layer<S> for PrometheusMetricsMiddlewareLayer {
     }
 }
 
-impl<S, Req> Service<Req> for PrometheusMetricsMiddlewareService<S>
+impl<S, B, ResponseBody> Service<http::Request<B>> for PrometheusMetricsMiddlewareService<S>
 where
+    S: Service<http::Request<B>, Response = http::Response<ResponseBody>> + Send,
     S::Future: Send + 'static,
-    S: Service<Req> + std::marker::Send,
+    B: Send + 'static,
 {
     type Response = S::Response;
     type Error = S::Error;
@@ -125,18 +157,58 @@ where
         self.service.poll_ready(cx)
     }
 
-    fn call(&mut self, request: Req) -> Self::Future {
+    fn call(&mut self, request: http::Request<B>) -> Self::Future {
         #[cfg(with_metrics)]
         let start = linera_base::time::Instant::now();
+
+        #[cfg(with_metrics)]
+        let method_name =
+            linera_rpc::grpc::extract_grpc_method_name(request.uri().path()).to_owned();
+
+        #[cfg(all(with_metrics, feature = "opentelemetry"))]
+        let traffic_type: &'static str = get_traffic_type_from_request(&request);
+        #[cfg(all(with_metrics, not(feature = "opentelemetry")))]
+        let traffic_type: &'static str = "unknown";
+
         let future = self.service.call(request);
         async move {
             let response = future.await?;
             #[cfg(with_metrics)]
             {
                 metrics::PROXY_REQUEST_LATENCY
-                    .with_label_values(&[])
+                    .with_label_values(&[&method_name, traffic_type])
                     .observe(start.elapsed().as_secs_f64() * 1000.0);
-                metrics::PROXY_REQUEST_COUNT.with_label_values(&[]).inc();
+                metrics::PROXY_REQUEST_COUNT
+                    .with_label_values(&[&method_name, traffic_type])
+                    .inc();
+
+                let grpc_status = response
+                    .headers()
+                    .get("grpc-status")
+                    .and_then(|v| v.to_str().ok());
+
+                // If tonic's router didn't recognize the method, it returns
+                // grpc-status 12 (UNIMPLEMENTED). Override the label to "unknown"
+                // so that crafted requests can't create unbounded cardinality.
+                let method_name = if grpc_status == Some("12") {
+                    "unknown".into()
+                } else {
+                    method_name
+                };
+
+                let is_error =
+                    !response.status().is_success() || grpc_status.is_some_and(|s| s != "0");
+
+                if is_error {
+                    let error_type = grpc_status_name(grpc_status);
+                    metrics::PROXY_REQUEST_ERROR
+                        .with_label_values(&[&method_name, traffic_type, &error_type])
+                        .inc();
+                } else {
+                    metrics::PROXY_REQUEST_SUCCESS
+                        .with_label_values(&[&method_name, traffic_type])
+                        .inc();
+                }
             }
             Ok(response)
         }
@@ -150,10 +222,27 @@ pub struct GrpcProxy<S>(Arc<GrpcProxyInner<S>>);
 struct GrpcProxyInner<S> {
     internal_config: ValidatorInternalNetworkConfig,
     worker_connection_pool: GrpcConnectionPool,
+    /// Connections to the other validators, used to carry requests on behalf of this validator's
+    /// shards, which have no route to the internet of their own. Pooled, so a peer costs one
+    /// connection for the whole process rather than one per shard.
+    peer_connection_pool: GrpcConnectionPool,
     notifier: ChannelNotifier<Result<Notification, Status>>,
     tls: TlsConfig,
     storage: S,
     id: usize,
+    /// The validator addresses this proxy will relay to, and the next epoch it has yet to learn.
+    /// Without this, anything able to reach the internal port could use the proxy to dial an
+    /// arbitrary host, defeating the point of keeping shards off the internet.
+    relay_destinations: Arc<tokio::sync::RwLock<RelayDestinations>>,
+}
+
+/// Committee members seen so far, and how far the epochs have been scanned.
+#[derive(Default)]
+struct RelayDestinations {
+    addresses: HashSet<String>,
+    next_epoch: u32,
+    /// Resolved from the network description once and cached.
+    admin_chain_id: Option<ChainId>,
 }
 
 impl<S> GrpcProxy<S>
@@ -173,10 +262,14 @@ where
             worker_connection_pool: GrpcConnectionPool::default()
                 .with_connect_timeout(connect_timeout)
                 .with_timeout(timeout),
+            peer_connection_pool: GrpcConnectionPool::default()
+                .with_connect_timeout(connect_timeout)
+                .with_timeout(timeout),
             notifier: ChannelNotifier::default(),
             tls,
             storage,
             id,
+            relay_destinations: Arc::default(),
         }))
     }
 
@@ -196,6 +289,142 @@ where
 
     fn as_notifier_service(&self) -> NotifierServiceServer<Self> {
         NotifierServiceServer::new(self.clone())
+    }
+
+    fn as_validator_relay(&self) -> ValidatorRelayServer<Self> {
+        ValidatorRelayServer::new(self.clone())
+            .max_encoding_message_size(GRPC_MAX_MESSAGE_SIZE)
+            .max_decoding_message_size(GRPC_MAX_MESSAGE_SIZE)
+    }
+
+    /// Whether this proxy will relay to `address`, i.e. whether it belongs to a validator in any
+    /// committee it can see. Epochs are scanned forward from the last scan, so a validator
+    /// admitted after startup is picked up on the first request naming it.
+    ///
+    /// `Err` means the scan itself failed and says nothing about the address, so the caller must
+    /// answer "try again", not "refused".
+    async fn is_relay_destination(&self, address: &str) -> Result<bool, anyhow::Error> {
+        let (known, start, admin_chain_id) = {
+            let destinations = self.0.relay_destinations.read().await;
+            (
+                destinations.addresses.contains(address),
+                destinations.next_epoch,
+                destinations.admin_chain_id,
+            )
+        };
+        if known {
+            return Ok(true);
+        }
+        let admin_chain_id = match admin_chain_id {
+            Some(admin_chain_id) => admin_chain_id,
+            None => match self.0.storage.read_network_description().await? {
+                Some(description) => description.admin_chain_id,
+                None => return Ok(false),
+            },
+        };
+
+        // The events are listed in one bulk read from the frontier, outside any lock — so holes
+        // in the admin history are simply absent from the list rather than wedging a probe, and
+        // termination is the end of the list, not a heuristic. A committee lists the full
+        // validator set, so an epoch that stays unloadable is covered by any later one.
+        let events = self
+            .0
+            .storage
+            .read_events_from_index(
+                &admin_chain_id,
+                &StreamId::system(EPOCH_STREAM_NAME),
+                start.max(1),
+            )
+            .await?;
+        let mut found = Vec::new();
+        let mut scanned_to = start;
+        if start == 0 {
+            // Epoch 0 comes from the genesis blob, not an event. The frontier only moves past it
+            // once it has actually loaded: on a network that has never changed epochs it is the
+            // only committee there is, so burning past it would refuse every validator forever.
+            if let Some(committee) = self.0.storage.committee_for_epoch(Epoch(0)).await? {
+                found.extend(
+                    committee
+                        .validator_addresses()
+                        .map(|(_, address)| address.to_owned()),
+                );
+                scanned_to = 1;
+            }
+        }
+        for event in events {
+            let loaded = match self
+                .0
+                .storage
+                .committee_for_epoch(Epoch(event.index))
+                .await?
+            {
+                Some(committee) => {
+                    found.extend(
+                        committee
+                            .validator_addresses()
+                            .map(|(_, address)| address.to_owned()),
+                    );
+                    true
+                }
+                None => false,
+            };
+            // The frontier moves past an epoch we could not load — any validator still in the
+            // committee reappears in a later one, so its members are not lost — except when it
+            // is the newest we know of: there is no later committee to carry them, so leave the
+            // frontier on it and pick it up when it becomes loadable.
+            scanned_to = if loaded {
+                scanned_to.max(event.index.saturating_add(1))
+            } else {
+                scanned_to.max(event.index)
+            };
+        }
+
+        let mut destinations = self.0.relay_destinations.write().await;
+        destinations.admin_chain_id = Some(admin_chain_id);
+        destinations.addresses.extend(found);
+        destinations.next_epoch = destinations.next_epoch.max(scanned_to);
+        Ok(destinations.addresses.contains(address))
+    }
+
+    /// Returns a client for the validator a relayed request names. Requests are forwarded as they
+    /// arrived, without decoding into Rust types: the proxy carries the shard's request.
+    async fn peer(
+        &self,
+        destination: &str,
+        #[cfg_attr(not(with_metrics), allow(unused_variables))] method: &str,
+    ) -> Result<ValidatorNodeClient<Channel>, Status> {
+        let network = ValidatorPublicNetworkConfig::from_str(destination).map_err(|_| {
+            Status::invalid_argument(format!("invalid destination validator: {destination}"))
+        })?;
+        match self.is_relay_destination(destination).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(Status::permission_denied(format!(
+                    "refusing to relay to {destination}: not a member of any known committee"
+                )));
+            }
+            // A scan failure says nothing about the destination; refusing here would disguise a
+            // storage problem as an authorization decision.
+            Err(error) => {
+                return Err(Status::unavailable(format!(
+                    "cannot verify the relay destination {destination} right now: {error}"
+                )));
+            }
+        }
+        // Counted only once the destination is accepted, so the metric measures relayed traffic
+        // rather than rejected attempts.
+        #[cfg(with_metrics)]
+        metrics::RELAYED_REQUEST_COUNT
+            .with_label_values(&[method])
+            .inc();
+        let channel = self
+            .0
+            .peer_connection_pool
+            .channel(network.http_address())
+            .map_err(|error| Status::unavailable(format!("cannot reach {destination}: {error}")))?;
+        Ok(ValidatorNodeClient::new(channel)
+            .max_encoding_message_size(GRPC_MAX_MESSAGE_SIZE)
+            .max_decoding_message_size(GRPC_MAX_MESSAGE_SIZE))
     }
 
     fn public_address(&self) -> SocketAddr {
@@ -244,12 +473,26 @@ where
         ),
         err,
     )]
-    pub async fn run(self, shutdown_signal: CancellationToken) -> Result<()> {
+    #[cfg_attr(not(with_metrics), allow(unused_variables))]
+    pub async fn run(
+        self,
+        shutdown_signal: CancellationToken,
+        enable_memory_profiling: bool,
+    ) -> Result<()> {
         info!("Starting proxy");
         let mut join_set = JoinSet::new();
 
         #[cfg(with_metrics)]
-        monitoring_server::start_metrics(self.metrics_address(), shutdown_signal.clone());
+        monitoring_server::start_metrics_with_profiling(
+            self.metrics_address(),
+            shutdown_signal.clone(),
+            enable_memory_profiling,
+            || {
+                linera_service::init_metrics();
+                metrics::init_metrics();
+            },
+        )
+        .await;
 
         let (health_reporter, health_service) = tonic_health::server::health_reporter();
         health_reporter
@@ -258,12 +501,25 @@ where
         let internal_server = join_set.spawn_task(
             Server::builder()
                 .add_service(self.as_notifier_service())
+                .add_service(self.as_validator_relay())
                 .serve(self.internal_address())
                 .in_current_span(),
         );
         let reflection_service = tonic_reflection::server::Builder::configure()
             .register_encoded_file_descriptor_set(linera_rpc::FILE_DESCRIPTOR_SET)
             .build_v1()?;
+        // Build the layer stack for the public server
+        #[cfg(feature = "opentelemetry")]
+        let layers = ServiceBuilder::new()
+            // Extract OpenTelemetry context from incoming requests (trace context + baggage)
+            .layer(OtelContextLayer)
+            .layer(PrometheusMetricsMiddlewareLayer)
+            .into_inner();
+        #[cfg(not(feature = "opentelemetry"))]
+        let layers = ServiceBuilder::new()
+            .layer(PrometheusMetricsMiddlewareLayer)
+            .into_inner();
+
         let public_server = join_set.spawn_task(
             self.public_server()?
                 .max_concurrent_streams(
@@ -272,11 +528,7 @@ where
                     // interpreted as "not set"
                     Some(u32::MAX - 1),
                 )
-                .layer(
-                    ServiceBuilder::new()
-                        .layer(PrometheusMetricsMiddlewareLayer)
-                        .into_inner(),
-                )
+                .layer(layers)
                 .layer(
                     // enable
                     // [CORS](https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CORS)
@@ -332,28 +584,20 @@ where
         Ok((client, inner))
     }
 
-    #[allow(clippy::result_large_err)]
-    fn log_and_return_proxy_request_outcome(
-        result: Result<Response<ChainInfoResult>, Status>,
-        method_name: &str,
-    ) -> Result<Response<ChainInfoResult>, Status> {
-        #![allow(unused_variables)]
-        match result {
-            Ok(chain_info_result) => {
-                #[cfg(with_metrics)]
-                metrics::PROXY_REQUEST_SUCCESS
-                    .with_label_values(&[method_name])
-                    .inc();
-                Ok(chain_info_result)
-            }
-            Err(status) => {
-                #[cfg(with_metrics)]
-                metrics::PROXY_REQUEST_ERROR
-                    .with_label_values(&[method_name])
-                    .inc();
-                Err(status)
-            }
-        }
+    /// Creates a tonic::Request with OpenTelemetry context injected for forwarding.
+    ///
+    /// Gets the context from the current tracing span (which has the parent set by
+    /// OtelContextLayer), ensuring downstream services (shards) create spans as
+    /// children of the proxy's span. This enables proper distributed tracing.
+    #[cfg(feature = "opentelemetry")]
+    fn create_forwarding_request<T>(inner: T) -> Request<T> {
+        linera_rpc::propagation::create_request_with_current_span_context(inner)
+    }
+
+    /// Creates a tonic::Request without OpenTelemetry context (feature disabled).
+    #[cfg(not(feature = "opentelemetry"))]
+    fn create_forwarding_request<T>(inner: T) -> Request<T> {
+        Request::new(inner)
     }
 
     /// Returns the appropriate gRPC status for the given [`ViewError`].
@@ -365,7 +609,9 @@ where
             | ViewError::TryLockError(_)
             | ViewError::InconsistentEntries
             | ViewError::PostLoadValuesError
+            | ViewError::HasPendingChanges
             | ViewError::IoError(_) => Status::internal(err.to_string()),
+            ViewError::MalformedContent(_) => Status::invalid_argument(err.to_string()),
             ViewError::KeyTooLong | ViewError::ArithmeticError(_) => {
                 Status::out_of_range(err.to_string())
             }
@@ -384,6 +630,8 @@ where
     S: Storage + Clone + Send + Sync + 'static,
 {
     type SubscribeStream = UnboundedReceiverStream<Result<Notification, Status>>;
+    type DownloadBlobsStream =
+        std::pin::Pin<Box<dyn futures::Stream<Item = Result<BlobContent, Status>> + Send>>;
 
     #[instrument(skip_all, err(Display), fields(method = "handle_block_proposal"))]
     async fn handle_block_proposal(
@@ -391,10 +639,9 @@ where
         request: Request<BlockProposal>,
     ) -> Result<Response<ChainInfoResult>, Status> {
         let (mut client, inner) = self.worker_client(request)?;
-        Self::log_and_return_proxy_request_outcome(
-            client.handle_block_proposal(inner).await,
-            "handle_block_proposal",
-        )
+        client
+            .handle_block_proposal(Self::create_forwarding_request(inner))
+            .await
     }
 
     #[instrument(skip_all, err(Display), fields(method = "handle_lite_certificate"))]
@@ -403,10 +650,9 @@ where
         request: Request<LiteCertificate>,
     ) -> Result<Response<ChainInfoResult>, Status> {
         let (mut client, inner) = self.worker_client(request)?;
-        Self::log_and_return_proxy_request_outcome(
-            client.handle_lite_certificate(inner).await,
-            "handle_lite_certificate",
-        )
+        client
+            .handle_lite_certificate(Self::create_forwarding_request(inner))
+            .await
     }
 
     #[instrument(
@@ -419,10 +665,9 @@ where
         request: Request<api::HandleConfirmedCertificateRequest>,
     ) -> Result<Response<ChainInfoResult>, Status> {
         let (mut client, inner) = self.worker_client(request)?;
-        Self::log_and_return_proxy_request_outcome(
-            client.handle_confirmed_certificate(inner).await,
-            "handle_confirmed_certificate",
-        )
+        client
+            .handle_confirmed_certificate(Self::create_forwarding_request(inner))
+            .await
     }
 
     #[instrument(
@@ -435,10 +680,9 @@ where
         request: Request<api::HandleValidatedCertificateRequest>,
     ) -> Result<Response<ChainInfoResult>, Status> {
         let (mut client, inner) = self.worker_client(request)?;
-        Self::log_and_return_proxy_request_outcome(
-            client.handle_validated_certificate(inner).await,
-            "handle_validated_certificate",
-        )
+        client
+            .handle_validated_certificate(Self::create_forwarding_request(inner))
+            .await
     }
 
     #[instrument(skip_all, err(Display), fields(method = "handle_timeout_certificate"))]
@@ -447,10 +691,9 @@ where
         request: Request<api::HandleTimeoutCertificateRequest>,
     ) -> Result<Response<ChainInfoResult>, Status> {
         let (mut client, inner) = self.worker_client(request)?;
-        Self::log_and_return_proxy_request_outcome(
-            client.handle_timeout_certificate(inner).await,
-            "handle_timeout_certificate",
-        )
+        client
+            .handle_timeout_certificate(Self::create_forwarding_request(inner))
+            .await
     }
 
     #[instrument(skip_all, err(Display), fields(method = "handle_chain_info_query"))]
@@ -459,10 +702,9 @@ where
         request: Request<api::ChainInfoQuery>,
     ) -> Result<Response<ChainInfoResult>, Status> {
         let (mut client, inner) = self.worker_client(request)?;
-        Self::log_and_return_proxy_request_outcome(
-            client.handle_chain_info_query(inner).await,
-            "handle_chain_info_query",
-        )
+        client
+            .handle_chain_info_query(Self::create_forwarding_request(inner))
+            .await
     }
 
     #[instrument(skip_all, err(Display), fields(method = "subscribe"))]
@@ -551,8 +793,32 @@ where
             .read_blob(blob_id)
             .await
             .map_err(Self::view_error_to_status)?;
-        let blob = blob.ok_or_else(|| Status::not_found(format!("Blob not found {}", blob_id)))?;
+        let blob = blob
+            .map(CacheArc::unwrap_or_clone)
+            .ok_or_else(|| Status::not_found(format!("Blob not found {blob_id}")))?;
         Ok(Response::new(blob.into_content().try_into()?))
+    }
+
+    #[instrument(skip_all, err(Display), fields(method = "download_blobs"))]
+    async fn download_blobs(
+        &self,
+        request: Request<BlobIds>,
+    ) -> Result<Response<Self::DownloadBlobsStream>, Status> {
+        let blob_ids = Vec::<linera_base::identifiers::BlobId>::try_from(request.into_inner())?;
+        let blobs = self
+            .0
+            .storage
+            .read_blobs(&blob_ids)
+            .await
+            .map_err(Self::view_error_to_status)?;
+        let stream = futures::stream::iter(blobs.into_iter().filter_map(|maybe_blob| {
+            let blob = maybe_blob?;
+            Some(
+                BlobContent::try_from(blob.content().clone())
+                    .map_err(|err| Status::internal(err.to_string())),
+            )
+        }));
+        Ok(Response::new(Box::pin(stream)))
     }
 
     #[instrument(skip_all, err(Display), fields(method = "download_pending_blob"))]
@@ -561,23 +827,7 @@ where
         request: Request<PendingBlobRequest>,
     ) -> Result<Response<PendingBlobResult>, Status> {
         let (mut client, inner) = self.worker_client(request)?;
-        #[cfg_attr(not(with_metrics), expect(clippy::needless_match))]
-        match client.download_pending_blob(inner).await {
-            Ok(blob_result) => {
-                #[cfg(with_metrics)]
-                metrics::PROXY_REQUEST_SUCCESS
-                    .with_label_values(&["download_pending_blob"])
-                    .inc();
-                Ok(blob_result)
-            }
-            Err(status) => {
-                #[cfg(with_metrics)]
-                metrics::PROXY_REQUEST_ERROR
-                    .with_label_values(&["download_pending_blob"])
-                    .inc();
-                Err(status)
-            }
-        }
+        client.download_pending_blob(inner).await
     }
 
     #[instrument(skip_all, err(Display), fields(method = "handle_pending_blob"))]
@@ -586,23 +836,7 @@ where
         request: Request<HandlePendingBlobRequest>,
     ) -> Result<Response<ChainInfoResult>, Status> {
         let (mut client, inner) = self.worker_client(request)?;
-        #[cfg_attr(not(with_metrics), expect(clippy::needless_match))]
-        match client.handle_pending_blob(inner).await {
-            Ok(blob_result) => {
-                #[cfg(with_metrics)]
-                metrics::PROXY_REQUEST_SUCCESS
-                    .with_label_values(&["handle_pending_blob"])
-                    .inc();
-                Ok(blob_result)
-            }
-            Err(status) => {
-                #[cfg(with_metrics)]
-                metrics::PROXY_REQUEST_ERROR
-                    .with_label_values(&["handle_pending_blob"])
-                    .inc();
-                Err(status)
-            }
-        }
+        client.handle_pending_blob(inner).await
     }
 
     #[instrument(skip_all, err(Display), fields(method = "download_certificate"))]
@@ -617,7 +851,9 @@ where
             .read_certificate(hash)
             .await
             .map_err(Self::view_error_to_status)?
-            .ok_or(Status::not_found(hash.to_string()))?
+            .ok_or_else(|| Status::not_found(hash.to_string()))?
+            .into_std()
+            .as_ref()
             .into();
         Ok(Response::new(certificate.try_into()?))
     }
@@ -634,8 +870,6 @@ where
             .map(linera_base::crypto::CryptoHash::try_from)
             .collect::<Result<Vec<linera_base::crypto::CryptoHash>, _>>()?;
 
-        // Use 70% of the max message size as a buffer capacity.
-        // Leave 30% as overhead.
         let mut grpc_message_limiter: GrpcMessageLimiter<linera_chain::types::Certificate> =
             GrpcMessageLimiter::new(GRPC_CHUNKED_MESSAGE_FILL_LIMIT);
 
@@ -645,13 +879,13 @@ where
             let certificates = self
                 .0
                 .storage
-                .read_certificates(batch.to_vec())
+                .read_certificates(batch)
                 .await
                 .map_err(Self::view_error_to_status)?;
             let certificates = match ResultReadCertificates::new(certificates, batch.to_vec()) {
                 ResultReadCertificates::Certificates(certificates) => certificates,
                 ResultReadCertificates::InvalidHashes(hashes) => {
-                    return Err(Status::not_found(format!("{:?}", hashes)))
+                    return Err(Status::not_found(format!("{hashes:?}")))
                 }
             };
             for certificate in certificates {
@@ -678,47 +912,31 @@ where
         request: Request<api::DownloadCertificatesByHeightsRequest>,
     ) -> Result<Response<CertificatesBatchResponse>, Status> {
         let original_request: CertificatesByHeightRequest = request.into_inner().try_into()?;
-        let chain_info_request = ChainInfoQuery::new(original_request.chain_id)
-            .with_sent_certificate_hashes_by_heights(original_request.heights);
+        let chain_id = original_request.chain_id;
+        let heights = original_request.heights;
 
-        // Use handle_chain_info_query to get the certificate hashes
-        let chain_info_response = self
-            .handle_chain_info_query(Request::new(chain_info_request.try_into()?))
-            .await?;
-
-        // Extract the ChainInfoResult from the response
-        let chain_info_result = chain_info_response.into_inner();
-
-        // Extract the certificate hashes from the ChainInfo
-        let hashes = match chain_info_result.inner {
-            Some(api::chain_info_result::Inner::ChainInfoResponse(response)) => {
-                let chain_info: ChainInfo =
-                    bincode::deserialize(&response.chain_info).map_err(|e| {
-                        Status::internal(format!("Failed to deserialize ChainInfo: {}", e))
-                    })?;
-                chain_info.requested_sent_certificate_hashes
-            }
-            Some(api::chain_info_result::Inner::Error(error)) => {
-                let error =
-                    bincode::deserialize(&error).unwrap_or_else(|err| NodeError::GrpcError {
-                        error: format!("failed to unmarshal error message: {}", err),
-                    });
-                return Err(Status::internal(format!(
-                    "Chain info query failed: {error}"
-                )));
-            }
-            None => {
-                return Err(Status::internal("Empty chain info result"));
-            }
-        };
-
-        // Use download_certificates to get the actual certificates
-        let certificates_request = CertificatesBatchRequest {
-            hashes: hashes.into_iter().map(|h| h.into()).collect(),
-        };
-
-        self.download_certificates(Request::new(certificates_request))
+        let certificates_by_height: Vec<_> = self
+            .0
+            .storage
+            .read_certificates_by_heights(chain_id, &heights)
             .await
+            .map_err(Self::view_error_to_status)?
+            .into_iter()
+            .flatten()
+            .collect();
+
+        let mut limiter: GrpcMessageLimiter<linera_chain::types::Certificate> =
+            GrpcMessageLimiter::new(GRPC_CHUNKED_MESSAGE_FILL_LIMIT);
+
+        let returned_certificates =
+            limiter.take_if(certificates_by_height, |lim, certificate| {
+                let cert: linera_chain::types::Certificate = (&*certificate).into();
+                Ok(lim.fits::<Certificate>(cert.clone())?.then_some(cert))
+            })?;
+
+        Ok(Response::new(CertificatesBatchResponse::try_from(
+            returned_certificates,
+        )?))
     }
 
     #[instrument(skip_all, err(Display))]
@@ -727,70 +945,33 @@ where
         request: Request<api::DownloadCertificatesByHeightsRequest>,
     ) -> Result<Response<api::RawCertificatesBatch>, Status> {
         let original_request: CertificatesByHeightRequest = request.into_inner().try_into()?;
-        let chain_info_request = ChainInfoQuery::new(original_request.chain_id)
-            .with_sent_certificate_hashes_by_heights(original_request.heights);
-        // Use handle_chain_info_query to get the certificate hashes
-        let chain_info_response = self
-            .handle_chain_info_query(Request::new(chain_info_request.try_into()?))
-            .await?;
-        // Extract the ChainInfoResult from the response
-        let chain_info_result = chain_info_response.into_inner();
-        // Extract the certificate hashes from the ChainInfo
-        let hashes = match chain_info_result.inner {
-            Some(api::chain_info_result::Inner::ChainInfoResponse(response)) => {
-                let chain_info: ChainInfo =
-                    bincode::deserialize(&response.chain_info).map_err(|e| {
-                        Status::internal(format!("Failed to deserialize ChainInfo: {}", e))
-                    })?;
-                chain_info.requested_sent_certificate_hashes
-            }
-            Some(api::chain_info_result::Inner::Error(error)) => {
-                let error =
-                    bincode::deserialize(&error).unwrap_or_else(|err| NodeError::GrpcError {
-                        error: format!("failed to unmarshal error message: {}", err),
-                    });
-                return Err(Status::internal(format!(
-                    "Chain info query failed: {error}"
-                )));
-            }
-            None => {
-                return Err(Status::internal("Empty chain info result"));
-            }
-        };
+        let chain_id = original_request.chain_id;
+        let heights = original_request.heights;
 
-        // Use 70% of the max message size as a buffer capacity.
-        // Leave 30% as overhead.
-        let mut grpc_message_limiter: GrpcMessageLimiter<linera_chain::types::Certificate> =
+        let raw_certificates_by_height = self
+            .0
+            .storage
+            .read_certificates_by_heights_raw(chain_id, &heights)
+            .await
+            .map_err(Self::view_error_to_status)?
+            .into_iter()
+            .flatten()
+            .map(CacheArc::unwrap_or_clone)
+            .collect::<Vec<(Vec<u8>, Vec<u8>)>>();
+
+        let mut limiter: GrpcMessageLimiter<linera_chain::types::Certificate> =
             GrpcMessageLimiter::new(GRPC_CHUNKED_MESSAGE_FILL_LIMIT);
 
-        let mut returned_certificates = vec![];
+        let certificates = limiter.take_if(raw_certificates_by_height, |lim, (lite, block)| {
+            Ok(lim
+                .fits_raw(lite.len() + block.len())
+                .then_some(RawCertificate {
+                    lite_certificate: lite,
+                    confirmed_block: block,
+                }))
+        })?;
 
-        'outer: for batch in hashes.chunks(100) {
-            let certificates: Vec<(Vec<u8>, Vec<u8>)> = self
-                .0
-                .storage
-                .read_certificates_raw(batch.to_vec())
-                .await
-                .map_err(Self::view_error_to_status)?
-                .into_iter()
-                .collect();
-            for (lite_cert_bytes, confirmed_block_bytes) in certificates {
-                if grpc_message_limiter
-                    .fits_raw(lite_cert_bytes.len() + confirmed_block_bytes.len())
-                {
-                    returned_certificates.push(RawCertificate {
-                        lite_certificate: lite_cert_bytes,
-                        confirmed_block: confirmed_block_bytes,
-                    });
-                } else {
-                    break 'outer;
-                }
-            }
-        }
-
-        Ok(Response::new(RawCertificatesBatch {
-            certificates: returned_certificates,
-        }))
+        Ok(Response::new(RawCertificatesBatch { certificates }))
     }
 
     #[instrument(skip_all, err(level = Level::WARN), fields(
@@ -808,10 +989,10 @@ where
             .await
             .map_err(Self::view_error_to_status)?;
         let blob_state =
-            blob_state.ok_or_else(|| Status::not_found(format!("Blob not found {}", blob_id)))?;
+            blob_state.ok_or_else(|| Status::not_found(format!("Blob not found {blob_id}")))?;
         let last_used_by = blob_state
             .last_used_by
-            .ok_or_else(|| Status::not_found(format!("Blob not found {}", blob_id)))?;
+            .ok_or_else(|| Status::not_found(format!("Blob not found {blob_id}")))?;
         Ok(Response::new(last_used_by.into()))
     }
 
@@ -843,6 +1024,97 @@ where
             .map_err(Self::view_error_to_status)?;
         Ok(Response::new(missing_blob_ids.try_into()?))
     }
+
+    #[instrument(skip_all, err(level = Level::WARN), fields(
+        method = "event_block_heights"
+    ))]
+    async fn event_block_heights(
+        &self,
+        request: Request<api::EventBlockHeightsRequest>,
+    ) -> Result<Response<api::EventBlockHeightsResponse>, Status> {
+        let event_ids: Vec<linera_base::identifiers::EventId> = request
+            .into_inner()
+            .try_into()
+            .map_err(|e: linera_rpc::grpc::GrpcProtoConversionError| {
+                Status::invalid_argument(e.to_string())
+            })?;
+        let heights = self
+            .0
+            .storage
+            .read_event_block_heights(&event_ids)
+            .await
+            .map_err(Self::view_error_to_status)?;
+        Ok(Response::new(heights.into()))
+    }
+}
+
+/// Performs, on behalf of this validator's shards, the requests they must send to other
+/// validators, returning each answer verbatim — including the peer's errors, which export depends
+/// on. Served only on the internal listener, limited to the four requests block export makes.
+#[async_trait]
+impl<S> ValidatorRelay for GrpcProxy<S>
+where
+    S: Storage + Clone + Send + Sync + 'static,
+{
+    #[instrument(skip_all, err(Display), fields(method = "relay_lite_certificate"))]
+    async fn relay_lite_certificate(
+        &self,
+        request: Request<api::RelayLiteCertificateRequest>,
+    ) -> Result<Response<ChainInfoResult>, Status> {
+        let request = request.into_inner();
+        let inner = request
+            .inner
+            .ok_or_else(|| Status::invalid_argument("missing lite certificate"))?;
+        self.peer(&request.destination, "relay_lite_certificate")
+            .await?
+            .handle_lite_certificate(Request::new(inner))
+            .await
+    }
+
+    #[instrument(skip_all, err(Display), fields(method = "relay_confirmed_certificate"))]
+    async fn relay_confirmed_certificate(
+        &self,
+        request: Request<api::RelayConfirmedCertificateRequest>,
+    ) -> Result<Response<ChainInfoResult>, Status> {
+        let request = request.into_inner();
+        let inner = request
+            .inner
+            .ok_or_else(|| Status::invalid_argument("missing confirmed certificate"))?;
+        self.peer(&request.destination, "relay_confirmed_certificate")
+            .await?
+            .handle_confirmed_certificate(Request::new(inner))
+            .await
+    }
+
+    #[instrument(skip_all, err(Display), fields(method = "relay_chain_info_query"))]
+    async fn relay_chain_info_query(
+        &self,
+        request: Request<api::RelayChainInfoQueryRequest>,
+    ) -> Result<Response<ChainInfoResult>, Status> {
+        let request = request.into_inner();
+        let inner = request
+            .inner
+            .ok_or_else(|| Status::invalid_argument("missing chain info query"))?;
+        self.peer(&request.destination, "relay_chain_info_query")
+            .await?
+            .handle_chain_info_query(Request::new(inner))
+            .await
+    }
+
+    #[instrument(skip_all, err(Display), fields(method = "relay_upload_blob"))]
+    async fn relay_upload_blob(
+        &self,
+        request: Request<api::RelayUploadBlobRequest>,
+    ) -> Result<Response<api::BlobId>, Status> {
+        let request = request.into_inner();
+        let inner = request
+            .inner
+            .ok_or_else(|| Status::invalid_argument("missing blob"))?;
+        self.peer(&request.destination, "relay_upload_blob")
+            .await?
+            .upload_blob(Request::new(inner))
+            .await
+    }
 }
 
 #[async_trait]
@@ -850,15 +1122,19 @@ impl<S> NotifierService for GrpcProxy<S>
 where
     S: Storage + Clone + Send + Sync + 'static,
 {
-    #[instrument(skip_all, err(Display), fields(method = "notify"))]
-    async fn notify(&self, request: Request<Notification>) -> Result<Response<()>, Status> {
-        let notification = request.into_inner();
-        let chain_id = notification
-            .chain_id
-            .clone()
-            .ok_or_else(|| Status::invalid_argument("Missing field: chain_id."))?
-            .try_into()?;
-        self.0.notifier.notify_chain(&chain_id, &Ok(notification));
+    #[instrument(skip_all, err(Display), fields(method = "notify_batch"))]
+    async fn notify_batch(
+        &self,
+        request: Request<NotificationBatch>,
+    ) -> Result<Response<()>, Status> {
+        for notification in request.into_inner().notifications {
+            let chain_id = notification
+                .chain_id
+                .clone()
+                .ok_or_else(|| Status::invalid_argument("Missing field: chain_id."))?
+                .try_into()?;
+            self.0.notifier.notify_chain(&chain_id, &Ok(notification));
+        }
         Ok(Response::new(()))
     }
 }
@@ -900,6 +1176,27 @@ impl<T> GrpcMessageLimiter<T> {
         }
         self.remaining = self.remaining.saturating_sub(bytes_len);
         true
+    }
+
+    /// Collects items while the predicate returns `Some`.
+    ///
+    /// The `try_take` closure should check if the item should be taken and return:
+    /// - `Ok(Some(output))` to take the item (transformed)
+    /// - `Ok(None)` to stop collection
+    /// - `Err(_)` on error
+    fn take_if<I, O, F>(&mut self, items: I, mut try_take: F) -> Result<Vec<O>, Status>
+    where
+        I: IntoIterator,
+        F: FnMut(&mut Self, I::Item) -> Result<Option<O>, Status>,
+    {
+        let mut result = vec![];
+        for item in items {
+            match try_take(self, item)? {
+                Some(output) => result.push(output),
+                None => break,
+            }
+        }
+        Ok(result)
     }
 }
 

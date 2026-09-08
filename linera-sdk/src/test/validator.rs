@@ -21,7 +21,7 @@ use linera_base::{
     identifiers::{AccountOwner, ApplicationId, ChainId, ModuleId},
     ownership::ChainOwnership,
 };
-use linera_core::worker::WorkerState;
+use linera_core::{worker::WorkerState, ChainWorkerConfig};
 use linera_execution::{
     committee::Committee,
     system::{AdminOperation, OpenChainConfig, SystemOperation},
@@ -88,22 +88,20 @@ impl TestValidator {
             .now_or_never()
             .expect("execution of DbStorage::new should not await anything");
         let clock = storage.clock().clone();
-        let worker = WorkerState::new(
-            "Single validator node".to_string(),
-            Some(validator_keypair.secret_key.copy()),
-            storage.clone(),
-            5_000,
-            10_000,
-        );
+        let config = ChainWorkerConfig {
+            nickname: "Single validator node".to_string(),
+            key_pair: Some(Arc::new(validator_keypair.secret_key.copy())),
+            ..ChainWorkerConfig::default()
+        };
+        let worker = WorkerState::new(storage.clone(), config, None);
 
         // Create an admin chain.
         let key_pair = AccountSecretKey::generate();
 
         let new_chain_config = InitialChainConfig {
             ownership: ChainOwnership::single(key_pair.public().into()),
-            min_active_epoch: epoch,
-            max_active_epoch: epoch,
             epoch,
+            account: AccountOwner::CHAIN,
             balance: Amount::from_tokens(1_000_000),
             application_permissions: ApplicationPermissions::default(),
         };
@@ -166,7 +164,7 @@ impl TestValidator {
         let validator = TestValidator::new().await;
         let publisher = Box::pin(validator.new_chain()).await;
 
-        let module_id = publisher.publish_current_module().await;
+        let module_id = Box::pin(publisher.publish_current_module()).await;
 
         (validator, module_id)
     }
@@ -188,10 +186,14 @@ impl TestValidator {
         Parameters: Serialize,
         InstantiationArgument: Serialize,
     {
-        let (validator, module_id) =
-            TestValidator::with_current_module::<Abi, Parameters, InstantiationArgument>().await;
+        let (validator, module_id) = Box::pin(TestValidator::with_current_module::<
+            Abi,
+            Parameters,
+            InstantiationArgument,
+        >())
+        .await;
 
-        let mut creator = validator.new_chain().await;
+        let mut creator = Box::pin(validator.new_chain()).await;
 
         let application_id = creator
             .create_application(module_id, parameters, instantiation_argument, vec![])
@@ -261,22 +263,21 @@ impl TestValidator {
             .await
             .expect("Should write committee blob");
 
-        admin_chain
-            .add_block(|block| {
-                block.with_system_operation(SystemOperation::Admin(
-                    AdminOperation::CreateCommittee { epoch, blob_hash },
-                ));
-            })
-            .await;
+        Box::pin(admin_chain.add_block(|block| {
+            block.with_system_operation(SystemOperation::Admin(AdminOperation::CreateCommittee {
+                epoch,
+                blob_hash,
+            }));
+        }))
+        .await;
 
         let pinned = self.chains.pin();
         for chain in pinned.values() {
             if chain.id() != self.admin_chain_id {
-                chain
-                    .add_block(|block| {
-                        block.with_system_operation(SystemOperation::ProcessNewEpoch(epoch));
-                    })
-                    .await;
+                Box::pin(chain.add_block(|block| {
+                    block.with_system_operation(SystemOperation::ProcessNewEpoch(epoch));
+                }))
+                .await;
             }
         }
     }
@@ -284,12 +285,11 @@ impl TestValidator {
     /// Creates a new microchain and returns the [`ActiveChain`] that can be used to add blocks to
     /// it with the given key pair.
     pub async fn new_chain_with_keypair(&self, key_pair: AccountSecretKey) -> ActiveChain {
-        let description = self
-            .request_new_chain_from_admin_chain(key_pair.public().into())
-            .await;
+        let description =
+            Box::pin(self.request_new_chain_from_admin_chain(key_pair.public().into())).await;
         let chain = ActiveChain::new(key_pair, description.clone(), self.clone());
 
-        chain.handle_received_messages().await;
+        Box::pin(chain.handle_received_messages()).await;
 
         self.chains.pin().insert(description.id(), chain.clone());
 
@@ -300,7 +300,7 @@ impl TestValidator {
     /// it.
     pub async fn new_chain(&self) -> ActiveChain {
         let key_pair = AccountSecretKey::generate();
-        self.new_chain_with_keypair(key_pair).await
+        Box::pin(self.new_chain_with_keypair(key_pair)).await
     }
 
     /// Adds an existing [`ActiveChain`].
@@ -312,26 +312,31 @@ impl TestValidator {
     ///
     /// Returns the [`ChainDescription`] of the new chain.
     async fn request_new_chain_from_admin_chain(&self, owner: AccountOwner) -> ChainDescription {
-        let admin_id = self.admin_chain_id;
+        let admin_chain_id = self.admin_chain_id;
         let pinned = self.chains.pin();
         let admin_chain = pinned
-            .get(&admin_id)
+            .get(&admin_chain_id)
             .expect("Admin chain should be created when the `TestValidator` is constructed");
-
-        let (epoch, _) = self.committee.lock().await.clone();
 
         let open_chain_config = OpenChainConfig {
             ownership: ChainOwnership::single(owner),
+            account: AccountOwner::CHAIN,
             balance: Amount::from_tokens(10),
             application_permissions: ApplicationPermissions::default(),
         };
-        let new_chain_config = open_chain_config.init_chain_config(epoch, epoch, epoch);
 
-        let certificate = admin_chain
-            .add_block(|block| {
-                block.with_system_operation(SystemOperation::OpenChain(open_chain_config));
-            })
-            .await;
+        let chain_state = Box::pin(self.worker.chain_state_view(admin_chain_id))
+            .await
+            .expect("Failed to read admin chain state");
+        let epoch = *chain_state.execution_state.system.epoch.get();
+        drop(chain_state);
+
+        let new_chain_config = open_chain_config.init_chain_config(epoch);
+
+        let (certificate, _) = Box::pin(admin_chain.add_block(|block| {
+            block.with_system_operation(SystemOperation::OpenChain(open_chain_config));
+        }))
+        .await;
         let block = certificate.inner().block();
 
         let origin = ChainOrigin::Child {

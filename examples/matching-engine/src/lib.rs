@@ -6,6 +6,7 @@
 use async_graphql::{scalar, InputObject, Request, Response, SimpleObject};
 use fungible::FungibleTokenAbi;
 use linera_sdk::{
+    formats::StableEnum,
     graphql::GraphQLMutationRoot,
     linera_base_types::{AccountOwner, Amount, ApplicationId, ContractAbi, ServiceAbi},
     views::{CustomSerialize, ViewError},
@@ -190,6 +191,9 @@ impl Order {
         // Reconstruct the full u128 value from upper and lower halves
         let full_value = (quantity.upper_half() as u128) << 64 | (quantity.lower_half() as u128);
 
+        // We allow this because `is_multiple_of` is still unstable in our MSRV.
+        #[allow(unknown_lints)]
+        #[expect(clippy::manual_is_multiple_of)]
         // Check if the quantity is divisible by the minimum unit
         // This ensures it doesn't use more than (DECIMAL_PLACES - price_decimals) decimal places
         if full_value % min_unit != 0 {
@@ -255,7 +259,7 @@ impl Parameters {
 }
 
 /// Operations that can be sent to the application.
-#[derive(Debug, Deserialize, Serialize, GraphQLMutationRoot)]
+#[derive(Debug, StableEnum, GraphQLMutationRoot)]
 pub enum Operation {
     /// The order that is going to be executed on the chain of the order book.
     ExecuteOrder { order: Order },
@@ -266,9 +270,60 @@ pub enum Operation {
 
 /// Messages that can be processed by the application.
 #[derive(Debug, Deserialize, Serialize)]
+#[doc(hidden)]
 pub enum Message {
     /// The order being transmitted from the chain and received by the chain of the order book.
     ExecuteOrder { order: Order },
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod formats {
+    use linera_sdk::{
+        formats::{BcsApplication, Formats, TracerExt},
+        linera_base_types::AccountOwner,
+    };
+    use serde_reflection::{Samples, Tracer, TracerConfig};
+
+    use super::{MatchingEngineAbi, Message, Operation, Order, OrderNature, Parameters, Price};
+
+    /// The MatchingEngine application.
+    pub struct MatchingEngineApplication;
+
+    impl BcsApplication for MatchingEngineApplication {
+        type Abi = MatchingEngineAbi;
+
+        fn formats() -> serde_reflection::Result<Formats> {
+            let mut tracer = Tracer::new(
+                TracerConfig::default()
+                    .record_samples_for_newtype_structs(true)
+                    .record_samples_for_tuple_structs(true),
+            );
+            let samples = Samples::new();
+
+            // Trace the ABI types
+            let operation = tracer.trace_stable_enum_type::<Operation>(&samples)?;
+            let (response, _) = tracer.trace_type::<()>(&samples)?;
+            let (message, _) = tracer.trace_type::<Message>(&samples)?;
+            let (event_value, _) = tracer.trace_type::<()>(&samples)?;
+
+            // Trace additional supporting types (notably all enums) to populate the registry
+            tracer.trace_type::<Parameters>(&samples)?;
+            tracer.trace_type::<Order>(&samples)?;
+            tracer.trace_type::<OrderNature>(&samples)?;
+            tracer.trace_type::<Price>(&samples)?;
+            tracer.trace_type::<AccountOwner>(&samples)?;
+
+            let registry = tracer.registry()?;
+
+            Ok(Formats {
+                registry,
+                operation,
+                response,
+                message,
+                event_value,
+            })
+        }
+    }
 }
 
 #[cfg(test)]

@@ -1,7 +1,8 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-#![allow(clippy::large_futures)]
+#![expect(clippy::large_futures)]
+#![allow(clippy::cast_possible_truncation)]
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -11,7 +12,7 @@ use std::{
 use assert_matches::assert_matches;
 use axum::{routing::get, Router};
 use linera_base::{
-    crypto::{AccountPublicKey, ValidatorPublicKey},
+    crypto::{AccountPublicKey, CryptoHash, ValidatorPublicKey},
     data_types::{
         Amount, ApplicationDescription, ApplicationPermissions, Blob, BlockHeight, Bytecode,
         ChainDescription, ChainOrigin, Epoch, InitialChainConfig, Timestamp,
@@ -26,23 +27,29 @@ use linera_execution::{
     committee::{Committee, ValidatorState},
     test_utils::{ExpectedCall, MockApplication},
     BaseRuntime, ContractRuntime, ExecutionError, ExecutionRuntimeConfig, ExecutionRuntimeContext,
-    Operation, ResourceControlPolicy, ServiceRuntime, SystemOperation, TestExecutionRuntimeContext,
+    Message, MessageKind, Operation, ResourceControlPolicy, ResourceTracker, ServiceRuntime,
+    SystemOperation, TestExecutionRuntimeContext,
 };
 use linera_views::{
+    batch::Batch,
     context::{Context as _, MemoryContext, ViewContext},
     memory::MemoryStore,
-    views::View,
+    views::{RootView as _, View},
 };
 use test_case::test_case;
 
 use crate::{
     block::{Block, ConfirmedBlock},
-    data_types::{BlockExecutionOutcome, ProposedBlock},
+    data_types::{
+        BlockExecutionOutcome, BundleExecutionPolicy, IncomingBundle, MessageAction, MessageBundle,
+        PostedMessage, ProposedBlock,
+    },
     test::{make_child_block, make_first_block, BlockTestExt, HttpServer},
-    ChainError, ChainExecutionContext, ChainStateView,
+    BlockExecution, BlockExecutionPhase, ChainError, ChainExecutionContext, ChainStateView,
 };
 
 impl ChainStateView<MemoryContext<TestExecutionRuntimeContext>> {
+    /// Creates an in-memory chain state view for the given chain, for use in tests.
     pub async fn new(chain_id: ChainId) -> Self {
         let exec_runtime_context =
             TestExecutionRuntimeContext::new(chain_id, ExecutionRuntimeConfig::default());
@@ -50,6 +57,29 @@ impl ChainStateView<MemoryContext<TestExecutionRuntimeContext>> {
         Self::load(context)
             .await
             .expect("Loading from memory should work")
+    }
+
+    /// Test helper that calls `execute_block` with default test parameters:
+    /// `round = None`, `replayed_oracle_responses = None`, `policy = Abort`.
+    #[cfg(with_testing)]
+    pub async fn execute_test_block_simple(
+        &mut self,
+        block: ProposedBlock,
+        local_time: Timestamp,
+        published_blobs: &[Blob],
+    ) -> Result<(ProposedBlock, BlockExecutionOutcome, ResourceTracker), ChainError> {
+        let (block, outcome, tracker, _) = self
+            .execute_block(
+                block,
+                local_time,
+                None,
+                published_blobs,
+                BlockExecution::StageProposal {
+                    policy: BundleExecutionPolicy::committed(),
+                },
+            )
+            .await?;
+        Ok((block, outcome, tracker))
     }
 }
 
@@ -63,21 +93,22 @@ impl TestEnvironment {
         let config = InitialChainConfig {
             ownership: ChainOwnership::single(AccountPublicKey::test_key(0).into()),
             epoch: Epoch::ZERO,
-            min_active_epoch: Epoch::ZERO,
-            max_active_epoch: Epoch::ZERO,
+            account: AccountOwner::CHAIN,
             balance: Amount::from_tokens(10),
             application_permissions: Default::default(),
         };
         let origin = ChainOrigin::Root(0);
         let admin_chain_description = ChainDescription::new(origin, config, Default::default());
-        let admin_id = admin_chain_description.id();
+        let admin_chain_id = admin_chain_description.id();
         Self {
             admin_chain_description: admin_chain_description.clone(),
-            created_descriptions: [(admin_id, admin_chain_description)].into_iter().collect(),
+            created_descriptions: [(admin_chain_id, admin_chain_description)]
+                .into_iter()
+                .collect(),
         }
     }
 
-    fn admin_id(&self) -> ChainId {
+    fn admin_chain_id(&self) -> ChainId {
         self.admin_chain_description.id()
     }
 
@@ -94,13 +125,13 @@ impl TestEnvironment {
     fn make_app_description(&self) -> (ApplicationDescription, Blob, Blob) {
         let contract = Bytecode::new(b"contract".into());
         let service = Bytecode::new(b"service".into());
-        self.make_app_from_bytecodes(contract, service)
+        self.make_app_from_bytecodes(&contract, &service)
     }
 
     fn make_app_from_bytecodes(
         &self,
-        contract: Bytecode,
-        service: Bytecode,
+        contract: &Bytecode,
+        service: &Bytecode,
     ) -> (ApplicationDescription, Blob, Blob) {
         let contract_blob = Blob::new_contract_bytecode(contract.compress());
         let service_blob = Blob::new_service_bytecode(service.compress());
@@ -110,7 +141,7 @@ impl TestEnvironment {
         (
             ApplicationDescription {
                 module_id,
-                creator_chain_id: self.admin_id(),
+                creator_chain_id: self.admin_chain_id(),
                 block_height: BlockHeight(2),
                 application_index: 0,
                 required_application_ids: vec![],
@@ -127,7 +158,7 @@ impl TestEnvironment {
         config: InitialChainConfig,
     ) -> ChainDescription {
         let origin = ChainOrigin::Child {
-            parent: self.admin_id(),
+            parent: self.admin_chain_id(),
             block_height: BlockHeight(height),
             chain_index: 0,
         };
@@ -149,7 +180,8 @@ fn committee_blob(policy: ResourceControlPolicy) -> Blob {
             },
         )]),
         policy,
-    );
+    )
+    .expect("test committee votes should not overflow");
     Blob::new_committee(bcs::to_bytes(&committee).expect("serializing a committee should succeed"))
 }
 
@@ -198,7 +230,7 @@ async fn test_block_size_limit() -> anyhow::Result<()> {
         .with_authenticated_owner(Some(owner))
         .with_operation(SystemOperation::Transfer {
             owner: AccountOwner::CHAIN,
-            recipient: Account::chain(env.admin_id()),
+            recipient: Account::chain(env.admin_chain_id()),
             amount: Amount::ONE,
         });
 
@@ -207,12 +239,12 @@ async fn test_block_size_limit() -> anyhow::Result<()> {
         .clone()
         .with_operation(SystemOperation::Transfer {
             owner: AccountOwner::CHAIN,
-            recipient: Account::chain(env.admin_id()),
+            recipient: Account::chain(env.admin_chain_id()),
             amount: Amount::ONE,
         });
 
     let result = chain
-        .execute_block(&invalid_block, time, None, &[], None)
+        .execute_test_block_simple(invalid_block, time, &[])
         .await;
     assert_matches!(
         result,
@@ -223,8 +255,8 @@ async fn test_block_size_limit() -> anyhow::Result<()> {
     );
 
     // The valid block is accepted...
-    let outcome = chain
-        .execute_block(&valid_block, time, None, &[], None)
+    let (valid_block, outcome, _) = chain
+        .execute_test_block_simple(valid_block, time, &[])
         .await
         .unwrap();
     let block = Block::new(valid_block, outcome);
@@ -250,8 +282,8 @@ async fn test_application_permissions() -> anyhow::Result<()> {
     let application = MockApplication::default();
 
     let (another_app, another_contract, another_service) = env.make_app_from_bytecodes(
-        Bytecode::new(b"contractB".into()),
-        Bytecode::new(b"serviceB".into()),
+        &Bytecode::new(b"contractB".into()),
+        &Bytecode::new(b"serviceB".into()),
     );
     let another_app_id = ApplicationId::from(&another_app);
 
@@ -300,7 +332,7 @@ async fn test_application_permissions() -> anyhow::Result<()> {
     // An operation that doesn't belong to the app isn't allowed.
     let invalid_block = make_first_block(chain_id).with_simple_transfer(chain_id, Amount::ONE);
     let result = chain
-        .execute_block(&invalid_block, time, None, &[], None)
+        .execute_test_block_simple(invalid_block, time, &[])
         .await;
     assert_matches!(result, Err(ChainError::AuthorizedApplications(app_ids))
         if app_ids == vec![application_id, another_app_id]
@@ -324,19 +356,19 @@ async fn test_application_permissions() -> anyhow::Result<()> {
         .with_operation(app_operation.clone())
         .with_operation(another_app_operation.clone());
 
-    let outcome = chain
-        .execute_block(&valid_block, time, None, &[], None)
+    let (valid_block, outcome, _) = chain
+        .execute_test_block_simple(valid_block, time, &[])
         .await?;
 
     let value = ConfirmedBlock::new(outcome.with(valid_block));
-    chain.apply_confirmed_block(&value, time).await?;
+    chain.apply_confirmed_block(&value, time, None).await?;
 
     // In the second block, other operations are still not allowed.
     let invalid_block = make_child_block(&value.clone())
         .with_simple_transfer(chain_id, Amount::ONE)
         .with_operation(app_operation.clone());
     let result = chain
-        .execute_block(&invalid_block, time, None, &[], None)
+        .execute_test_block_simple(invalid_block, time, &[])
         .await;
     assert_matches!(result, Err(ChainError::AuthorizedApplications(app_ids))
         if app_ids == vec![application_id, another_app_id]
@@ -344,7 +376,7 @@ async fn test_application_permissions() -> anyhow::Result<()> {
     // Also, blocks without all authorized applications operation, or incoming message, are forbidden.
     let invalid_block = make_child_block(&value).with_operation(another_app_operation.clone());
     let result = chain
-        .execute_block(&invalid_block, time, None, &[], None)
+        .execute_test_block_simple(invalid_block, time, &[])
         .await;
     assert_matches!(result, Err(ChainError::MissingMandatoryApplications(app_ids))
         if app_ids == vec![application_id]
@@ -357,11 +389,108 @@ async fn test_application_permissions() -> anyhow::Result<()> {
     let valid_block = make_child_block(&value)
         .with_operation(app_operation.clone())
         .with_operation(another_app_operation.clone());
-    let outcome = chain
-        .execute_block(&valid_block, time, None, &[], None)
+    let (valid_block, outcome, _) = chain
+        .execute_test_block_simple(valid_block, time, &[])
         .await?;
     let value = ConfirmedBlock::new(outcome.with(valid_block));
-    chain.apply_confirmed_block(&value, time).await?;
+    chain.apply_confirmed_block(&value, time, None).await?;
+
+    Ok(())
+}
+
+/// Tests that mandatory applications can be satisfied by accepted messages but not rejected ones.
+#[tokio::test]
+async fn test_mandatory_applications_with_messages() -> anyhow::Result<()> {
+    let mut env = TestEnvironment::new();
+
+    let time = Timestamp::from(0);
+
+    // Create a mock application.
+    let (app_description, contract_blob, service_blob) = env.make_app_description();
+    let application_id = ApplicationId::from(&app_description);
+    let application = MockApplication::default();
+
+    // Configure the chain with a mandatory application.
+    let config = InitialChainConfig {
+        application_permissions: ApplicationPermissions::new_single(application_id),
+        ..env.make_open_chain_config()
+    };
+    let chain_desc = env.make_child_chain_description_with_config(3, config);
+    let chain_id = chain_desc.id();
+    let origin_chain_id = ChainId(CryptoHash::test_hash("origin"));
+
+    let mut chain = ChainStateView::new(chain_id).await;
+
+    let context = chain.context();
+    let extra = context.extra();
+    {
+        let pinned = extra.user_contracts().pin();
+        pinned.insert(application_id, application.clone().into());
+    }
+
+    extra
+        .add_blobs([committee_blob(Default::default())])
+        .await?;
+    extra.add_blobs(env.description_blobs()).await?;
+    extra
+        .add_blobs([
+            contract_blob,
+            service_blob,
+            Blob::new_application_description(&app_description),
+        ])
+        .await?;
+
+    // Initialize the chain.
+    chain.initialize_if_needed(time).await?;
+
+    // Create an incoming bundle with a user message from the mandatory application.
+    let user_message = Message::User {
+        application_id,
+        bytes: b"test_message".to_vec(),
+    };
+    let posted_message = PostedMessage {
+        authenticated_owner: None,
+        grant: Amount::ZERO,
+        refund_grant_to: None,
+        kind: MessageKind::Simple,
+        message: user_message,
+    };
+    let message_bundle = MessageBundle {
+        height: BlockHeight::ZERO,
+        timestamp: time,
+        certificate_hash: CryptoHash::test_hash("test"),
+        transaction_index: 0,
+        messages: vec![posted_message],
+    };
+
+    // Test 1: A rejected message should NOT satisfy the mandatory application requirement.
+    let rejected_bundle = IncomingBundle {
+        origin: origin_chain_id,
+        bundle: message_bundle.clone(),
+        action: MessageAction::Reject,
+    };
+    let block_with_rejected = make_first_block(chain_id).with_incoming_bundle(rejected_bundle);
+    let result = chain
+        .execute_test_block_simple(block_with_rejected, time, &[])
+        .await;
+    assert_matches!(result, Err(ChainError::MissingMandatoryApplications(app_ids))
+        if app_ids == vec![application_id]
+    );
+
+    // Test 2: An accepted message SHOULD satisfy the mandatory application requirement.
+    application.expect_call(ExpectedCall::execute_message(|_, _| Ok(())));
+    application.expect_call(ExpectedCall::default_finalize());
+    let accepted_bundle = IncomingBundle {
+        origin: origin_chain_id,
+        bundle: message_bundle,
+        action: MessageAction::Accept,
+    };
+    let block_with_accepted = make_first_block(chain_id).with_incoming_bundle(accepted_bundle);
+    let (block_with_accepted, outcome, _) = chain
+        .execute_test_block_simple(block_with_accepted, time, &[])
+        .await?;
+    let value = ConfirmedBlock::new(outcome.with(block_with_accepted));
+    chain.apply_confirmed_block(&value, time, None).await?;
 
     Ok(())
 }
@@ -403,7 +532,7 @@ async fn test_service_as_oracles(service_oracle_execution_times_ms: &[u64]) -> a
 
     application.expect_call(ExpectedCall::default_finalize());
 
-    chain.execute_block(&block, time, None, &[], None).await?;
+    chain.execute_test_block_simple(block, time, &[]).await?;
 
     Ok(())
 }
@@ -448,7 +577,7 @@ async fn test_service_as_oracle_exceeding_time_limit(
 
     application.expect_call(ExpectedCall::default_finalize());
 
-    let result = chain.execute_block(&block, time, None, &[], None).await;
+    let result = chain.execute_test_block_simple(block, time, &[]).await;
 
     let Err(ChainError::ExecutionError(execution_error, ChainExecutionContext::Operation(0))) =
         result
@@ -513,7 +642,7 @@ async fn test_service_as_oracle_timeout_early_stop(
     application.expect_call(ExpectedCall::default_finalize());
 
     let execution_start = Instant::now();
-    let result = chain.execute_block(&block, time, None, &[], None).await;
+    let result = chain.execute_test_block_simple(block, time, &[]).await;
     let execution_time = execution_start.elapsed();
 
     let Err(ChainError::ExecutionError(execution_error, ChainExecutionContext::Operation(0))) =
@@ -564,7 +693,10 @@ async fn test_service_as_oracle_response_size_limit(
 
     application.expect_call(ExpectedCall::default_finalize());
 
-    chain.execute_block(&block, time, None, &[], None).await
+    chain
+        .execute_test_block_simple(block, time, &[])
+        .await
+        .map(|(_, outcome, _)| outcome)
 }
 
 /// Tests contract HTTP response size limit.
@@ -620,7 +752,10 @@ async fn test_contract_http_response_size_limit(
 
     application.expect_call(ExpectedCall::default_finalize());
 
-    chain.execute_block(&block, time, None, &[], None).await
+    chain
+        .execute_test_block_simple(block, time, &[])
+        .await
+        .map(|(_, outcome, _)| outcome)
 }
 
 /// Tests service HTTP response size limit.
@@ -676,7 +811,10 @@ async fn test_service_http_response_size_limit(
 
     application.expect_call(ExpectedCall::default_finalize());
 
-    chain.execute_block(&block, time, None, &[], None).await
+    chain
+        .execute_test_block_simple(block, time, &[])
+        .await
+        .map(|(_, outcome, _)| outcome)
 }
 
 /// Sets up a test with a dummy [`MockApplication`].
@@ -747,4 +885,355 @@ async fn prepare_test_with_dummy_mock_application(
     });
 
     Ok((application, application_id, chain, block, time))
+}
+
+/// The `next_height_to_preprocess` register is read directly by callers rather
+/// than being computed from `block_hashes.indices()`. This pins down that the
+/// register is consulted (no fallback to `indices()` that would mis-sort heights
+/// spanning a byte boundary under BCS little-endian `u64` encoding).
+#[tokio::test]
+async fn test_next_height_to_preprocess_register() {
+    let chain_id = TestEnvironment::new().admin_chain_id();
+    let mut chain = ChainStateView::new(chain_id).await;
+
+    // Empty chain.
+    assert_eq!(*chain.next_height_to_preprocess.get(), BlockHeight(0));
+
+    // Set the register to a height crossing the first byte boundary.
+    chain.next_height_to_preprocess.set(BlockHeight(257));
+    assert_eq!(*chain.next_height_to_preprocess.get(), BlockHeight(257));
+}
+
+fn test_chain_id(seed: &str) -> ChainId {
+    ChainId(CryptoHash::test_hash(seed))
+}
+
+/// Builds the hashed tracked-chain set passed to `reconcile_outbox_index`.
+fn tracked_set<const N: usize>(
+    ids: [ChainId; N],
+) -> linera_base::hashed::Hashed<crate::ChainIdSet> {
+    linera_base::hashed::Hashed::new(crate::ChainIdSet(ids.into_iter().collect()))
+}
+
+/// Schedules a message to `target`'s outbox at `height` and indexes it in
+/// `nonempty_outboxes`/`outbox_counters`, mirroring `process_outgoing_messages` for a tracked
+/// target.
+async fn schedule_indexed(
+    chain: &mut ChainStateView<MemoryContext<TestExecutionRuntimeContext>>,
+    target: ChainId,
+    height: BlockHeight,
+) -> anyhow::Result<()> {
+    {
+        let mut outbox = chain.outboxes.try_load_entry_mut(&target).await?;
+        assert!(outbox.schedule_message(height)?);
+    }
+    *chain.outbox_counters.get_mut().entry(height).or_default() += 1;
+    chain.nonempty_outboxes.get_mut().insert(target);
+    Ok(())
+}
+
+/// Schedules a message to `target`'s outbox at `height` without indexing it, mirroring an
+/// untracked target: the per-target queue is kept but the indices are not touched.
+async fn schedule_unindexed(
+    chain: &mut ChainStateView<MemoryContext<TestExecutionRuntimeContext>>,
+    target: ChainId,
+    height: BlockHeight,
+) -> anyhow::Result<()> {
+    let mut outbox = chain.outboxes.try_load_entry_mut(&target).await?;
+    assert!(outbox.schedule_message(height)?);
+    Ok(())
+}
+
+async fn outbox_queue_len(
+    chain: &ChainStateView<MemoryContext<TestExecutionRuntimeContext>>,
+    target: &ChainId,
+) -> anyhow::Result<usize> {
+    Ok(chain
+        .outboxes
+        .try_load_entry(target)
+        .await?
+        .map_or(0, |outbox| outbox.queue.count()))
+}
+
+/// On the first reconciliation (`None` stamp, i.e. a database written before filtering), targets
+/// that are no longer tracked are dropped from the indices, but their outbox queues are kept.
+#[tokio::test]
+async fn test_reconcile_outbox_index_migration_drops_untracked() -> anyhow::Result<()> {
+    let mut chain = ChainStateView::new(test_chain_id("self")).await;
+    let a = test_chain_id("a");
+    let b = test_chain_id("b");
+    let height = BlockHeight(5);
+    schedule_indexed(&mut chain, a, height).await?;
+    schedule_indexed(&mut chain, b, height).await?;
+    assert_eq!(*chain.outbox_index_tracked_hash.get(), None);
+
+    let tracked = tracked_set([a]);
+    let digest = tracked.hash();
+    chain.reconcile_outbox_index(Some(&tracked)).await?;
+
+    assert_eq!(chain.nonempty_outbox_chain_ids(), vec![a]);
+    assert_eq!(*chain.outbox_counters.get().get(&height).unwrap(), 1);
+    assert_eq!(outbox_queue_len(&chain, &b).await?, 1);
+    assert_eq!(*chain.outbox_index_tracked_hash.get(), Some(digest));
+    Ok(())
+}
+
+/// Shrinking the tracked set drops the removed chains from the indices (queue kept).
+#[tokio::test]
+async fn test_reconcile_outbox_index_shrink_removes_chain() -> anyhow::Result<()> {
+    let mut chain = ChainStateView::new(test_chain_id("self")).await;
+    let a = test_chain_id("a");
+    let b = test_chain_id("b");
+    let height = BlockHeight(1);
+    schedule_indexed(&mut chain, a, height).await?;
+    schedule_indexed(&mut chain, b, height).await?;
+    chain
+        .outbox_index_tracked_hash
+        .set(Some(tracked_set([a, b]).hash()));
+
+    let tracked = tracked_set([a]);
+    chain.reconcile_outbox_index(Some(&tracked)).await?;
+
+    assert_eq!(chain.nonempty_outbox_chain_ids(), vec![a]);
+    assert!(!chain.nonempty_outboxes.get().contains(&b));
+    assert_eq!(*chain.outbox_counters.get().get(&height).unwrap(), 1);
+    assert_eq!(outbox_queue_len(&chain, &b).await?, 1);
+    Ok(())
+}
+
+/// Growing the tracked set re-indexes a newly tracked chain from its retained outbox queue.
+#[tokio::test]
+async fn test_reconcile_outbox_index_retrack_reindexes_from_queue() -> anyhow::Result<()> {
+    let mut chain = ChainStateView::new(test_chain_id("self")).await;
+    let a = test_chain_id("a");
+    let b = test_chain_id("b");
+    let height = BlockHeight(7);
+    schedule_indexed(&mut chain, a, height).await?;
+    schedule_unindexed(&mut chain, b, height).await?;
+    chain
+        .outbox_index_tracked_hash
+        .set(Some(tracked_set([a]).hash()));
+    assert!(!chain.nonempty_outboxes.get().contains(&b));
+
+    let tracked = tracked_set([a, b]);
+    chain.reconcile_outbox_index(Some(&tracked)).await?;
+
+    assert!(chain.nonempty_outboxes.get().contains(&b));
+    assert_eq!(*chain.outbox_counters.get().get(&height).unwrap(), 2);
+    Ok(())
+}
+
+/// A matching stamp short-circuits reconciliation without touching the indices.
+#[tokio::test]
+async fn test_reconcile_outbox_index_noop_when_hash_matches() -> anyhow::Result<()> {
+    let mut chain = ChainStateView::new(test_chain_id("self")).await;
+    let a = test_chain_id("a");
+    let b = test_chain_id("b");
+    let height = BlockHeight(3);
+    schedule_indexed(&mut chain, a, height).await?;
+    let tracked = tracked_set([a]);
+    let digest = tracked.hash();
+    chain.outbox_index_tracked_hash.set(Some(digest));
+
+    // `b` is indexed even though it is untracked; a matching hash means reconcile returns early.
+    schedule_indexed(&mut chain, b, height).await?;
+    chain.reconcile_outbox_index(Some(&tracked)).await?;
+
+    assert!(chain.nonempty_outboxes.get().contains(&b));
+    Ok(())
+}
+
+/// A `ConfirmUpdatedRecipient` arriving for a chain that has just been un-tracked must not error,
+/// even though reconciliation already dropped its outbox counter.
+#[tokio::test]
+async fn test_mark_received_untracked_target_is_tolerated() -> anyhow::Result<()> {
+    let mut chain = ChainStateView::new(test_chain_id("self")).await;
+    let a = test_chain_id("a");
+    let height = BlockHeight(2);
+    schedule_indexed(&mut chain, a, height).await?;
+
+    // Un-track `a`: its counter is dropped and it leaves the index, but the queue is kept.
+    let empty = tracked_set([]);
+    chain.reconcile_outbox_index(Some(&empty)).await?;
+    assert!(!chain.nonempty_outboxes.get().contains(&a));
+    assert!(chain.outbox_counters.get().is_empty());
+    assert_eq!(outbox_queue_len(&chain, &a).await?, 1);
+
+    // The in-flight confirmation arrives; `a` is untracked, so this drains the queue without error.
+    let drained = chain
+        .mark_messages_as_received(&a, height, Some(empty.inner()))
+        .await?;
+    assert!(drained);
+    assert_eq!(outbox_queue_len(&chain, &a).await?, 0);
+    Ok(())
+}
+
+/// A missing counter for a *tracked* target is still reported as corruption.
+#[tokio::test]
+async fn test_mark_received_tracked_missing_counter_errors() -> anyhow::Result<()> {
+    let mut chain = ChainStateView::new(test_chain_id("self")).await;
+    let a = test_chain_id("a");
+    let height = BlockHeight(2);
+    // Queue a message but never count it: corrupt-by-construction for a tracked target.
+    schedule_unindexed(&mut chain, a, height).await?;
+    let tracked = tracked_set([a]);
+    let result = chain
+        .mark_messages_as_received(&a, height, Some(tracked.inner()))
+        .await;
+    assert!(result.is_err());
+    Ok(())
+}
+
+/// Confirming an untracked target must not disturb a tracked sibling's counter: `outbox_counters`
+/// is keyed by block height and shared across all recipients of that block, and only tracked
+/// recipients are counted.
+#[tokio::test]
+async fn test_mark_received_untracked_keeps_tracked_sibling_counter() -> anyhow::Result<()> {
+    let mut chain = ChainStateView::new(test_chain_id("self")).await;
+    let a = test_chain_id("a");
+    let b = test_chain_id("b");
+    let height = BlockHeight(4);
+    // Same block height: A is tracked (counted), B is untracked (not counted).
+    schedule_indexed(&mut chain, a, height).await?;
+    schedule_unindexed(&mut chain, b, height).await?;
+    assert_eq!(*chain.outbox_counters.get().get(&height).unwrap(), 1);
+
+    let tracked = tracked_set([a]);
+    // Confirming the untracked B drains its queue but must leave A's counter untouched.
+    assert!(
+        chain
+            .mark_messages_as_received(&b, height, Some(tracked.inner()))
+            .await?
+    );
+    assert_eq!(outbox_queue_len(&chain, &b).await?, 0);
+    assert_eq!(*chain.outbox_counters.get().get(&height).unwrap(), 1);
+    assert!(chain.nonempty_outboxes.get().contains(&a));
+
+    // A's own confirmation still succeeds and clears the (intact) counter.
+    assert!(
+        chain
+            .mark_messages_as_received(&a, height, Some(tracked.inner()))
+            .await?
+    );
+    assert!(chain.outbox_counters.get().is_empty());
+    assert!(!chain.nonempty_outboxes.get().contains(&a));
+    Ok(())
+}
+
+/// Reconciliation counts every queued height of a target, not just one.
+#[tokio::test]
+async fn test_reconcile_outbox_index_counts_all_queued_heights() -> anyhow::Result<()> {
+    let mut chain = ChainStateView::new(test_chain_id("self")).await;
+    let a = test_chain_id("a");
+    // `a` has two pending heights in its outbox queue, neither yet indexed/counted.
+    schedule_unindexed(&mut chain, a, BlockHeight(3)).await?;
+    schedule_unindexed(&mut chain, a, BlockHeight(5)).await?;
+
+    let tracked = tracked_set([a]);
+    assert!(chain.reconcile_outbox_index(Some(&tracked)).await?);
+
+    assert!(chain.nonempty_outboxes.get().contains(&a));
+    assert_eq!(
+        *chain.outbox_counters.get().get(&BlockHeight(3)).unwrap(),
+        1
+    );
+    assert_eq!(
+        *chain.outbox_counters.get().get(&BlockHeight(5)).unwrap(),
+        1
+    );
+    // A second reconciliation against the same set is a no-op.
+    assert!(!chain.reconcile_outbox_index(Some(&tracked)).await?);
+    Ok(())
+}
+
+/// In full mode (`None`), when the indices have never been filtered (stored hash `None`),
+/// reconciliation is a no-op: a steady-state validator keeps its incrementally-maintained indices
+/// untouched and never scans the full set of outbox targets.
+#[tokio::test]
+async fn test_reconcile_outbox_index_full_mode_noop_when_unfiltered() -> anyhow::Result<()> {
+    let mut chain = ChainStateView::new(test_chain_id("self")).await;
+    let a = test_chain_id("a");
+    let height = BlockHeight(4);
+    schedule_indexed(&mut chain, a, height).await?;
+    assert_eq!(*chain.outbox_index_tracked_hash.get(), None);
+
+    assert!(!chain.reconcile_outbox_index(None).await?);
+
+    // Indices are untouched and the chain stays in unfiltered (full) mode.
+    assert!(chain.nonempty_outboxes.get().contains(&a));
+    assert_eq!(*chain.outbox_counters.get().get(&height).unwrap(), 1);
+    assert_eq!(*chain.outbox_index_tracked_hash.get(), None);
+    Ok(())
+}
+
+/// Switching a previously-filtered chain back to full mode (`None`) re-indexes *every* outbox
+/// target from its retained queue — including targets dropped while filtered — and stamps the
+/// hash back to `None`.
+#[tokio::test]
+async fn test_reconcile_outbox_index_full_mode_reindexes_all() -> anyhow::Result<()> {
+    let mut chain = ChainStateView::new(test_chain_id("self")).await;
+    let a = test_chain_id("a");
+    let b = test_chain_id("b");
+    let height = BlockHeight(6);
+    // `a` is tracked/indexed; `b`'s queue is kept but it was dropped from the index while filtered.
+    schedule_indexed(&mut chain, a, height).await?;
+    schedule_unindexed(&mut chain, b, height).await?;
+    chain
+        .outbox_index_tracked_hash
+        .set(Some(tracked_set([a]).hash()));
+    assert!(!chain.nonempty_outboxes.get().contains(&b));
+
+    assert!(chain.reconcile_outbox_index(None).await?);
+
+    // Both targets are now indexed from their retained queues, and the stamp is back to `None`.
+    assert!(chain.nonempty_outboxes.get().contains(&a));
+    assert!(chain.nonempty_outboxes.get().contains(&b));
+    assert_eq!(*chain.outbox_counters.get().get(&height).unwrap(), 2);
+    assert_eq!(*chain.outbox_index_tracked_hash.get(), None);
+
+    // A second full-mode reconciliation is now a no-op.
+    assert!(!chain.reconcile_outbox_index(None).await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_insert_block_hash_leaves_unchanged_preprocess_height_clean() -> anyhow::Result<()> {
+    let chain_id = ChainId(CryptoHash::test_hash("chain"));
+    let mut chain = ChainStateView::new(chain_id).await;
+
+    chain.insert_block_hash(BlockHeight(0), CryptoHash::test_hash("block0"))?;
+    chain.save().await?;
+    assert_eq!(*chain.next_height_to_preprocess.get(), BlockHeight(1));
+
+    chain.insert_block_hash(BlockHeight(0), CryptoHash::test_hash("block0"))?;
+    let mut batch = Batch::new();
+    chain.next_height_to_preprocess.pre_save(&mut batch)?;
+    assert!(
+        batch.is_empty(),
+        "re-inserting a height below `next_height_to_preprocess` must not write the register"
+    );
+
+    chain.insert_block_hash(BlockHeight(1), CryptoHash::test_hash("block1"))?;
+    let mut batch = Batch::new();
+    chain.next_height_to_preprocess.pre_save(&mut batch)?;
+    assert!(
+        !batch.is_empty(),
+        "advancing `next_height_to_preprocess` must still write the register"
+    );
+    assert_eq!(*chain.next_height_to_preprocess.get(), BlockHeight(2));
+    Ok(())
+}
+
+/// The `phase` label values are part of the metrics wire format: dashboards, recording rules
+/// and alerts match on them, so renaming a variant would silently break every query. They are
+/// generated by `strum`, so pin them here rather than trusting the derive.
+#[test]
+fn metrics_label_values_are_stable() {
+    for (phase, expected) in [
+        (BlockExecutionPhase::StageProposal, "stage_proposal"),
+        (BlockExecutionPhase::HandleProposal, "handle_proposal"),
+        (BlockExecutionPhase::HandleConfirmed, "handle_confirmed"),
+    ] {
+        assert_eq!(<&str>::from(phase), expected);
+    }
 }

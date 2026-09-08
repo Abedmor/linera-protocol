@@ -2,7 +2,7 @@ name: Benchmark Test
 
 on:
   push:
-    branches: [ 'devnet_*', 'testnet_*' ]
+    branches: [ main, 'devnet_*', 'testnet_*' ]
   pull_request:
   merge_group:
   workflow_dispatch:
@@ -34,17 +34,15 @@ permissions:
 
 jobs:
   benchmark-test:
-    if: ${{ github.event_name == 'merge_group' }}
+    if: ${{ github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || github.event_name == 'push' }}
     runs-on: ubuntu-latest
     timeout-minutes: 40
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6.0.2
     - uses: actions-rust-lang/setup-rust-toolchain@v1
     - name: Install Protoc
-      uses: arduino/setup-protoc@v3
-      with:
-        repo-token: ${{ secrets.GITHUB_TOKEN }}
+      uses: ./.github/actions/install-protoc
     - name: Run the storage-service instance
       run: |
         cargo run --release -p linera-storage-service -- memory --endpoint $LINERA_STORAGE_SERVICE &
@@ -55,5 +53,5 @@ jobs:
         until nc -z "$STORAGE_HOST" "$STORAGE_PORT"; do sleep 1; done
     - name: Run the benchmark test
       run: |
-        cargo build --locked -p linera-service --bin linera-benchmark --features storage-service
-        cargo test --locked -p linera-service --features storage-service benchmark
+        cargo build --locked -p linera-service --bin linera-benchmark --features storage-service,opentelemetry
+        cargo test --locked -p linera-service --features storage-service,opentelemetry benchmark

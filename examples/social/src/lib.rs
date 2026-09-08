@@ -5,6 +5,7 @@
 
 use async_graphql::{InputObject, Request, Response, SimpleObject};
 use linera_sdk::{
+    formats::StableEnum,
     graphql::GraphQLMutationRoot,
     linera_base_types::{ChainId, ContractAbi, ServiceAbi, Timestamp},
     views::{CustomSerialize, ViewError},
@@ -24,7 +25,7 @@ impl ServiceAbi for SocialAbi {
 }
 
 /// An operation that can be executed by the application.
-#[derive(Debug, Serialize, Deserialize, GraphQLMutationRoot)]
+#[derive(Debug, StableEnum, GraphQLMutationRoot)]
 pub enum Operation {
     /// Request to be subscribed to another chain.
     Subscribe { chain_id: ChainId },
@@ -42,6 +43,7 @@ pub enum Operation {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[doc(hidden)]
 pub enum Message {
     /// Like a post, author of a post receives the message.
     Like { key: Key },
@@ -94,6 +96,69 @@ pub struct Key {
     pub author: ChainId,
     /// The number of posts by that author before this one.
     pub index: u32,
+}
+
+/// An event emitted by the social app.
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
+#[doc(hidden)]
+pub enum Event {
+    /// A new post was created
+    Post { post: OwnPost, index: u32 },
+    /// A user liked a post
+    Like { key: Key },
+    /// A user commented on a post
+    Comment { key: Key, comment: String },
+    /// A summary emitted at a checkpoint, carrying the most recent posts on the stream.
+    /// Older events may be dropped after the checkpoint; this lets a subscriber that joins
+    /// afterwards still receive those posts. Each entry is the post's index in the author's
+    /// own-post log paired with the post itself.
+    Summary { recent_posts: Vec<(u32, OwnPost)> },
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod formats {
+    use linera_sdk::formats::{BcsApplication, Formats, TracerExt};
+    use serde_reflection::{Samples, Tracer, TracerConfig};
+
+    use super::{Comment, Event, Key, Message, Operation, OwnPost, Post, SocialAbi};
+
+    /// The Social application.
+    pub struct SocialApplication;
+
+    impl BcsApplication for SocialApplication {
+        type Abi = SocialAbi;
+
+        fn formats() -> serde_reflection::Result<Formats> {
+            let mut tracer = Tracer::new(
+                TracerConfig::default()
+                    .record_samples_for_newtype_structs(true)
+                    .record_samples_for_tuple_structs(true),
+            );
+            let samples = Samples::new();
+
+            // Trace the ABI types
+            let operation = tracer.trace_stable_enum_type::<Operation>(&samples)?;
+            let (response, _) = tracer.trace_type::<()>(&samples)?;
+            let (message, _) = tracer.trace_type::<Message>(&samples)?;
+            let (event_value, _) = tracer.trace_type::<Event>(&samples)?;
+
+            // Trace additional supporting types (notably all enums) to populate the registry
+            tracer.trace_type::<Key>(&samples)?;
+            tracer.trace_type::<OwnPost>(&samples)?;
+            tracer.trace_type::<Post>(&samples)?;
+            tracer.trace_type::<Comment>(&samples)?;
+
+            let registry = tracer.registry()?;
+
+            Ok(Formats {
+                registry,
+                operation,
+                response,
+                message,
+                event_value,
+            })
+        }
+    }
 }
 
 // Serialize keys so that the lexicographic order of the serialized keys corresponds to reverse

@@ -32,10 +32,6 @@ pub struct RocksDbConfig {
     #[arg(long)]
     max_concurrent_queries: Option<usize>,
 
-    /// The maximal number of simultaneous stream queries to the database
-    #[arg(long, default_value = "10")]
-    pub max_stream_queries: usize,
-
     /// The maximal memory used in the storage cache in bytes.
     #[arg(long, default_value = "10000000")]
     pub max_cache_size: usize,
@@ -67,6 +63,26 @@ pub struct RocksDbConfig {
     /// The maximal memory used in the find_key_values_by_prefix cache in bytes.
     #[arg(long, default_value = "10000000")]
     pub max_cache_find_key_values_size: usize,
+
+    /// The maximal number of entries in the blob cache.
+    #[arg(long, default_value = "1000")]
+    pub blob_cache_size: usize,
+
+    /// The maximal number of entries in the confirmed block cache.
+    #[arg(long, default_value = "1000")]
+    pub confirmed_block_cache_size: usize,
+
+    /// The maximal number of entries in the assembled certificate cache.
+    #[arg(long, default_value = "1000")]
+    pub certificate_cache_size: usize,
+
+    /// The maximal number of entries in the raw certificate cache.
+    #[arg(long, default_value = "1000")]
+    pub certificate_raw_cache_size: usize,
+
+    /// The maximal number of entries in the event cache.
+    #[arg(long, default_value = "1000")]
+    pub event_cache_size: usize,
 }
 
 pub type RocksDbRunner = Runner<RocksDbDatabase, RocksDbConfig>;
@@ -92,7 +108,8 @@ impl RocksDbRunner {
         let inner_config = RocksDbStoreInternalConfig {
             spawn_mode,
             path_with_guard,
-            max_stream_queries: config.client.max_stream_queries,
+            enable_statistics: false,
+            statistics_level: Default::default(),
         };
         let store_config = RocksDbStoreConfig {
             inner_config,

@@ -2,28 +2,26 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-#![cfg(any(
-    feature = "dynamodb",
-    feature = "scylladb",
-    feature = "storage-service",
-))]
+#![cfg(any(feature = "scylladb", feature = "storage-service",))]
 
 mod common;
 mod guard;
 
 use std::{env, path::PathBuf, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use guard::INTEGRATION_TEST_GUARD;
+#[cfg(any(feature = "opentelemetry", feature = "ethereum"))]
+use linera_base::vm::VmRuntime;
 use linera_base::{
     crypto::Secp256k1SecretKey,
     data_types::{Amount, BlockHeight, Epoch},
     identifiers::{Account, AccountOwner},
-    vm::VmRuntime,
 };
 use linera_core::{data_types::ChainInfoQuery, node::ValidatorNode};
 use linera_sdk::linera_base_types::AccountSecretKey;
 use linera_service::{
+    cli::command::ResourceControlPolicyOverrides,
     cli_wrappers::{
         local_net::{get_node_port, Database, LocalNetConfig, ProcessInbox},
         ClientWrapper, LineraNet, LineraNetConfig, Network, NotificationsExt,
@@ -36,9 +34,11 @@ use test_case::test_case;
 use {alloy_primitives::U256, linera_service::cli_wrappers::ApplicationWrapper};
 #[cfg(feature = "storage-service")]
 use {
-    linera_base::port::get_free_port, linera_service::cli_wrappers::Faucet, std::process::Command,
+    assert_matches::assert_matches, linera_base::port::get_free_port,
+    linera_service::cli_wrappers::Faucet, std::process::Command,
 };
 
+#[cfg(feature = "opentelemetry")]
 fn get_fungible_account_owner(client: &ClientWrapper) -> AccountOwner {
     client.get_owner().unwrap()
 }
@@ -47,10 +47,7 @@ fn get_fungible_account_owner(client: &ClientWrapper) -> AccountOwner {
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_service_grpc"))]
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Tcp) ; "storage_service_tcp"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Tcp) ; "scylladb_tcp"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Tcp) ; "aws_tcp"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Udp) ; "aws_udp"))]
 #[test_log::test(tokio::test)]
 async fn test_end_to_end_reconfiguration(config: LocalNetConfig) -> Result<()> {
     let _guard: tokio::sync::MutexGuard<'_, ()> = INTEGRATION_TEST_GUARD.lock().await;
@@ -88,12 +85,12 @@ async fn test_end_to_end_reconfiguration(config: LocalNetConfig) -> Result<()> {
         .await?;
     let port = get_node_port().await;
     let mut node_service_2 = match network {
-        Network::Grpc | Network::Grpcs => {
+        Network::Grpc | Network::Grpcs | Network::Tcp => {
             let service = client_2.run_node_service(port, ProcessInbox::Skip).await?;
             let notifications = service.notifications(chain_1).await?;
             Some((service, notifications))
         }
-        Network::Tcp | Network::Udp => None,
+        Network::Udp => None,
     };
 
     client.query_validators(None).await?;
@@ -161,7 +158,11 @@ async fn test_end_to_end_reconfiguration(config: LocalNetConfig) -> Result<()> {
     client.query_validators(None).await?;
     client.query_validators(Some(chain_1)).await?;
 
-    if matches!(network, Network::Grpc) {
+    // The faucet's node learns about committee changes via notifications.
+    // Notification subscriptions are connection-oriented — the server streams them
+    // back over a held-open connection — so they work over gRPC and TCP but not
+    // over UDP.
+    if !matches!(network, Network::Udp) {
         assert!(
             eventually(|| async { faucet.current_validators().await.unwrap().len() == 6 }).await
         );
@@ -172,7 +173,7 @@ async fn test_end_to_end_reconfiguration(config: LocalNetConfig) -> Result<()> {
         .remove_validator(&net.validator_keys(4).unwrap().0)
         .await?;
     net.remove_validator(4)?;
-    if matches!(network, Network::Grpc) {
+    if !matches!(network, Network::Udp) {
         assert!(
             eventually(|| async { faucet.current_validators().await.unwrap().len() == 5 }).await
         )
@@ -190,10 +191,11 @@ async fn test_end_to_end_reconfiguration(config: LocalNetConfig) -> Result<()> {
         assert!(!service.process_inbox(&chain_2).await?.is_empty());
         client.revoke_epochs(Epoch(1)).await?;
         notifications.wait_for_events(None).await?;
-        assert!(!service.process_inbox(&chain_2).await.unwrap().is_empty());
-        let committees = service.query_committees(&chain_2).await?;
-        let epochs = committees.into_keys().collect::<Vec<_>>();
-        assert_eq!(&epochs, &[Epoch(2)]);
+        // Revocation no longer requires per-chain processing, so process_inbox on
+        // chain_2 may have nothing to do — but the chain's current epoch remains the
+        // last one it advanced to via `ProcessNewEpoch`.
+        service.process_inbox(&chain_2).await?;
+        assert_eq!(service.query_chain_epoch(&chain_2).await?, Epoch(2));
     } else {
         client_2.process_inbox(chain_2).await?;
         client.revoke_epochs(Epoch(1)).await?;
@@ -213,10 +215,8 @@ async fn test_end_to_end_reconfiguration(config: LocalNetConfig) -> Result<()> {
         assert!(!service.process_inbox(&chain_2).await.unwrap().is_empty());
         client.revoke_epochs(Epoch(2)).await?;
         notifications.wait_for_events(None).await?;
-        assert!(!service.process_inbox(&chain_2).await?.is_empty());
-        let committees = service.query_committees(&chain_2).await?;
-        let epochs = committees.into_keys().collect::<Vec<_>>();
-        assert_eq!(&epochs, &[Epoch(3)]);
+        service.process_inbox(&chain_2).await?;
+        assert_eq!(service.query_chain_epoch(&chain_2).await?, Epoch(3));
     } else {
         client_2.process_inbox(chain_2).await?;
         client.revoke_epochs(Epoch(2)).await?;
@@ -248,9 +248,7 @@ async fn test_end_to_end_reconfiguration(config: LocalNetConfig) -> Result<()> {
         assert!(!service.process_inbox(&chain_2).await?.is_empty());
         let balance = service.balance(&account_recipient).await?;
         assert_eq!(balance, Amount::from_tokens(5));
-        let committees = service.query_committees(&chain_2).await?;
-        let epochs = committees.into_keys().collect::<Vec<_>>();
-        assert_eq!(&epochs, &[Epoch(3)]);
+        assert_eq!(service.query_chain_epoch(&chain_2).await?, Epoch(3));
 
         service.ensure_is_running()?;
     } else {
@@ -262,7 +260,10 @@ async fn test_end_to_end_reconfiguration(config: LocalNetConfig) -> Result<()> {
         );
     }
 
-    if matches!(network, Network::Grpc) {
+    // A fresh client joins via the faucet after epochs 0-2 have been revoked and the
+    // original validators are gone: it trusts the faucet for the current committee
+    // and synchronizes the admin chain from it.
+    if !matches!(network, Network::Udp) {
         let client = net.make_client().await;
         client.wallet_init(Some(&faucet)).await?;
         let (chain_id, _owner) = client.request_chain(&faucet, true).await?;
@@ -286,10 +287,7 @@ async fn test_end_to_end_reconfiguration(config: LocalNetConfig) -> Result<()> {
 /// The epoch change messages are protected, and can't be rejected.
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_service_grpc"))]
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Tcp) ; "storage_service_tcp"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Tcp) ; "scylladb_tcp"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Tcp) ; "aws_tcp"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Udp) ; "aws_udp"))]
 #[test_log::test(tokio::test)]
 async fn test_end_to_end_receipt_of_old_create_committee_messages(
     config: LocalNetConfig,
@@ -383,10 +381,7 @@ async fn test_end_to_end_receipt_of_old_create_committee_messages(
 /// The epoch change messages are protected, and can't be rejected.
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_service_grpc"))]
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Tcp) ; "storage_service_tcp"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Tcp) ; "scylladb_tcp"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Tcp) ; "aws_tcp"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Udp) ; "aws_udp"))]
 #[test_log::test(tokio::test)]
 async fn test_end_to_end_receipt_of_old_remove_committee_messages(
     config: LocalNetConfig,
@@ -523,8 +518,9 @@ async fn test_end_to_end_receipt_of_old_remove_committee_messages(
 }
 
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_service_grpc"))]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Tcp) ; "storage_service_tcp"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
+#[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Tcp) ; "scylladb_tcp"))]
 #[test_log::test(tokio::test)]
 async fn test_end_to_end_retry_notification_stream(config: LocalNetConfig) -> Result<()> {
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
@@ -590,9 +586,242 @@ async fn test_end_to_end_retry_notification_stream(config: LocalNetConfig) -> Re
     Ok(())
 }
 
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_service_grpc"))]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Tcp) ; "storage_service_tcp"))]
+#[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
+#[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Tcp) ; "scylladb_tcp"))]
+#[test_log::test(tokio::test)]
+async fn test_wasm_end_to_end_update_stream_splitting(config: impl LineraNetConfig) -> Result<()> {
+    use event_emitter::EventEmitterAbi;
+    use event_subscriber::EventSubscriberAbi;
+
+    let _guard = INTEGRATION_TEST_GUARD.lock().await;
+    tracing::info!("Starting test {}", test_name!());
+
+    let (mut net, client) = config.instantiate().await?;
+
+    let emitter_chain1 = client
+        .open_and_assign(&client, Amount::from_tokens(100))
+        .await?;
+    let emitter_chain2 = client
+        .open_and_assign(&client, Amount::from_tokens(100))
+        .await?;
+    let subscriber_chain = client
+        .open_and_assign(&client, Amount::from_tokens(100))
+        .await?;
+
+    let (emitter_contract, emitter_service) = client.build_test_example("event-emitter").await?;
+    let emitter_module_id = client
+        .publish_module::<EventEmitterAbi, (), ()>(
+            emitter_contract,
+            emitter_service,
+            linera_base::vm::VmRuntime::Wasm,
+            None,
+        )
+        .await?;
+
+    let emitter_app1 = client
+        .create_application(&emitter_module_id, &(), &(), &[], Some(emitter_chain1))
+        .await?;
+    let emitter_app2 = client
+        .create_application(&emitter_module_id, &(), &(), &[], Some(emitter_chain2))
+        .await?;
+
+    let (subscriber_contract, subscriber_service) =
+        client.build_test_example("event-subscriber").await?;
+    let subscriber_module_id = client
+        .publish_module::<EventSubscriberAbi, (), ()>(
+            subscriber_contract,
+            subscriber_service,
+            linera_base::vm::VmRuntime::Wasm,
+            None,
+        )
+        .await?;
+
+    let subscriber_app1 = client
+        .create_application(
+            &subscriber_module_id,
+            &(),
+            &(),
+            &[emitter_app1.forget_abi()],
+            Some(subscriber_chain),
+        )
+        .await?;
+    let subscriber_app2 = client
+        .create_application(
+            &subscriber_module_id,
+            &(),
+            &(),
+            &[emitter_app1.forget_abi()],
+            Some(subscriber_chain),
+        )
+        .await?;
+
+    let port = get_node_port().await;
+    let node_service = client.run_node_service(port, ProcessInbox::Skip).await?;
+
+    // Two emitting applications on their own chains, and two subscribing applications on
+    // one chain, each subscribing to both emitting applications.
+    // This way, we should get 4 UpdateStream operations: 1 for each (emitter, subscriber)
+    // pair.
+    let sub_app1 = node_service.make_application(&subscriber_chain, &subscriber_app1)?;
+    let sub_app2 = node_service.make_application(&subscriber_chain, &subscriber_app2)?;
+    let emit1 = node_service.make_application(&emitter_chain1, &emitter_app1)?;
+    let emit2 = node_service.make_application(&emitter_chain2, &emitter_app2)?;
+
+    sub_app1
+        .mutate(format!(
+            "subscribe(chainId: \"{emitter_chain1}\", applicationId: \"{}\", streamName: \"s\")",
+            emitter_app1.forget_abi()
+        ))
+        .await?;
+    sub_app1
+        .mutate(format!(
+            "subscribe(chainId: \"{emitter_chain2}\", applicationId: \"{}\", streamName: \"s\")",
+            emitter_app2.forget_abi()
+        ))
+        .await?;
+    sub_app2
+        .mutate(format!(
+            "subscribe(chainId: \"{emitter_chain1}\", applicationId: \"{}\", streamName: \"s\")",
+            emitter_app1.forget_abi()
+        ))
+        .await?;
+    sub_app2
+        .mutate(format!(
+            "subscribe(chainId: \"{emitter_chain2}\", applicationId: \"{}\", streamName: \"s\")",
+            emitter_app2.forget_abi()
+        ))
+        .await?;
+
+    emit1
+        .mutate("emit(streamName: \"s\", value: \"e1a\")")
+        .await?;
+    emit1
+        .mutate("emit(streamName: \"s\", value: \"e1b\")")
+        .await?;
+    emit2
+        .mutate("emit(streamName: \"s\", value: \"e2a\")")
+        .await?;
+    emit2
+        .mutate("emit(streamName: \"s\", value: \"e2b\")")
+        .await?;
+
+    let (_, height_before) = node_service
+        .chain_tip(subscriber_chain)
+        .await?
+        .context("subscriber chain should exist")?;
+
+    node_service.process_inbox(&subscriber_chain).await?;
+
+    let (_, height_after_default) = node_service
+        .chain_tip(subscriber_chain)
+        .await?
+        .context("subscriber chain should exist")?;
+
+    let blocks_used = height_after_default.0 - height_before.0;
+    tracing::info!(
+        "With default block size: processed 4 UpdateStream operations in {blocks_used} block(s) \
+         (height {height_before} -> {height_after_default})"
+    );
+    assert_eq!(
+        blocks_used, 1,
+        "With default block size, all 4 operations should fit in 1 block, but used {blocks_used}"
+    );
+
+    let query = "receivedEvents { entries(start: 0, end: 10) }";
+    let response = sub_app1.query(query).await?;
+    let events = response["receivedEvents"]["entries"]
+        .as_array()
+        .context("expected array")?;
+    assert_eq!(events.len(), 4, "Expected 4 events, got {events:?}");
+    let response = sub_app2.query(query).await?;
+    let events = response["receivedEvents"]["entries"]
+        .as_array()
+        .context("expected array")?;
+    assert_eq!(events.len(), 4, "Expected 4 events, got {events:?}");
+
+    node_service.terminate().await?;
+
+    client
+        .set_resource_control_policy(ResourceControlPolicyOverrides {
+            maximum_block_size: Some(500),
+            ..Default::default()
+        })
+        .await
+        .context("Failed to set resource control policy")?;
+
+    let mut node_service = client.run_node_service(port, ProcessInbox::Skip).await?;
+
+    let sub_app1 = node_service.make_application(&subscriber_chain, &subscriber_app1)?;
+    let sub_app2 = node_service.make_application(&subscriber_chain, &subscriber_app2)?;
+    let emit1 = node_service.make_application(&emitter_chain1, &emitter_app1)?;
+    let emit2 = node_service.make_application(&emitter_chain2, &emitter_app2)?;
+
+    node_service.process_inbox(&subscriber_chain).await?;
+
+    emit1
+        .mutate("emit(streamName: \"s\", value: \"e1c\")")
+        .await?;
+    emit1
+        .mutate("emit(streamName: \"s\", value: \"e1d\")")
+        .await?;
+    emit2
+        .mutate("emit(streamName: \"s\", value: \"e2c\")")
+        .await?;
+    emit2
+        .mutate("emit(streamName: \"s\", value: \"e2d\")")
+        .await?;
+
+    let (_, height_before_small) = node_service
+        .chain_tip(subscriber_chain)
+        .await?
+        .context("subscriber chain should exist")?;
+
+    node_service.process_inbox(&subscriber_chain).await?;
+
+    let (_, height_after_small) = node_service
+        .chain_tip(subscriber_chain)
+        .await?
+        .context("subscriber chain should exist")?;
+
+    let response = sub_app1.query(query).await?;
+    let events = response["receivedEvents"]["entries"]
+        .as_array()
+        .context("expected array")?;
+    assert!(
+        events.len() >= 8,
+        "Expected at least 8 events total, got {events:?}"
+    );
+    let response = sub_app2.query(query).await?;
+    let events = response["receivedEvents"]["entries"]
+        .as_array()
+        .context("expected array")?;
+    assert!(
+        events.len() >= 8,
+        "Expected at least 8 events total, got {events:?}"
+    );
+
+    let blocks_used_small = height_after_small.0 - height_before_small.0;
+    tracing::info!(
+        "With small block size: processed 4 UpdateStream operations in {blocks_used_small} block(s) \
+         (height {height_before_small} -> {height_after_small})"
+    );
+    assert_eq!(
+        blocks_used_small, 4,
+        "With small block size, 4 operations should require 4 blocks, \
+         but used {blocks_used_small}"
+    );
+
+    node_service.ensure_is_running()?;
+    net.ensure_is_running().await?;
+    net.terminate().await?;
+
+    Ok(())
+}
+
 #[cfg_attr(feature = "storage-service", test_case(Database::Service, Network::Grpc ; "storage_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(Database::ScyllaDb, Network::Grpc ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(Database::DynamoDb, Network::Grpc ; "aws_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_project_publish(database: Database, network: Network) -> Result<()> {
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
@@ -631,7 +860,6 @@ async fn test_project_publish(database: Database, network: Network) -> Result<()
 
 #[cfg_attr(feature = "storage-service", test_case(Database::Service, Network::Grpc ; "storage_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(Database::ScyllaDb, Network::Grpc ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(Database::DynamoDb, Network::Grpc ; "aws_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_example_publish(database: Database, network: Network) -> Result<()> {
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
@@ -708,8 +936,6 @@ async fn test_storage_service_linera_net_up_simple() -> Result<()> {
         "net",
         "up",
         "--with-faucet",
-        "--faucet-chain",
-        "1",
         "--faucet-port",
         &port.to_string(),
     ]);
@@ -759,7 +985,7 @@ async fn test_storage_service_linera_net_up_simple() -> Result<()> {
         .join("\n"));
 
     // Test faucet.
-    let faucet = Faucet::new(format!("http://localhost:{}/", port));
+    let faucet = Faucet::new(format!("http://localhost:{port}/"));
     faucet.version_info().await.unwrap();
 
     // Send SIGINT to the child process.
@@ -771,18 +997,29 @@ async fn test_storage_service_linera_net_up_simple() -> Result<()> {
     return Ok(());
 }
 
-#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_service_grpc"))]
-#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Tcp) ; "storage_service_tcp"))]
-#[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
-#[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Tcp) ; "scylladb_tcp"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Tcp) ; "aws_tcp"))]
+#[cfg_attr(
+    all(feature = "storage-service", feature = "opentelemetry"),
+    test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_service_grpc")
+)]
+#[cfg_attr(
+    all(feature = "storage-service", feature = "opentelemetry"),
+    test_case(LocalNetConfig::new_test(Database::Service, Network::Tcp) ; "storage_service_tcp")
+)]
+#[cfg_attr(
+    all(feature = "scylladb", feature = "opentelemetry"),
+    test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc")
+)]
+#[cfg_attr(
+    all(feature = "scylladb", feature = "opentelemetry"),
+    test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Tcp) ; "scylladb_tcp")
+)]
+#[cfg(feature = "opentelemetry")]
 #[test_log::test(tokio::test)]
 async fn test_end_to_end_benchmark(mut config: LocalNetConfig) -> Result<()> {
     use std::collections::BTreeMap;
 
     use fungible::{FungibleTokenAbi, InitialState, Parameters};
-    use linera_service::cli::command::{BenchmarkCommand, BenchmarkOptions};
+    use linera_service::cli::command::{BenchmarkCommand, BenchmarkOptions, ClientMode};
 
     config.num_other_initial_chains = 2;
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
@@ -838,6 +1075,42 @@ async fn test_end_to_end_benchmark(mut config: LocalNetConfig) -> Result<()> {
         })
         .await?;
 
+    // And once more with the storage-free client, which proposes blocks straight to the
+    // validators instead of going through a ChainClient. It shares every other part of the
+    // harness, so this is what proves the two are actually interchangeable.
+    client
+        .benchmark(BenchmarkCommand::Single {
+            options: BenchmarkOptions {
+                num_chains: 2,
+                transactions_per_block: 10,
+                bps: 2,
+                runtime_in_seconds: Some(5),
+                client_mode: ClientMode::Lite,
+                close_chains: true,
+                ..Default::default()
+            },
+        })
+        .await?;
+
+    // Cross-chain traffic at a pinned fan-out, with roughly half the transfers staying on
+    // their own chain: exercises the destination window, the inbox draining the lite client
+    // does by default, and `avoid_self` on the generator.
+    client
+        .benchmark(BenchmarkCommand::Single {
+            options: BenchmarkOptions {
+                num_chains: 2,
+                transactions_per_block: 10,
+                bps: 2,
+                runtime_in_seconds: Some(5),
+                client_mode: ClientMode::Lite,
+                fan_out: Some(1),
+                mixed_self_transfers: true,
+                close_chains: true,
+                ..Default::default()
+            },
+        })
+        .await?;
+
     net.ensure_is_running().await?;
     net.terminate().await?;
 
@@ -850,10 +1123,7 @@ async fn test_end_to_end_benchmark(mut config: LocalNetConfig) -> Result<()> {
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_service_grpc"))]
 // #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Tcp) ; "storage_service_tcp"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 // #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Tcp) ; "scylladb_tcp"))]
-// #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Tcp) ; "aws_tcp"))]
-// #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Udp) ; "aws_udp"))]
 #[test_log::test(tokio::test)]
 async fn test_sync_validator(config: LocalNetConfig) -> Result<()> {
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
@@ -911,16 +1181,78 @@ async fn test_sync_validator(config: LocalNetConfig) -> Result<()> {
     Ok(())
 }
 
+/// Tests that `validator benchmark` runs every read-side layer against a live
+/// validator and emits a well-formed report (JSON to a file, brief to stdout).
+#[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
+#[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_service_grpc"))]
+#[test_log::test(tokio::test)]
+async fn test_validator_benchmark(config: LocalNetConfig) -> Result<()> {
+    let _guard = INTEGRATION_TEST_GUARD.lock().await;
+    tracing::info!("Starting test {}", test_name!());
+
+    let (mut net, client) = config.instantiate().await?;
+    let chain = client.default_chain().expect("Client has no default chain");
+    let validator_address = net.validator_address(0);
+
+    let dir = tempfile::tempdir()?;
+    let json_path = dir.path().join("report.json");
+
+    // Keep every layer small so the test stays fast; --deep is intentionally off.
+    let stdout = client
+        .validator_benchmark(
+            validator_address,
+            [&chain],
+            &[
+                "--baseline-requests",
+                "5",
+                "--stress-levels",
+                "1,2",
+                "--stress-duration-secs",
+                "1",
+                "--bulk-batch-size",
+                "10",
+                "--bulk-concurrency",
+                "1",
+                "--tip-lag-samples",
+                "1",
+                "--tip-lag-interval-secs",
+                "1",
+                "--observer-location",
+                "integration-test",
+                "--output",
+                &format!("json:{},brief", json_path.display()),
+            ],
+        )
+        .await?;
+
+    // The brief recap goes to stdout.
+    assert!(stdout.contains("Validator Benchmark"));
+    assert!(stdout.contains("integration-test"));
+
+    // The JSON report must parse and carry every read-side layer; partial_sync
+    // is absent because --deep was not passed.
+    let json = std::fs::read_to_string(&json_path)?;
+    let report: serde_json::Value = serde_json::from_str(&json)?;
+    assert!(report["metadata"]["candidate"]["address"].is_string());
+    assert!(report["layers"]["preflight"].is_object());
+    assert!(report["layers"]["read_baseline"]["per_chain"].is_array());
+    assert!(report["layers"]["read_stress"]["per_chain"].is_array());
+    assert!(report["layers"]["bulk_download"]["per_chain"].is_array());
+    assert!(report["layers"]["tip_lag"]["per_chain"].is_array());
+    assert!(report["layers"]["partial_sync"].is_null());
+
+    net.ensure_is_running().await?;
+    net.terminate().await?;
+    Ok(())
+}
+
 /// Tests if a validator can process blocks on a child chain without syncing the parent
 /// chain.
 // #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Udp) ; "scylladb_udp"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_service_grpc"))]
 // #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Tcp) ; "storage_service_tcp"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 // #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Tcp) ; "scylladb_tcp"))]
-// #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Tcp) ; "aws_tcp"))]
-// #[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Udp) ; "aws_udp"))]
 #[test_log::test(tokio::test)]
 async fn test_sync_child_chain(config: LocalNetConfig) -> Result<()> {
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
@@ -1003,7 +1335,6 @@ async fn test_sync_child_chain(config: LocalNetConfig) -> Result<()> {
 
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_service_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_update_validator_sender_gaps(config: LocalNetConfig) -> Result<()> {
     let _guard = INTEGRATION_TEST_GUARD.lock().await;
@@ -1104,7 +1435,6 @@ async fn test_update_validator_sender_gaps(config: LocalNetConfig) -> Result<()>
 #[cfg(feature = "ethereum")]
 #[cfg_attr(feature = "storage-service", test_case(LocalNetConfig::new_test(Database::Service, Network::Grpc) ; "storage_test_service_grpc"))]
 #[cfg_attr(feature = "scylladb", test_case(LocalNetConfig::new_test(Database::ScyllaDb, Network::Grpc) ; "scylladb_grpc"))]
-#[cfg_attr(feature = "dynamodb", test_case(LocalNetConfig::new_test(Database::DynamoDb, Network::Grpc) ; "aws_grpc"))]
 #[test_log::test(tokio::test)]
 async fn test_wasm_end_to_end_ethereum_tracker(config: impl LineraNetConfig) -> Result<()> {
     use ethereum_tracker::{EthereumTrackerAbi, InstantiationArgument};
@@ -1210,10 +1540,7 @@ struct EthereumTrackerApp(ApplicationWrapper<ethereum_tracker::EthereumTrackerAb
 impl EthereumTrackerApp {
     async fn get_amount(&self, account_owner: &str) -> U256 {
         use ethereum_tracker::U256Cont;
-        let query = format!(
-            "accounts {{ entry(key: \"{}\") {{ value }} }}",
-            account_owner
-        );
+        let query = format!("accounts {{ entry(key: \"{account_owner}\") {{ value }} }}");
         let response_body = self.0.query(&query).await.unwrap();
         let amount_option = serde_json::from_value::<Option<U256Cont>>(
             response_body["accounts"]["entry"]["value"].clone(),
@@ -1236,7 +1563,7 @@ impl EthereumTrackerApp {
     }
 
     async fn update(&self, to_block: u64) {
-        let mutation = format!("update(toBlock: {})", to_block);
+        let mutation = format!("update(toBlock: {to_block})");
         self.0.mutate(mutation).await.unwrap();
     }
 }
@@ -1288,7 +1615,7 @@ async fn test_node_service_with_task_processor() -> Result<()> {
     let port = get_node_port().await;
     let operators = vec![("echo".to_string(), operator_path)];
     let mut node_service = client
-        .run_node_service_with_options(port, ProcessInbox::Skip, &[app_id], &operators)
+        .run_node_service_with_options(port, ProcessInbox::Skip, &[app_id], &operators, false)
         .await?;
 
     node_service.ensure_is_running()?;
@@ -1326,6 +1653,268 @@ async fn test_node_service_with_task_processor() -> Result<()> {
     // Check that the task was processed (task count should be 1).
     let task_count: u64 = app.query_json("taskCount").await?;
     assert_eq!(task_count, 1);
+
+    net.ensure_is_running().await?;
+    net.terminate().await?;
+
+    Ok(())
+}
+
+/// Test that a slow task does not delay the outcome of a distinctly identified sibling: the
+/// example application gives every task an id, so each one is a group of its own.
+#[cfg(feature = "storage-service")]
+#[test_log::test(tokio::test)]
+async fn test_task_processor_slow_task_does_not_delay_siblings() -> Result<()> {
+    use std::{io::Write, os::unix::fs::PermissionsExt};
+
+    use linera_base::{abi::ContractAbi, identifiers::ApplicationId};
+
+    struct TaskProcessorAbi;
+
+    impl ContractAbi for TaskProcessorAbi {
+        type Operation = ();
+        type Response = ();
+    }
+
+    let _guard = INTEGRATION_TEST_GUARD.lock().await;
+    tracing::info!("Starting test {}", test_name!());
+
+    let config = LocalNetConfig::new_test(Database::Service, Network::Grpc);
+    let (mut net, client) = config.instantiate().await?;
+    let chain = client.load_wallet()?.default_chain().unwrap();
+
+    // Publish and create the task-processor example application.
+    let example_dir = ClientWrapper::example_path("task-processor")?;
+    let app_id_str = client
+        .project_publish(example_dir, vec![], None, &())
+        .await?;
+    let app_id: ApplicationId = app_id_str.trim().parse()?;
+
+    // Create a slow operator that sleeps before echoing its input.
+    let tmp_dir = tempfile::tempdir()?;
+    let slow_path = tmp_dir.path().join("slow-operator");
+    {
+        let mut file = std::fs::File::create(&slow_path)?;
+        writeln!(file, "#!/bin/sh")?;
+        writeln!(file, "sleep 5")?;
+        writeln!(file, "cat")?;
+    }
+    std::fs::set_permissions(&slow_path, std::fs::Permissions::from_mode(0o755))?;
+
+    // Create a fast operator that echoes immediately.
+    let fast_path = tmp_dir.path().join("fast-operator");
+    {
+        let mut file = std::fs::File::create(&fast_path)?;
+        writeln!(file, "#!/bin/sh")?;
+        writeln!(file, "cat")?;
+    }
+    std::fs::set_permissions(&fast_path, std::fs::Permissions::from_mode(0o755))?;
+
+    // Start the node service with both operators.
+    let port = get_node_port().await;
+    let operators = vec![
+        ("slow".to_string(), slow_path),
+        ("fast".to_string(), fast_path),
+    ];
+    let mut node_service = client
+        .run_node_service_with_options(port, ProcessInbox::Skip, &[app_id], &operators, false)
+        .await?;
+
+    node_service.ensure_is_running()?;
+
+    // Subscribe to notifications for the chain.
+    let mut notifications = Box::pin(node_service.notifications(chain).await?);
+
+    let app = node_service.make_application(&chain, &app_id.with_abi::<TaskProcessorAbi>())?;
+
+    // Submit both tasks in a single block: slow first, then fast.
+    // The slow task takes longer but should have its result stored first.
+    app.multiple_mutate(&[
+        r#"requestTask(operator: "slow", input: "slow_result")"#.to_string(),
+        r#"requestTask(operator: "fast", input: "fast_result")"#.to_string(),
+    ])
+    .await?;
+
+    // Wait for the block containing the RequestTask operations.
+    notifications.wait_for_block(None).await?;
+
+    // Wait for the first block containing a StoreResult operation. It must be the one of the
+    // fast task, submitted while the slow task requested before it is still running.
+    notifications.wait_for_block(None).await?;
+    let results: Vec<String> = app.query_json("results").await?;
+    assert_eq!(results, vec!["fast_result"]);
+
+    // Wait for the block containing the StoreResult operation of the slow task.
+    notifications.wait_for_block(None).await?;
+
+    let task_count: u64 = app.query_json("taskCount").await?;
+    assert_eq!(task_count, 2);
+    let results: Vec<String> = app.query_json("results").await?;
+    assert_eq!(results, vec!["fast_result", "slow_result"]);
+
+    net.ensure_is_running().await?;
+    net.terminate().await?;
+
+    Ok(())
+}
+
+/// Test that a task failing on every attempt does not hold back the outcomes of the other
+/// tasks in its batch.
+#[cfg(feature = "storage-service")]
+#[test_log::test(tokio::test)]
+async fn test_task_processor_failing_task_does_not_block_siblings() -> Result<()> {
+    use std::{io::Write, os::unix::fs::PermissionsExt};
+
+    use linera_base::{abi::ContractAbi, identifiers::ApplicationId};
+
+    struct TaskProcessorAbi;
+
+    impl ContractAbi for TaskProcessorAbi {
+        type Operation = ();
+        type Response = ();
+    }
+
+    let _guard = INTEGRATION_TEST_GUARD.lock().await;
+    tracing::info!("Starting test {}", test_name!());
+
+    let config = LocalNetConfig::new_test(Database::Service, Network::Grpc);
+    let (mut net, client) = config.instantiate().await?;
+    let chain = client.load_wallet()?.default_chain().unwrap();
+
+    // Publish and create the task-processor example application.
+    let example_dir = ClientWrapper::example_path("task-processor")?;
+    let app_id_str = client
+        .project_publish(example_dir, vec![], None, &())
+        .await?;
+    let app_id: ApplicationId = app_id_str.trim().parse()?;
+
+    // Create an operator that always fails, and one that echoes its input.
+    let tmp_dir = tempfile::tempdir()?;
+    let failing_path = tmp_dir.path().join("failing-operator");
+    {
+        let mut file = std::fs::File::create(&failing_path)?;
+        writeln!(file, "#!/bin/sh")?;
+        writeln!(file, "exit 1")?;
+    }
+    std::fs::set_permissions(&failing_path, std::fs::Permissions::from_mode(0o755))?;
+
+    let fast_path = tmp_dir.path().join("fast-operator");
+    {
+        let mut file = std::fs::File::create(&fast_path)?;
+        writeln!(file, "#!/bin/sh")?;
+        writeln!(file, "cat")?;
+    }
+    std::fs::set_permissions(&fast_path, std::fs::Permissions::from_mode(0o755))?;
+
+    // Start the node service with both operators.
+    let port = get_node_port().await;
+    let operators = vec![
+        ("failing".to_string(), failing_path),
+        ("fast".to_string(), fast_path),
+    ];
+    let mut node_service = client
+        .run_node_service_with_options(port, ProcessInbox::Skip, &[app_id], &operators, false)
+        .await?;
+
+    node_service.ensure_is_running()?;
+
+    // Subscribe to notifications for the chain.
+    let mut notifications = Box::pin(node_service.notifications(chain).await?);
+
+    let app = node_service.make_application(&chain, &app_id.with_abi::<TaskProcessorAbi>())?;
+
+    // Submit both tasks in a single block, the failing one first.
+    app.multiple_mutate(&[
+        r#"requestTask(operator: "failing", input: "never_stored")"#.to_string(),
+        r#"requestTask(operator: "fast", input: "fast_result")"#.to_string(),
+    ])
+    .await?;
+
+    // Wait for the block containing the RequestTask operations, then for the block
+    // containing the StoreResult operation of the task that succeeded.
+    notifications.wait_for_block(None).await?;
+    notifications.wait_for_block(None).await?;
+
+    let task_count: u64 = app.query_json("taskCount").await?;
+    assert_eq!(task_count, 1);
+    let results: Vec<String> = app.query_json("results").await?;
+    assert_eq!(results, vec!["fast_result"]);
+
+    // The failing task is still pending, and is the only one retried.
+    let response = app.query("nextActions(now: 0)").await?;
+    let tasks = response["nextActions"]["execute_tasks"]
+        .as_array()
+        .expect("expected a list of tasks")
+        .clone();
+    assert_eq!(
+        tasks.len(),
+        1,
+        "Expected only the failing task, got: {tasks:?}"
+    );
+    assert_eq!(tasks[0]["operator"], "failing");
+
+    net.ensure_is_running().await?;
+    net.terminate().await?;
+
+    Ok(())
+}
+
+/// Test that the node service read-only mode disables mutations and prevents query-triggered operations.
+#[cfg(feature = "storage-service")]
+#[test_log::test(tokio::test)]
+async fn test_node_service_read_only_mode() -> Result<()> {
+    let _guard = INTEGRATION_TEST_GUARD.lock().await;
+    tracing::info!("Starting test {}", test_name!());
+
+    let config = LocalNetConfig::new_test(Database::Service, Network::Grpc);
+    let (mut net, client) = config.instantiate().await?;
+    let chain = client.load_wallet()?.default_chain().unwrap();
+    let owner = client.get_owner().unwrap();
+
+    // Start the node service in read-only mode.
+    let port = get_node_port().await;
+    let mut node_service = client
+        .run_node_service_with_options(port, ProcessInbox::Skip, &[], &[], true)
+        .await?;
+
+    node_service.ensure_is_running()?;
+
+    // Verify that queries work by checking the chain balance.
+    let chain_account = Account::chain(chain);
+    let balance = node_service.balance(&chain_account).await?;
+    assert!(balance > Amount::ZERO, "Expected chain to have balance");
+
+    // Verify that mutations are disabled by trying to transfer.
+    // In read-only mode, the mutation type doesn't exist in the schema, so this should fail.
+    let recipient = Account::new(chain, owner);
+    let result = node_service
+        .transfer(
+            chain,
+            AccountOwner::CHAIN,
+            recipient,
+            Amount::from_tokens(1),
+        )
+        .await;
+    assert_matches!(result, Err(_));
+
+    // Terminate the read-only mode service.
+    node_service.terminate().await?;
+
+    // Restart the node service without read-only mode.
+    let mut node_service = client
+        .run_node_service_with_options(port, ProcessInbox::Skip, &[], &[], false)
+        .await?;
+    node_service.ensure_is_running()?;
+
+    // Verify that mutations now succeed by transferring from chain to owner.
+    node_service
+        .transfer(
+            chain,
+            AccountOwner::CHAIN,
+            recipient,
+            Amount::from_tokens(1),
+        )
+        .await?;
 
     net.ensure_is_running().await?;
     net.terminate().await?;

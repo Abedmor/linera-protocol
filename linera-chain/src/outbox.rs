@@ -1,6 +1,8 @@
 // Copyright (c) Zefchain Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::BTreeSet;
+
 use allocative::Allocative;
 use linera_base::data_types::{ArithmeticError, BlockHeight};
 #[cfg(with_testing)]
@@ -18,20 +20,19 @@ use linera_views::{
 mod outbox_tests;
 
 #[cfg(with_metrics)]
-mod metrics {
-    use std::sync::LazyLock;
-
+pub(crate) mod metrics {
     use linera_base::prometheus_util::{exponential_bucket_interval, register_histogram_vec};
     use prometheus::HistogramVec;
 
-    pub static OUTBOX_SIZE: LazyLock<HistogramVec> = LazyLock::new(|| {
-        register_histogram_vec(
-            "outbox_size",
-            "Outbox size",
-            &[],
-            exponential_bucket_interval(1.0, 10_000.0),
-        )
-    });
+    linera_base::declare_metrics! {
+        pub static OUTBOX_SIZE: HistogramVec =
+            register_histogram_vec(
+                "outbox_size",
+                "Outbox size",
+                &[],
+                exponential_bucket_interval(1.0, 1_000_000.0),
+            );
+    }
 }
 
 /// The state of an outbox
@@ -46,7 +47,7 @@ mod metrics {
 #[allocative(bound = "C")]
 pub struct OutboxStateView<C>
 where
-    C: Context + Send + Sync + 'static,
+    C: Context + 'static,
 {
     /// The minimum block height accepted in the future.
     pub next_height_to_schedule: RegisterView<C, BlockHeight>,
@@ -57,7 +58,7 @@ where
 
 impl<C> OutboxStateView<C>
 where
-    C: Context + Clone + Send + Sync + 'static,
+    C: Context + Clone + 'static,
 {
     /// Schedules a message at the given height if we haven't already.
     /// Returns true if a change was made.
@@ -70,11 +71,32 @@ where
         }
         self.next_height_to_schedule.set(height.try_add_one()?);
         self.queue.push_back(height);
-        #[cfg(with_metrics)]
-        metrics::OUTBOX_SIZE
-            .with_label_values(&[])
-            .observe(self.queue.count() as f64);
         Ok(true)
+    }
+
+    /// Re-adds heights to the outbox queue by merging them with existing entries.
+    /// Used by the `RevertConfirm` mechanism to undo a previous confirmation.
+    /// Returns the heights that were newly added.
+    pub async fn revert(
+        &mut self,
+        heights_to_add: &[BlockHeight],
+    ) -> Result<Vec<BlockHeight>, ViewError> {
+        let existing = self.queue.elements().await?;
+        let mut all_heights = existing.iter().copied().collect::<BTreeSet<_>>();
+        let new_heights = heights_to_add
+            .iter()
+            .filter(|h| !all_heights.contains(h))
+            .copied()
+            .collect::<Vec<_>>();
+        if new_heights.is_empty() {
+            return Ok(Vec::new());
+        }
+        all_heights.extend(new_heights.iter().copied());
+        self.clear();
+        for h in &all_heights {
+            self.schedule_message(*h).map_err(ViewError::from)?;
+        }
+        Ok(new_heights)
     }
 
     /// Marks all messages as received up to the given height.

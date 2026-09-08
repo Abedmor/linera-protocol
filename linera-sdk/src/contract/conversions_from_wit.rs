@@ -5,12 +5,12 @@
 
 use linera_base::{
     crypto::CryptoHash,
-    data_types::{Amount, StreamUpdate},
+    data_types::{Amount, StreamUpdate, Timestamp},
     identifiers::{
         AccountOwner, ApplicationId, ChainId, DataBlobHash, GenericApplicationId, ModuleId,
         StreamId, StreamName,
     },
-    ownership::{ChangeApplicationPermissionsError, CloseChainError},
+    ownership::ManageChainError,
     vm::VmRuntime,
 };
 
@@ -62,10 +62,11 @@ impl From<wit_contract_api::AccountOwner> for AccountOwner {
 
 impl From<wit_contract_api::ModuleId> for ModuleId {
     fn from(module_id: wit_contract_api::ModuleId) -> Self {
-        ModuleId::new(
+        ModuleId::new_with_formats(
             module_id.contract_blob_hash.into(),
             module_id.service_blob_hash.into(),
             module_id.vm_runtime.into(),
+            module_id.formats_blob_hash.map(Into::into),
         )
     }
 }
@@ -91,6 +92,12 @@ impl From<wit_contract_api::ChainId> for ChainId {
     }
 }
 
+impl From<wit_contract_api::Timestamp> for Timestamp {
+    fn from(timestamp: wit_contract_api::Timestamp) -> Self {
+        Timestamp::from(timestamp.inner0)
+    }
+}
+
 impl From<wit_contract_api::Amount> for Amount {
     fn from(balance: wit_contract_api::Amount) -> Self {
         let (lower_half, upper_half) = balance.inner0;
@@ -99,22 +106,10 @@ impl From<wit_contract_api::Amount> for Amount {
     }
 }
 
-impl From<wit_contract_api::CloseChainError> for CloseChainError {
-    fn from(guest: wit_contract_api::CloseChainError) -> Self {
+impl From<wit_contract_api::ManageChainError> for ManageChainError {
+    fn from(guest: wit_contract_api::ManageChainError) -> Self {
         match guest {
-            wit_contract_api::CloseChainError::NotPermitted => CloseChainError::NotPermitted,
-        }
-    }
-}
-
-impl From<wit_contract_api::ChangeApplicationPermissionsError>
-    for ChangeApplicationPermissionsError
-{
-    fn from(guest: wit_contract_api::ChangeApplicationPermissionsError) -> Self {
-        match guest {
-            wit_contract_api::ChangeApplicationPermissionsError::NotPermitted => {
-                ChangeApplicationPermissionsError::NotPermitted
-            }
+            wit_contract_api::ManageChainError::NotPermitted => ManageChainError::NotPermitted,
         }
     }
 }
@@ -174,6 +169,7 @@ impl From<wit_entrypoints::StreamUpdate> for StreamUpdate {
             chain_id: stream_update.chain_id.into(),
             stream_id: stream_update.stream_id.into(),
             previous_index: stream_update.previous_index,
+            first_index: stream_update.first_index,
             next_index: stream_update.next_index,
         }
     }

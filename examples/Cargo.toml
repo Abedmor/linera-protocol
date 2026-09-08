@@ -19,6 +19,7 @@ members = [
     "rfq",
     "social",
     "task-processor",
+    "wrapped-fungible",
 ]
 
 [workspace.dependencies]
@@ -38,12 +39,15 @@ getrandom = { version = "0.2.12", default-features = false, features = [
     "custom",
 ] }
 hex = "0.4.3"
+insta = { version = "1.36.1", features = ["yaml"] }
+linera-ethereum = { path = "../linera-ethereum" }
 linera-sdk = { path = "../linera-sdk" }
 log = "0.4.20"
 num-bigint = "0.4.3"
 num-traits = "0.2.16"
 rand = "0.8.5"
 serde = { version = "1.0.152", features = ["derive"] }
+serde-reflection = "0.6.0"
 serde_json = "1.0.93"
 sha3 = "0.10.8"
 test-log = { version = "0.2.15", default-features = false, features = [
@@ -63,6 +67,7 @@ fungible = { path = "./fungible" }
 matching-engine = { path = "./matching-engine" }
 native-fungible = { path = "./native-fungible" }
 non-fungible = { path = "./non-fungible" }
+wrapped-fungible = { path = "./wrapped-fungible" }
 
 [profile.release]
 debug = true

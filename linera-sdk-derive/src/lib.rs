@@ -3,27 +3,63 @@
 
 //! The procedural macros for the crate `linera-sdk`.
 
+#![deny(missing_docs)]
+
+mod stable_enum;
 mod utils;
 
 use proc_macro::TokenStream;
 use proc_macro2::{Ident, Span};
 use syn::{
-    parse_macro_input, Fields, ItemEnum,
     __private::{quote::quote, TokenStream2},
+    parse_macro_input, Fields, ItemEnum,
 };
 
 use crate::utils::{concat, snakify};
 
+/// Derives `GraphQLMutationRoot` for an operation enum, generating a GraphQL mutation root
+/// whose mutations each schedule the corresponding operation. SDK paths in the generated code
+/// are resolved against the `linera_sdk` crate.
 #[proc_macro_derive(GraphQLMutationRoot)]
 pub fn derive_mutation_root(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as ItemEnum);
     generate_mutation_root_code(input, "linera_sdk").into()
 }
 
+/// Like the `GraphQLMutationRoot` derive, but resolves SDK paths against `crate` instead of
+/// `linera_sdk`. Used within the `linera-sdk` crate itself.
 #[proc_macro_derive(GraphQLMutationRootInCrate)]
 pub fn derive_mutation_root_in_crate(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as ItemEnum);
     generate_mutation_root_code(input, "crate").into()
+}
+
+/// Derive `linera_sdk::formats::StableEnum` for an `enum`. Expands to:
+///
+/// * `serde::Serialize` / `serde::Deserialize` impls in which the variant tag
+///   is the first 4 bytes of `Keccak-256(variant_name)` (read big-endian as
+///   `u32`), with the top 5 bits masked to `00001` so the ULEB128 encoding is
+///   always exactly 4 bytes; and
+/// * a `linera_sdk::formats::StableEnumTrace` impl exposing the per-variant
+///   tags and a `trace_all_variants` method that drives
+///   `serde_reflection::Tracer` without caller-supplied samples.
+#[proc_macro_derive(StableEnum)]
+pub fn derive_stable_enum(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as ItemEnum);
+    stable_enum::generate_all(&input, stable_enum::CrateRoot::LineraSdk)
+        .unwrap_or_else(|err| err.to_compile_error())
+        .into()
+}
+
+/// Same as [`StableEnum`] but referring to the trait through `crate::...`
+/// instead of `::linera_sdk::...`. Used inside the `linera-sdk` crate itself
+/// (and only there).
+#[proc_macro_derive(StableEnumInCrate)]
+pub fn derive_stable_enum_in_crate(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as ItemEnum);
+    stable_enum::generate_all(&input, stable_enum::CrateRoot::Crate)
+        .unwrap_or_else(|err| err.to_compile_error())
+        .into()
 }
 
 fn generate_mutation_root_code(input: ItemEnum, crate_root: &str) -> TokenStream2 {
@@ -97,6 +133,7 @@ fn generate_mutation_root_code(input: ItemEnum, crate_root: &str) -> TokenStream
         pub struct #mutation_root_name<Application>
         where
             Application: #crate_root::Service,
+            Application::Abi: #crate_root::abi::ContractAbi<Operation = #enum_name>,
             #crate_root::ServiceRuntime<Application>: Send + Sync,
         {
             runtime: ::std::sync::Arc<#crate_root::ServiceRuntime<Application>>,
@@ -106,6 +143,7 @@ fn generate_mutation_root_code(input: ItemEnum, crate_root: &str) -> TokenStream
         impl<Application> #mutation_root_name<Application>
         where
             Application: #crate_root::Service,
+            Application::Abi: #crate_root::abi::ContractAbi<Operation = #enum_name>,
             #crate_root::ServiceRuntime<Application>: Send + Sync,
         {
             #(#methods)*
@@ -114,6 +152,7 @@ fn generate_mutation_root_code(input: ItemEnum, crate_root: &str) -> TokenStream
         impl<Application> #crate_root::graphql::GraphQLMutationRoot<Application> for #enum_name
         where
             Application: #crate_root::Service,
+            Application::Abi: #crate_root::abi::ContractAbi<Operation = #enum_name>,
             #crate_root::ServiceRuntime<Application>: Send + Sync,
         {
             type MutationRoot = #mutation_root_name<Application>;
@@ -128,14 +167,14 @@ fn generate_mutation_root_code(input: ItemEnum, crate_root: &str) -> TokenStream
 }
 
 #[cfg(test)]
-pub mod tests {
-    use syn::{parse_quote, ItemEnum, __private::quote::quote};
+mod tests {
+    use syn::{__private::quote::quote, parse_quote, ItemEnum};
 
     use crate::generate_mutation_root_code;
 
     fn assert_eq_no_whitespace(mut actual: String, mut expected: String) {
         // Intentionally left here for debugging purposes
-        println!("{}", actual);
+        println!("{actual}");
 
         actual.retain(|c| !c.is_whitespace());
         expected.retain(|c| !c.is_whitespace());
@@ -163,6 +202,7 @@ pub mod tests {
             pub struct SomeOperationMutationRoot<Application>
             where
                 Application: linera_sdk::Service,
+                Application::Abi: linera_sdk::abi::ContractAbi<Operation = SomeOperation>,
                 linera_sdk::ServiceRuntime<Application>: Send + Sync,
             {
                 runtime: ::std::sync::Arc<linera_sdk::ServiceRuntime<Application>>,
@@ -172,6 +212,7 @@ pub mod tests {
             impl<Application> SomeOperationMutationRoot<Application>
             where
                 Application: linera_sdk::Service,
+                Application::Abi: linera_sdk::abi::ContractAbi<Operation = SomeOperation>,
                 linera_sdk::ServiceRuntime<Application>: Send + Sync,
             {
                 async fn tuple_variant(&self, field0: String,) -> [u8; 0] {
@@ -197,6 +238,7 @@ pub mod tests {
                 for SomeOperation
             where
                 Application: linera_sdk::Service,
+                Application::Abi: linera_sdk::abi::ContractAbi<Operation = SomeOperation>,
                 linera_sdk::ServiceRuntime<Application>: Send + Sync,
             {
                 type MutationRoot = SomeOperationMutationRoot<Application>;

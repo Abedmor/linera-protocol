@@ -102,7 +102,7 @@ impl ChainOwnership {
             super_owners: iter::once(owner).collect(),
             owners: BTreeMap::new(),
             first_leader: None,
-            multi_leader_rounds: 2,
+            multi_leader_rounds: 5,
             open_multi_leader_rounds: false,
             timeout_config: TimeoutConfig::default(),
         }
@@ -114,7 +114,7 @@ impl ChainOwnership {
             super_owners: BTreeSet::new(),
             owners: iter::once((owner, 100)).collect(),
             first_leader: None,
-            multi_leader_rounds: 2,
+            multi_leader_rounds: 5,
             open_multi_leader_rounds: false,
             timeout_config: TimeoutConfig::default(),
         }
@@ -137,14 +137,9 @@ impl ChainOwnership {
     }
 
     /// Adds a regular owner.
+    #[cfg(with_testing)]
     pub fn with_regular_owner(mut self, owner: AccountOwner, weight: u64) -> Self {
         self.owners.insert(owner, weight);
-        self
-    }
-
-    /// Fixes the given owner as the leader of the first single-leader round on all heights.
-    pub fn with_first_leader(mut self, owner: AccountOwner) -> Self {
-        self.first_leader = Some(owner);
         self
     }
 
@@ -155,15 +150,16 @@ impl ChainOwnership {
             || self.timeout_config.fallback_duration == TimeDelta::ZERO
     }
 
-    /// Returns `true` if this is an owner or super owner.
+    /// Returns `true` if this is a regular owner or super owner or the designated first leader.
     pub fn is_owner(&self, owner: &AccountOwner) -> bool {
         self.super_owners.contains(owner)
             || self.owners.contains_key(owner)
             || self.first_leader.as_ref().is_some_and(|fl| fl == owner)
     }
 
-    /// Returns `true` if this is an owner or if `open_multi_leader_rounds`.
-    pub fn is_multi_leader_owner(&self, owner: &AccountOwner) -> bool {
+    /// Returns `true` if this owner can participate in multi-leader rounds, i.e. it
+    /// is a regular owner or super owner or `open_multi_leader_rounds == true`.
+    pub fn can_propose_in_multi_leader_round(&self, owner: &AccountOwner) -> bool {
         self.open_multi_leader_rounds
             || self.owners.contains_key(owner)
             || self.super_owners.contains(owner)
@@ -235,19 +231,12 @@ impl ChainOwnership {
     }
 }
 
-/// Errors that can happen when attempting to close a chain.
+/// Errors that can happen when attempting to manage a chain (close it, change ownership, or
+/// change application permissions).
 #[derive(Clone, Copy, Debug, Error, WitStore, WitType)]
-pub enum CloseChainError {
-    /// The application wasn't allowed to close the chain.
-    #[error("Unauthorized attempt to close the chain")]
-    NotPermitted,
-}
-
-/// Errors that can happen when attempting to change the application permissions.
-#[derive(Clone, Copy, Debug, Error, WitStore, WitType)]
-pub enum ChangeApplicationPermissionsError {
-    /// The application wasn't allowed to change the application permissions.
-    #[error("Unauthorized attempt to change the application permissions")]
+pub enum ManageChainError {
+    /// The application wasn't allowed to perform this chain management operation.
+    #[error("Unauthorized chain management operation")]
     NotPermitted,
 }
 

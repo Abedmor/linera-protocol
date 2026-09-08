@@ -1,6 +1,8 @@
 name: Indexer Tests
 
 on:
+  push:
+    branches: [main]
   pull_request:
     branches:
       - "**"
@@ -25,17 +27,54 @@ permissions:
   contents: read
 
 jobs:
+  # paths-ignore within a pull_request doesn't work well with merge_group, so we need to use a custom filter.
+  changed-files:
+    runs-on: ubuntu-latest
+    outputs:
+      should-run: ${{ steps.files-changed.outputs.paths }}
+    steps:
+      - uses: actions/checkout@v6.0.2
+        with:
+          fetch-depth: 0
+      - name: Filter paths
+        uses: dorny/paths-filter@v4.0.1
+        id: files-changed
+        with:
+          predicate-quantifier: 'every'
+          filters: |
+            paths:
+              - '!docker/**'
+              - '!configuration/**'
+              - '!kubernetes/**'
+              - '!docs/**'
+              - '!mdbook/**'
+              - '!CONTRIBUTING.md'
+              - '!INSTALL.md'
+              - '!README.md'
+              # Workflow-only PRs don't need heavy code tests; merge to main
+              # validates the workflow itself by running it for real.
+              - '!.github/workflows/**'
+              # Specification-only changes: doc comments on marker traits with no
+              # members, implementors or call sites. rust.yml still runs clippy,
+              # cargo doc and cargo fmt on them, which is all that can fail.
+              - '!linera-spec/**'
+              - '!linera-chain/src/proof/**'
+              - '!linera-chain/src/manager/proof/**'
+              - '!linera-chain/src/data_types/proof/**'
+              - '!linera-chain/src/justification/proof.rs'
+              - '!linera-core/src/proof/**'
+
   indexer-check:
+    needs: changed-files
+    if: needs.changed-files.outputs.should-run == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6.0.2
     - uses: actions-rust-lang/setup-rust-toolchain@v1
     - name: Install Protoc
-      uses: arduino/setup-protoc@v3
-      with:
-        repo-token: ${{ secrets.GITHUB_TOKEN }}
+      uses: ./.github/actions/install-protoc
     - name: Check indexer library compiles
       run: |
         cargo check --locked -p linera-indexer
@@ -47,17 +86,15 @@ jobs:
         cargo test --locked -p linera-indexer --lib -- --skip db::postgres
 
   indexer-integration-tests:
-    if: github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6.0.2
     - uses: actions-rust-lang/setup-rust-toolchain@v1
     - name: Install Protoc
-      uses: arduino/setup-protoc@v3
-      with:
-        repo-token: ${{ secrets.GITHUB_TOKEN }}
+      uses: ./.github/actions/install-protoc
     - name: Run indexer integration tests
       run: |
         cargo test --locked -p linera-indexer --lib
